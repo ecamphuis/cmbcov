@@ -1,0 +1,35 @@
+# MANIFEST.in - Specifies additional files to include in the source distribution
+# This ensures that the package's own sources and related files are included
+# when the package is built and installed
+
+# Include the README and license
+include README.md
+include LICENSE
+include CHANGELOG.md
+
+# Include the example scripts only (never the masks, notebooks or run
+# artefacts that accumulate next to them)
+include examples/*.py examples/*.yml
+
+# legacy/fortran (the vendored cross-check executables) is intentionally not
+# shipped: it is a developer-only comparison script, not part of the package.
+
+# Include documentation files
+recursive-include docs *
+prune docs/_build
+
+# Include the test suite and its golden reference data, so that a source
+# distribution can be validated after unpacking. Only the top level of
+# tests/data is shipped: its subdirectories are per-run cache artefacts.
+recursive-include tests *.py
+include tests/data/*.npy tests/data/*.npz tests/data/*.fits tests/data/*.dat tests/data/*.yml
+
+# Exclude compiled files and caches
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude *.pyd
+global-exclude __pycache__
+global-exclude .git*
+global-exclude .pytest_cache
+global-exclude *.so
+global-exclude .DS_Store

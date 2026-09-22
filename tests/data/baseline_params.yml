@@ -1,0 +1,26 @@
+# Deterministic end-to-end baseline. Paths are rewritten by the test fixture.
+cov_path: PLACEHOLDER_OUT
+cov_name: covariance_matrix.dat
+frequencies: ['090GHz', '150GHz']
+stokes: ['T', 'E']
+lmax: 60
+lmin: 2
+bins:
+  - [2, 20, 6]
+  - [20, 60, 10]
+mask_name: baseline_mask.fits
+mask_path: PLACEHOLDER_DATA
+covariance_approximation: nka
+beams:
+  090GHz: 5.0
+  150GHz: 2.0
+pixwin: 32
+cmb_spectrum: PLACEHOLDER_DATA/baseline_cls.dat
+nl:
+  090GHz090GHz: 20.0
+  090GHz150GHz: 0.0
+  150GHz150GHz: 9.0
+apodizetype: 1
+apodizesigma: 30.0
+thetamax: 30.0
+Dl: True

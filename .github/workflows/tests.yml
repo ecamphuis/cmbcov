@@ -1,0 +1,52 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the package and test dependencies
+        run: pip install -e .[test]
+
+      - name: Run the test suite
+        run: python -m pytest -q
+
+  style:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Versions pinned to match .pre-commit-config.yaml.
+      - name: Install ruff and black
+        run: pip install ruff==0.13.2 black==25.9.0
+
+      # legacy/ (vendored Fortran cross-check tools, excluded from the
+      # public export) was never brought up to this project's ruff/black
+      # style; .pre-commit-config.yaml excludes it from ruff-check for the
+      # same reason. It is usually absent here (public repo), but excluded
+      # explicitly so this also works against the private repo.
+      - name: ruff check
+        run: ruff check --extend-exclude legacy/ .
+
+      - name: black --check
+        run: black --check --extend-exclude '/legacy/' .

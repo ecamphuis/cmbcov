@@ -1,0 +1,253 @@
+# Example parameter file for covariance matrix computation
+# Copy this file and edit it for your own analysis.
+# Authoritative list: cmbcov/generator/parameter_validation.py
+
+# ============================================================
+# REQUIRED PARAMETERS -- all ten below are mandatory; validation
+# fails with an explicit error if any is missing or has the wrong type.
+# ============================================================
+
+# Path where output will be saved (a versioned subdirectory, v0/ v1/ ..., is
+# created under it automatically).
+cov_path: ./covariance_output
+# Name of the output covariance matrix file.
+cov_name: covariance_matrix.dat
+# List of frequency channels.
+frequencies: ['090GHz', '150GHz', '220GHz']
+# Which spectra to compute. Exactly one of 'stokes' or 'observables' is
+# required; giving both is an error.
+#
+# 'stokes' is the historical shorthand, single letters T and/or E only (a B
+# here is rejected, telling you to use 'observables' instead):
+#   stokes: [T]       -> observables: [TT]
+#   stokes: [T, E]    -> observables: [TT, EE, TE]
+stokes: ['T', 'E']
+#
+# 'observables' is the general form: an explicit list of two-letter spectra,
+# a subset of TT, EE, BB, TE, TB, EB (ET, BT, BE accepted as aliases of TE,
+# TB, EB). BB, TB and EB need `covariance_approximation: acc` (NKA/INKA are
+# degenerate for BB by construction), GL-grid ACC kernels (the default
+# `acc_precompute.grid: gl`), and `polspice_postprocess: false` (below).
+# Once any observable has a B, every block -- TT/EE/TE included -- is
+# assembled per Wick term with the normalisation of
+# docs/theory/bmode_kernels.md, Sect. 5, so the T/E blocks differ
+# slightly from a T/E-only run (they gain their C^BB terms). Cross-frequency
+# orientations (ET, BT, BE) keep being generated automatically, as today.
+# observables: [TT, EE, TE, BB]
+#
+# The one exception to "BB needs ACC": `observables: [BB]` ALONE (nothing
+# else -- cross-frequency BB is fine) also runs under `covariance_approximation:
+# nka` or `inka`, with no ACC precompute. It neglects E->B leakage into the
+# pseudo-BB mean throughout (Cov(BB, BB) = 2 (C^BB)^2 Xi^{EE->EE}, INKA
+# smooths C^BB with the EE kernel, and `polspice_postprocess: true` applies
+# the diagonal G+ transform only -- see docs/theory/bmode_kernels.md).
+# The run always emits a UserWarning giving ell_safe, the smallest multipole
+# above which the missed variance inflation stays under 5%; bins below that
+# are underestimated. Use this only when you need Cov(BB, BB) at high ell
+# without paying for an ACC precompute -- for anything else with a B
+# observable (TB, EB, or BB alongside a T/E one), use `observables: [TT, EE,
+# TE, BB]` above.
+# observables: [BB]
+#
+# Whether a block between a parity-even spectrum (TT, EE, TE, BB) and a
+# parity-odd one (TB, EB) is included; needs TB or EB in observables plus at
+# least one parity-even one. Default false (those blocks are small and
+# exactly zero for a mirror-symmetric mask).
+# parity_mixed_blocks: false
+# Maximum multipole (must satisfy lmax <= 2 * nside of the mask).
+lmax: 2000
+# Minimum multipole. Truncates the bandpowers from below; a value at or
+# below the first bin edge (as below) is a no-op.
+lmin: 2
+# Bin specifications: [start, stop, step].
+bins:
+  - [2, 30, 1]
+  - [30, 100, 5]
+  - [100, 1000, 25]
+  - [1000, 2000, 50]
+# Mask file name (looked up inside mask_path).
+mask_name: example_mask.fits
+# Directory containing mask_name. REQUIRED, even when it is just './'.
+mask_path: ./
+# Covariance approximation to use: 'acc', 'nka' or 'inka'.
+covariance_approximation: nka
+
+# ============================================================
+# ACC-ONLY PARAMETERS
+# Required when covariance_approximation is 'acc'; ignored otherwise.
+# Both default to None, so ACC fails at config validation if left out, and
+# `centralell <= 150` warns about accuracy.
+# The coupling kernels for the pairs (centralell, centralell + d), d in
+# range(dmax), must be precomputed first, once per mask, from this same file:
+#     precompute-acc parameters.yml       # once
+#     compute-covariance parameters.yml   # every run
+# The kernels are written to <cov_path>/covariance_coupling/ and every run of
+# this file reads them from there. See docs/acc_precomputation.md.
+#
+# ACC reads the spectra past lmax, to lmax_int = lmax + max(0, 2*nside - 1 -
+# centralell) with nside the acc_precompute nside (e.g. lmax + 261 for
+# centralell 250, nside 256), so that no covariance entry near lmax loses part
+# of its coupling kernel; the covariance is still reported to lmax. The CMB
+# spectrum, foregrounds, noise, beams, pixel window and transfer-function
+# files must therefore reach ell = lmax_int - 1 (a file that stops short
+# raises, naming it). Only lmax is bound by 2 * nside of the mask, not lmax_int.
+# ============================================================
+# dmax: 20          # number of diagonal bands; sizing it is mask-dependent,
+#                    # see docs/acc_precomputation.md, "Parameters"
+# centralell: 200   # central multipole for the coupling kernel computation
+#
+# How precompute-acc computes the kernels. Optional; every key is optional.
+# Only meaningful with covariance_approximation: acc (a warning otherwise).
+# acc_precompute:
+#   nside: 256        # ACC working resolution; default from centralell + dmax.
+#                     # Must be a power of two with grid: healpix.
+#   grid: gl          # gl (default, exact for the band-limited mask) | healpix
+#   lw: 512           # mask band-limit, grid: gl only; default 3 * nside - 1
+#   spectra: [TT, DD, TD, DT]   # kernel channels: subset of TT, DD, LL, TD, DT
+#                     # (plus the new TL, LT, DL, LD); default the first five.
+#                     # Old names TT, EE, BB, TE, ET are accepted and
+#                     # normalised to the new ones. Must cover what `stokes`/
+#                     # `observables` needs: [T] -> TT; [T, E] -> TT, DD, TD
+#                     # and DT. Left unset (the default), a run whose
+#                     # `observables` include B derives the needed pairs
+#                     # automatically (`required_kernel_pairs`); a manual
+#                     # `spectra` here is an advanced override and is left
+#                     # exactly as given.
+#   max_memory_gb: 6  # contraction memory budget in GiB; default 2
+
+# ============================================================
+# OPTIONAL PARAMETERS
+# ============================================================
+
+# Beams: dict of FWHM in arcmin (Gaussian beams are generated), or a path to a file.
+beams:
+  090GHz: 1.0
+  150GHz: 1.0
+  220GHz: 1.0
+# Pixel window: an int nside (HEALPix pixel window is generated), or a path to
+# a file. Default: 8192.
+pixwin: 512
+
+# CMB power spectrum. PLACEHOLDER -- you MUST point this at your own lensed-Cl file.
+# Leaving the placeholder in place will fail to load.
+#
+# COLUMN LAYOUT of every tabulated spectrum input below (cmb_spectrum, fl,
+# foregrounds, nl, post_process_correction), after the leading ell column:
+#   1 column   TT only (a run with stokes: ['T']); asking for any other
+#              spectrum raises, naming the file
+#   4 columns  TT, EE, BB, TE (CAMB-style). ET is then taken from the TE
+#              column (C_l^ET = C_l^TE); TB and EB default to ZERO with a
+#              warning (the usual EB null test) if `observables` asks for
+#              them -- unlike every other spectrum, which raises when the
+#              file cannot supply it
+#   9 columns  TT, EE, BB, TE, TB, EB, ET, BT, BE, read as they are, so a file
+#              that distinguishes ET from TE (or gives non-zero TB/EB) is
+#              honoured
+# Any other column count raises, naming the file and the counts supported.
+# BB is read whenever `observables` contains a B; TB/EB only when TB/EB are
+# themselves in `observables`.
+# .fits files are read with healpy.read_cl and follow the same rules.
+cmb_spectrum: /path/to/your/lensed_cls.dat
+
+# UNITS of the tabulated spectrum inputs: 'Cl' (default) or 'Dl'
+# (D_l = l(l+1) C_l / 2pi, what CAMB's *_lensedCls.dat and most published
+# spectra carry). 'Dl' converts at read time with C_l = 2 pi D_l / (l(l+1)),
+# setting l = 0 and l = 1 to zero, so the rest of the pipeline only ever sees
+# C_l. The default 'Cl' is exactly the old behaviour: columns are used as they
+# are. An unknown value is an error naming the two allowed ones.
+#
+# APPLIES TO the three inputs whose columns are power spectra in uK^2:
+#   cmb_spectrum, foregrounds, nl
+# NEVER APPLIED to the dimensionless inputs, whatever this key says:
+#   beams (B_l), pixwin, fl / hl (transfer functions), post_process_correction,
+#   inpainting_rescaling.
+# It also does not apply to inputs that are not tabulated: a constant
+# `cmb_spectrum` and the white-noise levels below are C_l by construction, and
+# asking for 'Dl' with one of them is an error (not a silent no-op) -- write
+# the per-input override 'Cl' to say so.
+spectrum_units: Cl
+# Per-input overrides; each defaults to spectrum_units. Use them when the
+# inputs genuinely differ, e.g. a CAMB D_l spectrum with a C_l noise curve.
+# cmb_spectrum_units: Dl
+# foregrounds_units: Dl
+# nl_units: Cl        # `noise_units` is accepted, as `noise` is for `nl`
+
+# Transfer function file (format string over frequency pairs), multiplying
+# the signal spectra. fl is the fraction of the signal the pipeline keeps, so
+# every value must lie in [0, 1]; a file with values outside it is refused
+# (outside that range the debiasing and the add_tf_uncertainty factor below
+# would silently degrade to 1). Default: none (1.0 everywhere).
+fl: null
+# Transfer function 'hl'. Accepted and stored on the parsed config but not
+# currently read or applied anywhere in the pipeline.
+hl: null
+# Foreground spectra file (format string over frequency pairs), added to the
+# CMB spectrum before the covariance is computed. Default: none (0.0 everywhere).
+foregrounds: null
+
+# White-noise levels in uK*arcmin.
+# IMPORTANT: keys are the concatenated frequency pair with NO separator, exactly as
+# produced by CovKeys(...).combined_frequencies() -- e.g. '090GHz090GHz'.
+# Keys that do not match a frequency pair raise ValueError listing the
+# expected keys; a missing pair warns and is treated as noiseless.
+# `noise:` is accepted as a legacy alias for `nl:`.
+nl:
+  090GHz090GHz: 10.0
+  150GHz150GHz: 7.0
+  220GHz220GHz: 15.0
+# If false, nl is multiplied by the beam/pixel-window data model instead of
+# being treated as already beam-deconvolved. Default: true.
+nl_is_biased: true
+
+# Multiplicative post-processing correction factors applied after the
+# covariance is computed (e.g. H_ell, inpainting rescaling), as a filename or
+# a {name: filename} dict; entries are multiplied together. Default: none.
+post_process_correction: null
+# Reserved multiplicative correction; the code path that would apply it is
+# currently commented out, so setting this has no effect. Default: 1.0.
+inpainting_rescaling: 1.0
+
+# Apodization / coupling settings. Coupling kernels are always computed
+# natively (built-in Gauss-Legendre quadrature, no external tools). A
+# legacy Fortran backend is kept internally as a manual cross-check only;
+# it is not part of this package.
+# Whether the pseudo-C_l covariance is turned into the covariance of the
+# PolSpice estimator (Eq. 55, G Sigma G^T; the apodisation settings below)
+# before D_ell scaling, debiasing and binning. Default: true. False gives
+# the binned pseudo-C_l covariance. A run with a B observable also mixes
+# the EE and BB pseudo blocks under decoupling (docs/theory/bmode_kernels.md,
+# Sect. 7); that needs the pseudo BB block, so `observables` must include
+# BB whenever it has both EE and a B observable (TB or EB) -- otherwise the
+# parameter file is rejected at validation, not at compute time. The
+# `observables: [BB]`-only NKA/INKA escape hatch above is the one exception:
+# it applies the diagonal level-1-style G+ transform instead, since it never
+# computes a pseudo EE block.
+polspice_postprocess: true
+apodizetype: 1        # 0 = Gaussian, 1 = cosine (preferred)
+apodizesigma: 30.0    # DEGREES (PolSpice parses degrees, max 180)
+thetamax: 30.0        # DEGREES; max angular size of the weighted mask
+
+# Return D_ell = l(l+1)/2pi covariance instead of C_ell. Default: false.
+Dl: True
+
+# Note the spelling. `sum_asymmetric_stokes` (one s) is accepted too and means the
+# same thing; setting both to different values is an error. Default: false.
+sum_assymetric_stokes: False
+
+# Accepted but raise NotImplementedError if set to true -- not yet supported.
+compute_noise_only: False
+compute_signal_only: False
+
+# Propagate the transfer-function uncertainty into the covariance: each
+# spectrum leg is multiplied by 1 + sqrt((1 - fl) / 3999) >= 1, so the
+# covariance is inflated, the more so the smaller fl. Needs `fl`.
+# Default: false.
+add_tf_uncertainty: False
+
+# Cache each raw (pseudo-C_l, unbinned) covariance block in the run's output
+# directory as cov_<stokes>_<freq>.npy with a manifest of everything it
+# depends on (method, lmax, ACC lmax_int/dmax/centralell and kernel cache,
+# mask, a digest of the spectra read); a block is reused only on an exact
+# manifest match, otherwise recomputed. Default: false (nothing is written;
+# at lmax 3000 the blocks of a 3-frequency T+E run are an estimated 16 GB).
+save_raw_blocks: False

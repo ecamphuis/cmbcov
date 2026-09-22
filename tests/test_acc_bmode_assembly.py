@@ -24,8 +24,8 @@ per-Wick-term normalisation of docs/theory/bmode_kernels.md (:meth:`ACCStrategy.
     0.90% (0.9%); level-1 EE x EE 5.38% (5.4%). C^BB = 0 (docs/theory/bmode_kernels.md, Sect. 8):
     TT x EE 2.21% -> 0.89% (2.2% -> 0.9%), EE x EE 5.45% -> 1.46%
     (5.4% -> 1.5%), TE x TE 2.20% -> 0.89% (2.2% -> 0.9%).
-(c) **Level 1 unchanged.** A two-frequency ``stokes: [T, E]`` ACC run is
-    bit-identical to a T/E-only reference (stored by
+(c) **Level 1 unchanged.** A two-frequency ``stokes: [T, E]`` ACC run
+    matches a T/E-only reference (stored by
     ``tests/reference/acc_level1.py``), and its raw-block manifest has no
     new field.
 (d) **End to end.** ``CovarianceMatrixGenerator`` runs of levels 2, 3 and 4
@@ -507,12 +507,27 @@ def test_eb_blocks_fail_at_zero_cbb_as_documented(b16):
 # --------------------------------------------------------------------------- #
 
 
-def test_level1_run_is_bit_identical_to_the_pre_stage3_code(tmp_path):
+def test_level1_run_matches_the_recorded_reference(tmp_path):
+    """
+    A two-frequency T/E-only ACC run must reproduce
+    ``tests/reference/acc_level1_reference.npz`` up to the rounding
+    difference of the BLAS/SHT libraries it is built on, not bit-for-bit:
+    the reference was recorded on a different machine. On Linux x86
+    (different BLAS from the macOS/Accelerate one this was recorded with)
+    the worst relative difference measured was 3.6e-13; rtol=1e-10 leaves a
+    ~280x margin while still catching a structural change to the assembly.
+    """
     reference = np.load(os.path.join(REFERENCE, "acc_level1_reference.npz"))
     current = build_level1_reference(str(tmp_path))
     assert sorted(reference.files) == sorted(current)
     for name in reference.files:
-        np.testing.assert_array_equal(current[name], reference[name], err_msg=name)
+        np.testing.assert_allclose(
+            current[name],
+            reference[name],
+            rtol=1e-10,
+            atol=1e-12 * np.abs(reference[name]).max(),
+            err_msg=name,
+        )
 
 
 def _level1_cov(workdir):
@@ -631,11 +646,11 @@ def test_single_frequency_run_with_white_noise_levels(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_b_run_with_polspice_postprocessing_no_longer_raises_stage_4(tmp_path):
+def test_b_run_with_polspice_postprocessing_completes(tmp_path):
     """
-    PolSpice post-processing of a B-mode run is implemented
-    (``tests/test_polspice_bmode.py``), so this configuration runs to
-    completion instead of raising ``NotImplementedError``.
+    PolSpice post-processing of a B-mode run
+    (``tests/test_polspice_bmode.py``) runs this configuration to
+    completion and returns a finite matrix.
     """
     cov = _level1_cov(str(tmp_path))
     cov.config.polspice_postprocess = True

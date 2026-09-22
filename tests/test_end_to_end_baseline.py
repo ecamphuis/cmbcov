@@ -38,10 +38,11 @@ def _clear_baseline_mask_kernel_cache():
     are built from the spectrally convergent (not exact) integrals of the
     analytic factors f_apo and 1/w. A G kernel left behind at a larger l1max
     by an earlier test therefore reproduces this run's numbers only to
-    ~1e-9 relative, not bit-for-bit, which is far looser than this golden
-    test's rtol=1e-10. Clearing the cache directory before each run makes the
-    test order-independent: it always recomputes its own kernel rather than
-    risking reuse of one computed for a different request.
+    ~1e-9 relative, not bit-for-bit, which is close enough to this golden
+    test's rtol=1e-7 to blur the distinction between "reused a coarser
+    kernel" and "regressed". Clearing the cache directory before each run
+    makes the test order-independent: it always recomputes its own kernel
+    rather than risking reuse of one computed for a different request.
     """
     cache_dir = os.path.join(DATA, "utils_baseline_mask")
     for pattern in ("*.k*.fits", "*.k*.fits.manifest.json"):
@@ -73,12 +74,21 @@ def pipeline_output():
 
 
 def test_matches_recorded_baseline(pipeline_output):
-    """The pipeline must reproduce the recorded covariance bit-for-bit."""
+    """
+    The pipeline must reproduce the recorded covariance up to the rounding
+    difference of the BLAS/SHT libraries it is built on, not bit-for-bit:
+    the baseline was recorded on a different machine. On Linux x86 (a
+    different BLAS from the macOS/Accelerate one this was recorded with),
+    1.5% of entries differ from the recorded value by ~1e-9 relative (e.g.
+    65.11384076 against 65.11384070, 9.2e-10 relative). rtol=1e-7 leaves
+    >100x margin over that while still catching a structural change in the
+    result.
+    """
     covariance, _ = pipeline_output
     expected = np.load(os.path.join(DATA, "baseline_covariance.npy"))
     assert covariance.shape == expected.shape
     np.testing.assert_allclose(
-        covariance, expected, rtol=1e-10, atol=1e-12 * np.abs(expected).max()
+        covariance, expected, rtol=1e-7, atol=1e-12 * np.abs(expected).max()
     )
 
 

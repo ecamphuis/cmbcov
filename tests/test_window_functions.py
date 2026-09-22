@@ -16,7 +16,7 @@ Bandpower window functions, ``--save-windows``
     plain-text file per spectrum and frequency pair under a ``windows/``
     subdirectory beside the covariance -- the owner's existing convention.
 (c) **Unaffected default.** A run without ``--save-windows`` writes nothing
-    and its covariance is bit-identical to the recorded golden baseline
+    and its covariance matches the recorded golden baseline
     (``tests/test_end_to_end_baseline.py``).
 (d) **Refusal.** A run with ``polspice_postprocess: false`` and both ``EE``
     and ``BB`` among the observables raises instead of writing anything: the
@@ -419,6 +419,14 @@ def test_cli_save_windows_reproduces_the_chain_for_one_frequency_pair(tmp_path):
 
 
 def test_default_run_writes_no_window_directory_and_covariance_is_unchanged(tmp_path):
+    """
+    Same golden file and same tolerance as
+    ``tests/test_end_to_end_baseline.py::test_matches_recorded_baseline``:
+    the recorded covariance was produced on a different machine, so the
+    comparison must survive a different BLAS/SHT rounding path, not just
+    this one. See that test for the measured Linux x86 difference (~1e-9
+    relative on 1.5% of entries) and the margin behind rtol=1e-7.
+    """
     params = _write_baseline_params(tmp_path)
     rc = main(["--parameter-file", params])
     assert rc == 0
@@ -429,7 +437,7 @@ def test_default_run_writes_no_window_directory_and_covariance_is_unchanged(tmp_
     covariance = np.loadtxt(os.path.join(version, "covariance_matrix.dat"))
     expected = np.load(os.path.join(DATA, "baseline_covariance.npy"))
     np.testing.assert_allclose(
-        covariance, expected, rtol=1e-10, atol=1e-12 * np.abs(expected).max()
+        covariance, expected, rtol=1e-7, atol=1e-12 * np.abs(expected).max()
     )
 
 

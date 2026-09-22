@@ -26,7 +26,7 @@ observable (docs/theory/bmode_kernels.md, Sect. 7).
     Kern3 = ``^-2K`` for EE, BB and EB, and the TE/TB kernel ``^xK``, the
     same computation ``tests/test_bmode_theta_combinations.py`` uses for
     ``^x G M^TE = ^xK`` and ``^-2 G M^- = ^-2 K``.
-(c) **Level 1.** A T/E-only ACC run is bit-identical to a T/E-only
+(c) **Level 1.** A T/E-only ACC run matches a T/E-only
     reference (the same stored reference
     ``tests/reference/acc_level1_reference.npz`` that
     ``tests/test_acc_bmode_assembly.py`` pins), confirming PolSpice
@@ -267,21 +267,34 @@ def test_decoupling_transform_is_block_diagonal_and_matches_named_kernels():
 
 
 # --------------------------------------------------------------------------- #
-# (c) level 1 is bit-identical
+# (c) level 1 matches the recorded reference
 # --------------------------------------------------------------------------- #
 
 
-def test_level1_still_bit_identical_under_stage4(tmp_path):
-    """The same reference ``tests/test_acc_bmode_assembly.py`` pins: included
+def test_level1_run_matches_the_recorded_reference(tmp_path):
+    """
+    The same reference ``tests/test_acc_bmode_assembly.py`` pins: included
     here too since PolSpice post-processing support changed
-    ``compute_covariance_matrix``'s loop, not just the B-mode branch."""
+    ``compute_covariance_matrix``'s loop, not just the B-mode branch.
+
+    Same tolerance and reasoning as
+    ``tests/test_acc_bmode_assembly.py::test_level1_run_matches_the_recorded_reference``:
+    the reference was recorded on a different machine, so the comparison
+    must survive a different BLAS/SHT rounding path.
+    """
     reference = np.load(
         os.path.join(os.path.dirname(__file__), "reference", "acc_level1_reference.npz")
     )
     current = build_level1_reference(str(tmp_path))
     assert sorted(reference.files) == sorted(current)
     for name in reference.files:
-        np.testing.assert_array_equal(current[name], reference[name], err_msg=name)
+        np.testing.assert_allclose(
+            current[name],
+            reference[name],
+            rtol=1e-10,
+            atol=1e-12 * np.abs(reference[name]).max(),
+            err_msg=name,
+        )
 
 
 # --------------------------------------------------------------------------- #

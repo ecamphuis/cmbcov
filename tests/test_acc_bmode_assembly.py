@@ -631,7 +631,7 @@ def test_single_frequency_run_with_white_noise_levels(tmp_path):
         "cmb_spectrum": os.path.join(DATA, "baseline_cls.dat"),
         "beams": {"090GHz": 5.0},
         "pixwin": 32,
-        "nl": {"090GHz090GHz": 10.0},
+        "nl": {"090GHz": 10.0},
     }
     path = os.path.join(work, "params.yml")
     with open(path, "w") as handle:
@@ -713,7 +713,7 @@ def _generator_run(workdir, observables, parity_mixed, nonzero_odd, freqs):
         "cmb_spectrum": os.path.join(workdir, "cls.dat"),
         "beams": dict.fromkeys(freqs, 5.0),
         "pixwin": 32,
-        "nl": {f + f: 10.0 for f in freqs},
+        "nl": dict.fromkeys(freqs, 10.0),
         "parity_mixed_blocks": parity_mixed,
         "polspice_postprocess": False,
         "acc_precompute": {"nside": 16, "grid": "gl", "lw": 10},

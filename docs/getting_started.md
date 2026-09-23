@@ -22,10 +22,15 @@ is driven, and what it writes.
   `*_lensedCls.dat`. See [`parameters.md`](parameters.md) for the full rule.
 - **Beams.** `beams`: a `{frequency: FWHM_arcmin}` dict (Gaussian beams are
   generated) or a file path.
-- **Noise.** `nl`: white-noise levels in $\mu K \cdot \mathrm{arcmin}$, keyed
-  by the concatenated frequency pair with no separator, e.g.
-  `090GHz090GHz`. `nl_is_biased` (default `true`) says whether the beam and
-  pixel window are already folded into these levels.
+- **Noise.** `nl` is the noise power spectrum of the map *as delivered to the
+  estimator*: no beam, no pixel window, no transfer function (the MASTER
+  convention, Hivon et al. 2002, Eqs. (15)-(16)). The debiasing divides each
+  leg by the data model, so the noise reaches the error bars as
+  $N_\ell / B^2_\ell$. Three forms: one number per frequency (temperature
+  white-noise level in $\mu K \cdot \mathrm{arcmin}$, with
+  $N^{EE} = N^{BB} = 2 N^{TT}$), `[sigma_T, sigma_P]` per frequency, or a
+  tabulated file such as `nl_{}.txt`. Dict keys are *single* frequencies;
+  cross-frequency noise is zero. See [`parameters.md`](parameters.md).
 
 ## The ACC workflow
 
@@ -73,7 +78,7 @@ acc_precompute: {nside: 16, grid: gl, lw: 10, spectra: [TT]}
 cmb_spectrum: ./tests/data/baseline_cls.dat
 beams: {090GHz: 5.0}
 pixwin: 16
-nl: {090GHz090GHz: 20.0}
+nl: {090GHz: 20.0}
 Dl: true
 ```
 

@@ -293,11 +293,6 @@ class SpectraLoader:
         self.nl_dict_biased: dict[str, dict[str, np.ndarray]] = {}
         self.debiasing_dict: dict[str, dict[str, np.ndarray]] = {}
 
-        # Whether the noise spectra carry the instrumental response. It starts
-        # from the parameter file and is overridden by _load_noise_spectra when
-        # the user supplies white-noise levels, which are unbiased by
-        # construction.
-        self.noise_is_biased: bool = bool(config.nl_is_biased)
         self._spectra_lmax: int | None = None
 
     @property
@@ -798,15 +793,189 @@ class SpectraLoader:
             return name, value
         return None, None
 
+    #: uK*arcmin -> uK*rad. A white-noise level sigma in uK*arcmin is a flat
+    #: ``C_l = (sigma * ARCMIN_TO_RAD)^2`` in uK^2.
+    ARCMIN_TO_RAD = np.pi / 10800.0
+
+    def _single_frequencies(self) -> list[str]:
+        """
+        The run's single frequencies, in the order the parameter file gave
+        them. :attr:`combined_frequencies` holds *pair* keys, so the single
+        names come from the configuration.
+        """
+        return list(self.config.frequencies)
+
+    def _split_frequency_pair(self, pair: str) -> tuple[str, str]:
+        """
+        Split a combined-frequency key such as ``"090GHz150GHz"`` into its two
+        single frequencies, matching against the run's frequency list rather
+        than cutting the string in half (which only works when every frequency
+        name has the same length).
+        """
+        freqs = self._single_frequencies()
+        for f1 in freqs:
+            if pair.startswith(f1):
+                rest = pair[len(f1) :]
+                if rest in freqs:
+                    return f1, rest
+        # Fall back to the historical halving rule so an unexpected key still
+        # produces something rather than raising here; the caller only uses
+        # the result to look levels up, and an unknown name yields zero.
+        half = len(pair) // 2
+        return pair[:half], pair[half:]
+
+    def _white_noise_level(
+        self, value: object, freq: str, param_name: str
+    ) -> tuple[float, float]:
+        """
+        Turn one entry of a white-noise-level dict into ``(N^TT, N^PP)`` in
+        uK^2, for the two accepted forms.
+
+        Form 1, a single number ``sigma`` (temperature level, uK*arcmin):
+        ``N^TT = (sigma pi / 10800)^2``, ``N^PP = 2 N^TT``. Form 2, a
+        two-element sequence ``[sigma_T, sigma_P]``: each is squared on its
+        own. A dict may mix the two forms across frequencies.
+        """
+        if isinstance(value, bool):
+            raise ValueError(
+                f"{param_name}['{freq}'] is a boolean; a white-noise level must "
+                "be a number (uK*arcmin) or a pair [sigma_T, sigma_P]."
+            )
+        if isinstance(value, (int, float, np.floating, np.integer)):
+            n_tt = (float(value) * self.ARCMIN_TO_RAD) ** 2
+            # sqrt(2) more noise in amplitude for Q/U than for T, hence the
+            # factor 2 in power.
+            return n_tt, 2.0 * n_tt
+        if isinstance(value, (list, tuple, np.ndarray)):
+            values = list(value)
+            if len(values) != 2:
+                raise ValueError(
+                    f"{param_name}['{freq}'] has {len(values)} entries; a "
+                    "white-noise level is either one number (the temperature "
+                    "level, uK*arcmin) or exactly two, [sigma_T, sigma_P]."
+                )
+            try:
+                sigma_t, sigma_p = (float(v) for v in values)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{param_name}['{freq}'] = {value!r} is not a pair of "
+                    "numbers [sigma_T, sigma_P] in uK*arcmin."
+                ) from exc
+            return (
+                (sigma_t * self.ARCMIN_TO_RAD) ** 2,
+                (sigma_p * self.ARCMIN_TO_RAD) ** 2,
+            )
+        raise TypeError(
+            f"{param_name}['{freq}'] must be a number (uK*arcmin) or a pair "
+            f"[sigma_T, sigma_P], got {type(value).__name__}"
+        )
+
+    def _white_noise_dict(
+        self, noise: dict, param_name: str
+    ) -> dict[str, dict[str, np.ndarray]]:
+        """
+        Build ``nl_dict`` over :attr:`combined_frequencies` from a dict of
+        white-noise levels keyed by **single** frequency.
+
+        An auto pair ``f+f`` takes that frequency's level. A cross pair
+        ``f1+f2``, ``f1 != f2``, is zero and silent: map noise is uncorrelated
+        between bands, so that is the normal case, not a missing input. Every
+        cross-Stokes spectrum is zero for the same reason across Stokes
+        parameters.
+        """
+        freqs = self._single_frequencies()
+        expected = set(freqs)
+        pair_spellings = {f1 + f2 for f1 in freqs for f2 in freqs}
+
+        # dict.get(key, 0.0) silently yields zero noise for any key that does
+        # not match the expected spelling, which is how a typo turns into a
+        # signal-only covariance with no diagnostic. Check the keys first.
+        for key in noise:
+            if key in expected:
+                continue
+            if key in pair_spellings:
+                f1, f2 = self._split_frequency_pair(key)
+                raise ValueError(
+                    f"{param_name} key '{key}' is a frequency *pair*. White-noise "
+                    "levels are now keyed by single frequency: write "
+                    f"'{f1}' (and '{f2}') instead. An auto pair takes that "
+                    "frequency's level and a cross pair is noiseless."
+                )
+            raise ValueError(
+                f"Unrecognised {param_name} frequency key: '{key}'. Expected one "
+                f"of the run's frequencies {sorted(expected)}."
+            )
+
+        missing = expected - set(noise)
+        if missing:
+            warnings.warn(
+                f"No {param_name} value given for {sorted(missing)}; "
+                "these frequencies will be treated as noiseless.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        levels = {
+            freq: self._white_noise_level(value, freq, param_name)
+            for freq, value in noise.items()
+        }
+
+        nl_dict: dict[str, dict[str, np.ndarray]] = {}
+        for cf in self.combined_frequencies:
+            f1, f2 = self._split_frequency_pair(cf)
+            if f1 == f2 and f1 in levels:
+                n_tt, n_pp = levels[f1]
+            else:
+                # Cross-frequency, or a frequency with no level: noiseless.
+                n_tt = n_pp = 0.0
+            flat = {
+                "TT": n_tt,
+                "EE": n_pp,
+                "BB": n_pp,
+                "TE": 0.0,
+                "ET": 0.0,
+                "TB": 0.0,
+                "BT": 0.0,
+                "EB": 0.0,
+                "BE": 0.0,
+            }
+            nl_dict[cf] = {
+                key_pol: flat[key_pol] * np.ones(self.spectra_lmax)
+                for key_pol in self.combined_stokes
+            }
+        return nl_dict
+
     def _load_noise_spectra(self) -> None:
         """
         Load noise spectra.
 
-        A tabulated ``nl`` file is a power spectrum and is read in the units
-        ``config.spectrum_units_of("nl")`` gives. White-noise *levels* (a
-        dict of uK*arcmin) are not: they are turned into a flat ``C_l`` here
-        by ``(sigma pi / 10800)^2``, so ``Dl`` for them raises instead of
-        being ignored.
+        ``nl`` is the noise power spectrum of the map **as delivered to the
+        estimator**: it carries no beam, no pixel window and no transfer
+        function, and it is never multiplied by the data model. This is the
+        MASTER convention (Hivon et al. 2002, astro-ph/0105302, Eqs. (15)-(16));
+        the debiasing divides each leg by ``B1 B2 pix fl``, so the noise
+        enters the reported error bars as ``N_l / B_l^2``.
+
+        Three input forms are accepted:
+
+        1. ``{freq: sigma}`` -- one temperature white-noise level per
+           frequency, in uK*arcmin. ``N^TT = (sigma pi / 10800)^2`` and
+           ``N^EE = N^BB = 2 N^TT`` (the usual sqrt(2) in amplitude for
+           polarisation).
+        2. ``{freq: [sigma_T, sigma_P]}`` -- temperature and polarisation
+           levels, both uK*arcmin. ``N^TT = (sigma_T pi / 10800)^2``,
+           ``N^EE = N^BB = (sigma_P pi / 10800)^2``.
+        3. ``"path/nl_{}.txt"`` -- a tabulated noise power spectrum per
+           frequency pair, columns as in :data:`SPECTRUM_FILE_LAYOUTS`, read
+           in the units ``config.spectrum_units_of("nl")`` gives.
+
+        In forms 1 and 2 every cross-Stokes spectrum (TE/ET, TB/BT, EB/BE) is
+        zero -- map noise is uncorrelated between Stokes parameters -- and the
+        dict keys are **single frequencies**, not frequency pairs: an auto pair
+        ``f+f`` takes that frequency's level and a cross pair ``f1+f2`` is
+        noiseless, since map noise is uncorrelated between bands. Levels are a
+        flat ``C_l`` by construction, so ``nl_units: Dl`` with a dict raises
+        instead of being ignored.
         """
         self.logger.info("Loading noise spectra...")
 
@@ -842,53 +1011,7 @@ class SpectraLoader:
             self.logger.info(
                 f"Using white-noise levels from '{param_name}' (uK*arcmin)"
             )
-            # dict.get(key, 0.0) silently yields zero noise for any key that does
-            # not match the expected frequency-pair spelling, which is how a
-            # typo turns into a signal-only covariance with no diagnostic. Check
-            # the keys explicitly before using them.
-            expected = set(self.combined_frequencies)
-            unknown = set(noise) - expected
-            if unknown:
-                raise ValueError(
-                    f"Unrecognised {param_name} frequency-pair keys: "
-                    f"{sorted(unknown)}. Expected keys of the form "
-                    f"{sorted(expected)[:3]}... (no 'x' separator)."
-                )
-            missing = expected - set(noise)
-            if missing:
-                warnings.warn(
-                    f"No {param_name} value given for {sorted(missing)}; "
-                    "these frequency pairs will be treated as noiseless.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-            # White-noise levels are given at map level, so they carry no beam
-            # or transfer function. Recorded on the loader, not written back
-            # into a parameter representation.
-            self.noise_is_biased = False
-            self.nl_dict = {}
-            for cf in self.combined_frequencies:
-                # translate from uk*arcmin to uK^2
-                val = noise.get(cf, 0.0) ** 2 / 10800**2 * np.pi**2
-                # BB gets the same white-noise level as EE (same polarised
-                # detector noise); every cross spectrum -- TE/ET as before,
-                # and now TB/BT/EB/BE -- is noiseless, since map noise is
-                # uncorrelated between Stokes parameters.
-                temp_dict = {
-                    "TT": val,
-                    "EE": 2 * val,
-                    "BB": 2 * val,
-                    "TE": 0.0,
-                    "ET": 0.0,
-                    "TB": 0.0,
-                    "BT": 0.0,
-                    "EB": 0.0,
-                    "BE": 0.0,
-                }
-                self.nl_dict[cf] = {
-                    key_pol: temp_dict[key_pol] * np.ones(self.spectra_lmax)
-                    for key_pol in self.combined_stokes
-                }
+            self.nl_dict = self._white_noise_dict(noise, param_name)
         else:
             raise TypeError(
                 f"Noise parameter '{param_name}' must be a filename or a dict of "
@@ -1039,12 +1162,20 @@ class SpectraLoader:
         self.cl_dict_biased = mult_nested_dicts(
             self.cl_dict, self.data_model, missing="error"
         )
-        if not self.noise_is_biased:
-            self.nl_dict_biased = mult_nested_dicts(
-                self.nl_dict, self.data_model, missing="error"
-            )
-        else:
-            self.nl_dict_biased = deepcopy(self.nl_dict)
+        # `nl` is the noise power spectrum of the map as delivered to the
+        # estimator: it carries no beam, no pixel window and no transfer
+        # function, and so it is NEVER multiplied by the data model. This is
+        # the MASTER convention (Hivon et al. 2002, astro-ph/0105302),
+        # their Eqs. (15)-(16):
+        #
+        #   <Ctilde_l> = M_ll' F_l' B^2_l' <C_l'> + <Ntilde_l>
+        #   Delta C_l ~ (C_l + N_l / B^2_l) sqrt(2 / nu_l)
+        #
+        # The debiasing below divides each leg by data_model = B1 B2 pix fl,
+        # so the noise enters the reported error bars as N_l / B^2_l with no
+        # further bookkeeping. The copy keeps the loaded `nl_dict` intact for
+        # callers that want the map-level spectrum.
+        self.nl_dict_biased = deepcopy(self.nl_dict)
 
         # The per-leg factor applied to the covariance of each spectrum
         # C^s_f (f a frequency pair, s a Stokes pair -- the keys

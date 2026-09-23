@@ -366,7 +366,7 @@ def test_generator_end_to_end_bb_only(tmp_path, approximation, polspice_postproc
         "cmb_spectrum": os.path.join(work, "cls.dat"),
         "beams": {"090GHz": 5.0},
         "pixwin": 32,
-        "nl": {"090GHz090GHz": 10.0},
+        "nl": {"090GHz": 10.0},
         "polspice_postprocess": polspice_postprocess,
     }
     path = os.path.join(work, "params.yml")

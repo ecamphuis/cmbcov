@@ -185,19 +185,42 @@ hl: null
 # CMB spectrum before the covariance is computed. Default: none (0.0 everywhere).
 foregrounds: null
 
-# White-noise levels in uK*arcmin.
-# IMPORTANT: keys are the concatenated frequency pair with NO separator, exactly as
-# produced by CovKeys(...).combined_frequencies() -- e.g. '090GHz090GHz'.
-# Keys that do not match a frequency pair raise ValueError listing the
-# expected keys; a missing pair warns and is treated as noiseless.
+# Noise power spectrum of the MAP AS DELIVERED TO THE ESTIMATOR: it carries no
+# beam, no pixel window and no transfer function, and it is never multiplied by
+# the data model (MASTER convention, Hivon et al. 2002, Eqs. (15)-(16)). The
+# debiasing divides each leg by B1*B2*pixwin*fl, so the noise enters the error
+# bars as N_l / B_l^2.
+#
 # `noise:` is accepted as a legacy alias for `nl:`.
+#
+# Three forms are accepted.
+#
+# Form 1 -- one number per frequency: the temperature white-noise level in
+# uK*arcmin. N^TT = (sigma * pi / 10800)^2, N^EE = N^BB = 2 * N^TT, every
+# cross-Stokes spectrum (TE/ET, TB/BT, EB/BE) zero.
 nl:
-  090GHz090GHz: 10.0
-  150GHz150GHz: 7.0
-  220GHz220GHz: 15.0
-# If false, nl is multiplied by the beam/pixel-window data model instead of
-# being treated as already beam-deconvolved. Default: true.
-nl_is_biased: true
+  090GHz: 10.0
+  150GHz: 7.0
+  220GHz: 15.0
+
+# Form 2 -- two numbers per frequency, [sigma_T, sigma_P], both uK*arcmin:
+# N^TT = (sigma_T * pi / 10800)^2, N^EE = N^BB = (sigma_P * pi / 10800)^2.
+# A dict may mix forms 1 and 2 across frequencies.
+# nl:
+#   090GHz: [10.0, 14.1]
+#   150GHz: [7.0, 9.9]
+#   220GHz: [15.0, 21.2]
+
+# Form 3 -- a tabulated noise power spectrum per frequency pair; `{}` is filled
+# with the frequency-pair key, columns as for cmb_spectrum (4 columns are
+# TT, EE, BB, TE), units from nl_units / spectrum_units.
+# nl: /path/to/noise/nl_{}.txt
+
+# Dict keys are SINGLE frequencies, members of `frequencies` above -- not
+# frequency pairs. An auto pair f+f takes that frequency's level; a cross pair
+# f1+f2 is zero, silently, because map noise is uncorrelated between bands. A
+# key spelled as a pair ('090GHz090GHz', the old spelling) raises; so does an
+# unknown key. A frequency with no entry warns and is treated as noiseless.
 
 # Multiplicative post-processing correction factors applied after the
 # covariance is computed (e.g. H_ell, inpainting rescaling), as a filename or

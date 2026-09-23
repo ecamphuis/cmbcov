@@ -335,7 +335,7 @@ def _generator_run(workdir, observables, parity_mixed, nonzero_odd, freqs):
         "cmb_spectrum": os.path.join(workdir, "cls.dat"),
         "beams": dict.fromkeys(freqs, 5.0),
         "pixwin": 32,
-        "nl": {f + f: 10.0 for f in freqs},
+        "nl": dict.fromkeys(freqs, 10.0),
         "parity_mixed_blocks": parity_mixed,
         "polspice_postprocess": True,
         "acc_precompute": {"nside": 16, "grid": "gl", "lw": 10},

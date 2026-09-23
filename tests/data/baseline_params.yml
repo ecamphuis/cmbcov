@@ -16,10 +16,11 @@ beams:
   150GHz: 2.0
 pixwin: 32
 cmb_spectrum: PLACEHOLDER_DATA/baseline_cls.dat
+# White-noise levels in uK*arcmin, keyed by single frequency (form 1).
+# Cross-frequency map noise is uncorrelated and so is zero by construction.
 nl:
-  090GHz090GHz: 20.0
-  090GHz150GHz: 0.0
-  150GHz150GHz: 9.0
+  090GHz: 20.0
+  150GHz: 9.0
 apodizetype: 1
 apodizesigma: 30.0
 thetamax: 30.0

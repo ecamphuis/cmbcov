@@ -485,7 +485,7 @@ def _bmode_generator(workdir, polspice_postprocess):
         "cmb_spectrum": os.path.join(workdir, "cls.dat"),
         "beams": {"090GHz": 5.0},
         "pixwin": 32,
-        "nl": {"090GHz090GHz": 10.0},
+        "nl": {"090GHz": 10.0},
         "polspice_postprocess": polspice_postprocess,
         "acc_precompute": {"nside": 16, "grid": "gl", "lw": 10},
     }

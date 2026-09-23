@@ -334,8 +334,7 @@ def resolve_observables(params: Mapping[str, Any]) -> tuple[list[str], list[str]
         )
     if not has_stokes and not has_observables:
         raise ValueError(
-            "Parameter file sets neither 'stokes' nor 'observables'; one is "
-            "required."
+            "Parameter file sets neither 'stokes' nor 'observables'; one is required."
         )
 
     if has_observables:
@@ -370,7 +369,7 @@ def resolve_observables(params: Mapping[str, Any]) -> tuple[list[str], list[str]
         raise ValueError(f"'stokes' must be a list of strings, got {stokes!r}")
     if any(s not in ("T", "E", "B") for s in stokes):
         raise ValueError(
-            f"Invalid Stokes parameters {stokes!r}; valid letters are 'T', " "'E', 'B'"
+            f"Invalid Stokes parameters {stokes!r}; valid letters are 'T', 'E', 'B'"
         )
     if "B" in stokes:
         raise ValueError(
@@ -569,7 +568,6 @@ class ParameterValidator:
         "hl": None,
         "cmb_spectrum": None,
         "nl": {},
-        "nl_is_biased": True,
         "foregrounds": None,
         # Units the tabulated spectrum inputs are written in. The default
         # "Cl" is exactly what the package did before this key existed: the
@@ -600,6 +598,22 @@ class ParameterValidator:
     }
 
     REBINNING_PARAMS = ["lmin", "lmax", "bins"]
+
+    #: Parameter keys that used to exist and have been removed. A file that
+    #: still carries one is refused rather than silently ignored: the key
+    #: changed what the covariance was, so quietly dropping it would change
+    #: the numbers without telling anyone. Maps key -> explanation.
+    REMOVED_PARAMS = {
+        "nl_is_biased": (
+            "'nl' is now always the noise power spectrum of the map as "
+            "delivered to the estimator: it carries no beam, no pixel window "
+            "and no transfer function, and it is never multiplied by the data "
+            "model (MASTER, Hivon et al. 2002, Eqs. (15)-(16)). Beam "
+            "deconvolution reaches the noise through the debiasing, which "
+            "divides each leg by B1 B2 pix fl, so the noise enters the error "
+            "bars as N_l / B_l^2. Delete the key."
+        ),
+    }
 
     #: Keys of the saved parameter record that describe the run rather than
     #: what was asked for, and so cannot make two runs incompatible:
@@ -655,6 +669,9 @@ class ParameterValidator:
         self.errors = []
         self.warnings = []
 
+        # Refuse removed parameters before anything else reads a key
+        self._check_removed_params(params)
+
         # Check required parameters
         self.logger.debug("Checking required parameters...")
         self._check_required_params(params)
@@ -687,6 +704,20 @@ class ParameterValidator:
             self.logger.info("Parameter validation passed successfully")
 
         return len(self.errors) == 0
+
+    def _check_removed_params(self, params: dict[str, Any]) -> None:
+        """
+        Refuse any key in :attr:`REMOVED_PARAMS`.
+
+        Silently ignoring a removed key would change the covariance without
+        saying so, so each one is a validation error naming the key and what
+        replaced it.
+        """
+        for param, explanation in self.REMOVED_PARAMS.items():
+            if param in params:
+                error_msg = f"Parameter '{param}' has been removed. {explanation}"
+                self.logger.error(error_msg)
+                self.errors.append(error_msg)
 
     def _check_required_params(self, params: dict[str, Any]) -> None:
         """Check that all required parameters are present."""
@@ -1140,7 +1171,6 @@ class PipelineConfig(Mapping):
     cmb_spectrum: Any
     foregrounds: Any
     nl: Any
-    nl_is_biased: bool
     inpainting_rescaling: Any
     add_tf_uncertainty: bool
 
@@ -1411,7 +1441,6 @@ class PipelineConfig(Mapping):
             nl_units=optional("nl_units"),
             # Backwards-compatible alias for `nl`, resolved by SpectraLoader.
             noise=params.get("noise", None),
-            nl_is_biased=optional("nl_is_biased"),
             # Read by SpectraLoader but absent from OPTIONAL_PARAMS.
             post_process_correction=params.get("post_process_correction", None),
             acc_precompute=(

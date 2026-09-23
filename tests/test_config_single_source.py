@@ -166,20 +166,31 @@ def test_covariance_config_is_not_rebuilt_downstream(tmp_path):
     assert generator.covariance_instance.lmax == generator.config.lmax
 
 
-def test_noise_bias_flag_is_not_written_back_into_the_record(tmp_path):
+def test_noise_bias_flag_is_gone(tmp_path):
     """
-    Loading white-noise levels is loader state, not written back into the
-    parameter record: the record still says what the file said.
+    `nl_is_biased` no longer exists in any representation: `nl` is always the
+    map-level noise power spectrum (MASTER, Hivon et al. 2002, Eqs. (15)-(16))
+    and the beam reaches it only through the debiasing.
     """
     generator = loaded_generator(tmp_path)
-    assert generator.config.nl_is_biased is True  # the default
-    assert generator.spectra.noise_is_biased is True
+
+    assert not hasattr(generator.config, "nl_is_biased")
+    assert "nl_is_biased" not in generator.params
+    assert not hasattr(generator.spectra, "noise_is_biased")
 
     generator.load_pre_process()
 
-    assert generator.spectra.noise_is_biased is False  # white noise is unbiased
-    assert generator.params["nl_is_biased"] is True
-    assert generator.config.nl_is_biased is True
+    assert not hasattr(generator.spectra, "noise_is_biased")
+
+
+def test_nl_is_biased_in_a_parameter_file_is_refused(tmp_path):
+    """
+    A parameter file that still carries the removed key is refused, not
+    silently ignored: ignoring it would change the numbers without saying so.
+    """
+    path = write_params(tmp_path, extra="\nnl_is_biased: true\n")
+    with pytest.raises(ValueError, match="nl_is_biased.*removed"):
+        ParameterManager(path).load_and_validate()
 
 
 # ----------------------------------------------------------------------------

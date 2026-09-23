@@ -73,12 +73,77 @@ provides.
 | `pixwin` | int or str | `8192` | HEALPix nside for the pixel window, or a file path. |
 | `cmb_spectrum` | str, float or dict | `None` | Tabulated spectrum file (or `.fits`, read with `healpy.read_cl`); column layout in [`getting_started.md`](getting_started.md). |
 | `foregrounds` | str | `None` | Foreground spectrum file (format string over frequency pairs), added to `cmb_spectrum`. |
-| `nl` | dict | `{}` | White-noise levels in $\mu K \cdot \mathrm{arcmin}$, keyed by the concatenated frequency pair (e.g. `090GHz150GHz`, no separator). `noise` is accepted as a legacy alias. A missing pair warns and is treated as noiseless; an unexpected key raises. |
-| `nl_is_biased` | bool | `true` | If `false`, `nl` is multiplied by the beam/pixel-window model instead of being treated as already beam-deconvolved. |
+| `nl` | dict or str | `{}` | Noise of the map **as delivered to the estimator**, in one of three forms (below). `noise` is accepted as a legacy alias. |
 | `fl` | str | `None` | Transfer function (format string over frequency pairs), multiplying the signal spectra. Values must lie in `[0, 1]`. |
 | `hl` | str | `None` | Accepted and stored, but not currently read or applied anywhere. |
 | `post_process_correction` | str or dict | `None` | Multiplicative correction factor(s) applied after the covariance is computed, as a filename or `{name: filename}`; entries are multiplied together. |
 | `inpainting_rescaling` | float | `1.0` | Reserved multiplicative correction; the code path that would apply it is currently disabled, so setting this has no effect. |
+
+### The three forms of `nl`
+
+`nl` is the noise power spectrum of the map as delivered to the estimator. It
+carries **no** beam, **no** pixel window and **no** transfer function, and it
+is never multiplied by the data model. This is the MASTER convention (Hivon et
+al. 2002, [astro-ph/0105302](https://arxiv.org/abs/astro-ph/0105302), their
+Eqs. (15)-(16)),
+
+$$\langle \tilde C_\ell \rangle = M_{\ell\ell'} F_{\ell'} B^2_{\ell'} \langle C_{\ell'} \rangle + \langle \tilde N_\ell \rangle ,
+\qquad
+\Delta C_\ell \simeq \left( C_\ell + \frac{N_\ell}{B^2_\ell} \right) \sqrt{\frac{2}{\nu_\ell}} .$$
+
+The debiasing divides each leg by `data_model` $= B_1 B_2 \, w^{\rm pix} F_\ell$,
+so the noise enters the reported error bars as $N_\ell / B^2_\ell$ on its own —
+it grows at high $\ell$, as it should.
+
+**Form 1 — one number per frequency** (temperature white-noise level,
+$\mu K \cdot \mathrm{arcmin}$):
+
+```yaml
+nl: {'090GHz': 5.4, '150GHz': 4.4, '220GHz': 16.2}
+```
+
+$N^{TT} = (\sigma \pi / 10800)^2$ and $N^{EE} = N^{BB} = 2 N^{TT}$ (the usual
+$\sqrt 2$ in amplitude for polarisation).
+
+**Form 2 — two numbers per frequency**, `[sigma_T, sigma_P]`, both
+$\mu K \cdot \mathrm{arcmin}$:
+
+```yaml
+nl: {'090GHz': [5.4, 7.6], '150GHz': [4.4, 6.2]}
+```
+
+$N^{TT} = (\sigma_T \pi / 10800)^2$ and $N^{EE} = N^{BB} = (\sigma_P \pi / 10800)^2$.
+A list or tuple of exactly two numbers; any other length raises. One dict may
+mix forms 1 and 2 across frequencies.
+
+**Form 3 — a tabulated noise power spectrum file**:
+
+```yaml
+nl: 'path/nl_{}.txt'
+```
+
+`{}` is filled with the frequency-pair key. Columns follow the layout rules of
+[`getting_started.md`](getting_started.md) (the 4-column layout is TT, EE, BB,
+TE); units follow `nl_units` / `spectrum_units`.
+
+In forms 1 and 2 every cross-Stokes spectrum (TE/ET, TB/BT, EB/BE) is zero —
+map noise is uncorrelated between Stokes parameters. Dict keys are **single
+frequencies**, members of `frequencies`, not frequency pairs:
+
+- an auto pair `f+f` takes that frequency's level;
+- a cross pair `f1+f2`, `f1 != f2`, is zero, with no warning — map noise is
+  uncorrelated between bands, so this is the normal case, not a missing input;
+- an unknown key raises, naming it and the expected frequency names;
+- a key spelled as a frequency *pair* (e.g. `090GHz090GHz`, the spelling
+  accepted before this change) raises with a message saying to use the single
+  frequency name;
+- a frequency in `frequencies` with no entry warns and is treated as noiseless.
+
+`nl_units: Dl` with a dict raises: levels are a flat $C_\ell$ by construction.
+
+> **Removed:** `nl_is_biased`. A parameter file that still carries it is
+> refused. `nl` is now always the map-level noise power spectrum, and beam
+> deconvolution is applied by the debiasing.
 
 ### `spectrum_units` and per-input overrides
 

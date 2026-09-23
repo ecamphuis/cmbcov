@@ -59,7 +59,7 @@ acc_precompute: {nside: 16, grid: gl, lw: 10, spectra: [TT]}
 cmb_spectrum: ./tests/data/baseline_cls.dat
 beams: {090GHz: 5.0}
 pixwin: 16
-nl: {090GHz090GHz: 20.0}
+nl: {090GHz: 20.0}
 Dl: true
 ```
 

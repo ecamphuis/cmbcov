@@ -8,6 +8,7 @@ and reached through ``self.cov``.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Iterator
 
 import numpy as np
 
@@ -53,6 +54,18 @@ class CovarianceStrategy(ABC):
             Covariance matrix term for this key
         """
         pass
+
+    def compute_covariance_terms(
+        self, cov_keys: Iterable[CovKey], cl: dict[str, dict[str, np.ndarray]]
+    ) -> Iterator[tuple[CovKey, np.ndarray]]:
+        """
+        ``(cov_key, compute_covariance_term(cov_key, cl))`` for every key of
+        ``cov_keys``, one at a time; a strategy may yield them in another
+        order and compute them together (ACC does). Used by
+        :meth:`~cmbcov.covariance.Cov.compute_covariance_matrix`.
+        """
+        for cov_key in cov_keys:
+            yield cov_key, self.compute_covariance_term(cov_key, cl)
 
     def configure_run(self, covariance_keys, cl) -> None:
         """

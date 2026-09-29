@@ -24,6 +24,32 @@ settings `apodizetype`, `apodizesigma` and `thetamax` (see
 [`parameters.md`](parameters.md)) control the real-space window PolSpice's
 kernel is built from.
 
+## Order of the steps
+
+Each covariance block goes through the PolSpice transform, then $D_\ell$
+scaling, then debiasing, then binning. All four are linear on each side of
+the block, so a run applies them as one matrix per side, the projection
+
+```math
+P = B\thinspace \mathrm{diag}(\delta_\ell\thinspace d_\ell)\thinspace G,
+\qquad
+\hat\Sigma_{\mathrm{binned}} = P_{\mathrm{left}}\thinspace \tilde\Sigma\thinspace P_{\mathrm{right}}^{T},
+```
+
+with $B$ the binning matrix, $\delta_\ell = \ell(\ell+1)/2\pi$ (1 without
+`Dl`), $d_\ell$ the debiasing factor of the leg (frequency pair and
+spectrum) and $G$ its kernel. $P$ is built once per leg in a
+`compute_covariance_matrix` call (nothing is kept between calls), so a block
+costs two products of size `n_bins x lmax` instead of two of
+`lmax x lmax`. A block with an EE or BB leg under the B-mode transform sums
+this over its (up to four) source terms, each with its own $G_{X\leftarrow a}$.
+This is a different order of floating-point operations, so the result differs
+from applying the four steps one after the other by round-off, about
+$10^{-15}$ of the largest element. Output with `polspice_postprocess: false`, or
+with fewer than 4 multipoles per bandpower on average (nearly unbinned, where
+$P$ is as large as the block), is computed step by step as before and is
+unchanged.
+
 ## Kernels per spectrum
 
 Each two-letter spectrum takes one of a small set of kernels, built from the

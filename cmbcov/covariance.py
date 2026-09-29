@@ -208,6 +208,17 @@ class Cov:
     operations, and post-processing transformations.
     """
 
+    #: How blocks are post-processed. ``None`` (always, for a user): through
+    #: the projection of each leg (:meth:`_process_covariance_term`) when
+    #: that pays, see :meth:`_folds_postprocess`, and block by block
+    #: otherwise. Tests set it true or false to force the projections or
+    #: the per-block reference (:meth:`_process_covariance_term_reference`).
+    _fold_postprocess: bool | None = None
+    #: Projections pay when a bandpower spans at least this many multipoles
+    #: on average (``lmax / n_bins``): a block then costs ``n_bins lmax^2``
+    #: instead of ``2 lmax^3 + n_bins lmax^2``, at least 9 times less.
+    _FOLD_MIN_ELL_PER_BIN = 4
+
     def __init__(
         self,
         mask: str,
@@ -1287,6 +1298,15 @@ class Cov:
         :meth:`~cmbcov.postprocess.CovariancePostProcessor.pseudo_to_spice`
         transform: it never computes a pseudo EE block, so it
         cannot go through ``pseudo_to_spice_bmode``.
+
+        The PolSpice transform, D_ell scaling, debiasing and binning of a
+        block are applied as one matrix per leg, built once per call and
+        shared by every block with that leg
+        (:meth:`_process_covariance_term`), when
+        ``polspice_postprocess`` is true and a bandpower spans at least
+        ``_FOLD_MIN_ELL_PER_BIN`` multipoles on average; the result is that
+        of applying the steps one after the other to round-off
+        (about 1e-15 of the largest element).
         """
         self.config.validate()
 
@@ -1362,24 +1382,11 @@ class Cov:
         )
 
         raw_blocks: dict[CovKey, np.ndarray] = {}
+        # One projection matrix per spectrum leg, built on first use and
+        # dropped with this call (see _leg_projection).
+        projections: dict[tuple, np.ndarray] = {}
 
-        for cov_key in covariance_keys.keys():
-            if self.config.verbose:
-                print(f"Computing {cov_key}")
-
-            covariance_term = None
-            manifest = None
-            if self.config.save_raw_blocks:
-                manifest = self._raw_block_manifest(computation_strategy, cov_key, cl)
-                covariance_term = self._load_raw_block(cov_key, manifest)
-
-            if covariance_term is None:
-                covariance_term = computation_strategy.compute_covariance_term(
-                    cov_key, cl
-                )
-                if manifest is not None:
-                    self._save_raw_block(cov_key, covariance_term, manifest)
-
+        def consume(cov_key: CovKey, covariance_term: np.ndarray) -> None:
             if needs_bmode_mixing:
                 raw_blocks[cov_key] = covariance_term
             else:
@@ -1392,7 +1399,36 @@ class Cov:
                     bin_matrix,
                     num_bins,
                     post_processor,
+                    projections,
                 )
+
+        # Blocks read back from the save_raw_blocks cache are used as they
+        # come; every other block is computed by the strategy's
+        # compute_covariance_terms, which may compute blocks together and
+        # yield them in its own order (ACC shares kernel products between
+        # blocks). Each block lands at its own place in output_matrix (and
+        # raw_blocks), so the order changes nothing.
+        manifests: dict[CovKey, dict] = {}
+        to_compute: list[CovKey] = []
+        for cov_key in covariance_keys.keys():
+            covariance_term = None
+            if self.config.save_raw_blocks:
+                manifest = self._raw_block_manifest(computation_strategy, cov_key, cl)
+                manifests[cov_key] = manifest
+                covariance_term = self._load_raw_block(cov_key, manifest)
+            if covariance_term is None:
+                to_compute.append(cov_key)
+            else:
+                consume(cov_key, covariance_term)
+
+        for cov_key, covariance_term in computation_strategy.compute_covariance_terms(
+            to_compute, cl
+        ):
+            if self.config.verbose:
+                print(f"Computed {cov_key}")
+            if cov_key in manifests:
+                self._save_raw_block(cov_key, covariance_term, manifests[cov_key])
+            consume(cov_key, covariance_term)
 
         if needs_bmode_mixing:
             spec_index = {spec: i for i, spec in enumerate(covariance_keys.spec_keys)}
@@ -1408,6 +1444,7 @@ class Cov:
                     num_bins,
                     post_processor,
                     block_provider,
+                    projections,
                 )
 
         # Handle asymmetric Stokes if requested
@@ -1429,8 +1466,9 @@ class Cov:
         The known-error report of this run's method, or ``None`` if it has
         none.
 
-        Only ACC has one, and only when a block of ``covariance_keys`` has a
-        polarised leg: see
+        Only ACC has one, and every ACC run gets it (for a TT-only run or a
+        run with a B observable, the leakage and translation sections are
+        reported as not applicable): see
         :meth:`~cmbcov.approximations.acc.ACCStrategy.error_budget`
         and :mod:`~cmbcov.approximations.acc_budget`. It
         reads the coupling kernels this ``Cov`` already loads (including the
@@ -1562,12 +1600,18 @@ class Cov:
         bin_matrix: np.ndarray,
         num_bins: int,
         post_processor: CovariancePostProcessor,
+        projections: dict[tuple, np.ndarray],
     ):
         """Add processed covariance term to output matrix."""
         # Process the covariance term
-        binned_term = self._process_covariance_term(
-            covariance_term, cov_key, post_processor, bin_matrix
-        )
+        if self._folds_postprocess(bin_matrix):
+            binned_term = self._process_covariance_term(
+                covariance_term, cov_key, post_processor, bin_matrix, projections
+            )
+        else:
+            binned_term = self._process_covariance_term_reference(
+                covariance_term, cov_key, post_processor, bin_matrix
+            )
 
         # Add to output matrix
         left_index, right_index = covariance_keys[cov_key]
@@ -1592,6 +1636,7 @@ class Cov:
         num_bins: int,
         post_processor: CovariancePostProcessor,
         block_provider,
+        projections: dict[tuple, np.ndarray],
     ):
         """
         Same as :meth:`_add_to_output_matrix`, for a B run under
@@ -1600,12 +1645,21 @@ class Cov:
         and ``block_provider`` (built by :meth:`_pseudo_block_provider`)
         rather than from a single raw block.
         """
-        processed_term = post_processor.pseudo_to_spice_bmode(
-            cov_key.stokekey(), block_provider
-        )
-        binned_term = self._finish_processing(
-            processed_term, cov_key, post_processor, bin_matrix
-        )
+        if self._folds_postprocess(bin_matrix):
+            binned_term = post_processor.project_bmode(
+                cov_key.stokekey(),
+                block_provider,
+                lambda side, source: self._leg_projection(
+                    projections, post_processor, bin_matrix, cov_key, side, source
+                ),
+            )
+        else:
+            processed_term = post_processor.pseudo_to_spice_bmode(
+                cov_key.stokekey(), block_provider
+            )
+            binned_term = self._finish_processing_reference(
+                processed_term, cov_key, post_processor, bin_matrix
+            )
 
         left_index, right_index = covariance_keys[cov_key]
         output_matrix[
@@ -1672,7 +1726,97 @@ class Cov:
         key = CovKey.from_spec_keys(spec_keys[ib], spec_keys[ia])
         return raw_blocks[key].T
 
+    def _folds_postprocess(self, bin_matrix: np.ndarray | None) -> bool:
+        """
+        Whether blocks are post-processed through leg projections.
+
+        Without the PolSpice transform there is nothing to save (binning
+        alone costs the same either way), and with (nearly) unbinned output
+        the projections are as large as the blocks: both keep the per-block
+        path, and with it their bit-for-bit output.
+        """
+        if self._fold_postprocess is not None:
+            return self._fold_postprocess
+        return (
+            self.config.polspice_postprocess
+            and bin_matrix is not None
+            and bin_matrix.shape[0] * self._FOLD_MIN_ELL_PER_BIN <= self.lmax
+        )
+
+    def _leg_projection(
+        self,
+        projections: dict[tuple, np.ndarray],
+        post_processor: CovariancePostProcessor,
+        bin_matrix: np.ndarray | None,
+        cov_key: CovKey,
+        side: str,
+        source: str | None,
+    ) -> np.ndarray:
+        r"""
+        The matrix :math:`P = B\,\mathrm{diag}(\delta d)\,G` of one leg of
+        ``cov_key`` (``side`` ``"left"`` or ``"right"``), built on first use
+        and kept in ``projections`` for every other block with the same leg.
+
+        A leg is fixed by its frequency pair, its output spectrum (which
+        selects the debiasing factor) and the pseudo spectrum ``source`` its
+        kernel :math:`G` acts on: ``None`` for the diagonal transform of a
+        T/E-only run, the source of ``pseudo_to_spice_bmode`` for a B run.
+        ``projections`` belongs to one ``compute_covariance_matrix`` call,
+        so it never outlives the spectra and debiasing it was built with.
+        """
+        index = 0 if side == "left" else 1
+        freq_pair = cov_key.freqkey().split("x")[index]
+        stokes = cov_key.stokekey().split("x")[index]
+        key = (freq_pair, stokes, source)
+        projection = projections.get(key)
+        if projection is None:
+            if not self.config.polspice_postprocess:
+                kernel = None
+            elif source is None:
+                kernel = post_processor.G_kernels[stokes]
+            else:
+                kernel = post_processor._bmode_kernel(stokes, source)
+            scaling = post_processor.leg_scaling(
+                freq_pair,
+                stokes,
+                self.lmax,
+                self.config.Dl,
+                self.config.debiasing_dict,
+            )
+            projection = post_processor.leg_projection(
+                kernel, scaling, bin_matrix, self.lmax
+            )
+            projections[key] = projection
+        return projection
+
     def _process_covariance_term(
+        self,
+        covariance_term: np.ndarray,
+        cov_key: CovKey,
+        post_processor: CovariancePostProcessor,
+        bin_matrix: np.ndarray | None,
+        projections: dict[tuple, np.ndarray],
+    ) -> np.ndarray:
+        r"""
+        Process a covariance term (transform, scale, debias, bin) as
+        :math:`P_L\,C\,P_R^{T}`, with :math:`P` the projection of each leg
+        (:meth:`_leg_projection`). Each step is linear on both legs, so this
+        is :meth:`_process_covariance_term_reference` to round-off, at a
+        cost of ``n_bins lmax^2`` rather than ``lmax^3`` per block. With
+        ``config.polspice_postprocess`` false the PolSpice transform is
+        skipped; D_ell scaling, debiasing and binning are applied as usual.
+        """
+        return post_processor.project(
+            self._leg_projection(
+                projections, post_processor, bin_matrix, cov_key, "left", None
+            ),
+            covariance_term,
+            self._leg_projection(
+                projections, post_processor, bin_matrix, cov_key, "right", None
+            ),
+        )
+
+    def _process_covariance_term_reference(
         self,
         covariance_term: np.ndarray,
         cov_key: CovKey,
@@ -1680,9 +1824,10 @@ class Cov:
         bin_matrix: np.ndarray | None,
     ) -> np.ndarray:
         """
-        Process covariance term (transform, bin). With
-        ``config.polspice_postprocess`` false the PolSpice transform is
-        skipped; D_ell scaling, debiasing and binning are applied as usual.
+        The per-block reference of :meth:`_process_covariance_term`: PolSpice
+        transform, D_ell scaling, debiasing, then binning, each applied to
+        the whole ``lmax x lmax`` block. Kept for tests, not used by a run
+        (``_fold_postprocess`` false selects it).
         """
         if self.config.polspice_postprocess:
             # Transform to PolSpice format (a new array: the raw block the
@@ -1693,18 +1838,18 @@ class Cov:
         else:
             processed_term = np.array(covariance_term, copy=True)
 
-        return self._finish_processing(
+        return self._finish_processing_reference(
             processed_term, cov_key, post_processor, bin_matrix
         )
 
-    def _finish_processing(
+    def _finish_processing_reference(
         self,
         processed_term: np.ndarray,
         cov_key: CovKey,
         post_processor: CovariancePostProcessor,
         bin_matrix: np.ndarray | None,
     ) -> np.ndarray:
-        """D_ell scaling, debiasing and binning, shared by the T/E-only and B-mode paths."""
+        """D_ell scaling, debiasing and binning of :meth:`_process_covariance_term_reference`, shared by the T/E-only and B-mode reference paths."""
         # Apply D_ell scaling if requested
         if self.config.Dl:
             processed_term = post_processor.apply_Dl_scaling(processed_term, self.lmax)

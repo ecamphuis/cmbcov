@@ -69,7 +69,9 @@ new spectra, noise, beams or binning — reuses the cached kernels and is
 comparable in cost to NKA/INKA plus the PolSpice transform.
 
 **Accuracy.** Two effects, both reported by the per-run error budget
-(`error_budget.txt`, written for any ACC run with a polarised leg):
+(`error_budget.txt`, written for every ACC run; the two below are
+reported for a run with a polarised leg and no B observable, and as not
+applicable otherwise):
 
 - the translation itself gets less accurate the further $\ell$ is from
   `centralell` — this error is **not bounded** by the budget, only its

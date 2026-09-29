@@ -50,18 +50,40 @@ against the measured numbers above and both failed:
   measured error exceeds it at l = 100 (3.8% against S = 1.8%) and at
   l = 600 (0.33% against 0.11%), so it is neither an estimate nor a bound.
 
+**Normalisation consistency (checked here).** ``norm_Xi`` comes from
+``Cov.Xi``, the MASTER operator of the mask at its own band limit, while the
+kernels are built from the mask truncated at ``acc_precompute.lw``. Eq. 22 ties
+the two together exactly when they come from the same mask, so
+:func:`normalisation_consistency` compares them (see there).
+
+**Which runs.** Every ACC run gets a budget. The normalisation check needs
+only the ``TT x TT`` kernel and ``Xi``, so it applies to all of them (it is
+skipped with a note when the cache has no ``TT x TT`` kernel, as for an
+EE-only or BB-only run). The leakage and translation terms above describe
+polarised blocks made with the Eq. 23 normalisation, so for a TT-only run
+and for a run with a B observable (per-Wick-term normalisation, exact at
+``l*``; docs/theory/bmode_kernels.md, "Known limits") they are reported as
+not applicable, with ``"applicable": False`` in the dict.
+
 Scripts: ad hoc, not included in this repository.
 """
 
+import logging
 import textwrap
 
 import numpy as np
 
+from ..kernels.coupling import KERNEL_TT
+
+logger = logging.getLogger(__name__)
+
 __all__ = [
     "SURVEY_MEASUREMENT",
     "error_budget",
+    "XI_MISMATCH_WARNING",
     "format_error_budget",
     "leakage_ratio",
+    "normalisation_consistency",
     "polarised_leg_count",
 ]
 
@@ -74,6 +96,22 @@ POLARISED_LABELS = ("E", "B")
 #: (old names ``TT x BB`` / ``TT x EE``) isolates the spin-2 deficit with one
 #: spin-0 leg held fixed, which is the ratio measured for this budget.
 LEAKAGE_PAIRS = (("TT", "LL"), ("TT", "DD"))
+
+#: Relative mismatch between the kernels' own normalisation and ``Cov.Xi`` above
+#: which :func:`normalisation_consistency` logs a WARNING. The mismatch is the
+#: fraction of the mask's weight that the kernel shape ``Theta / sum Theta``
+#: does not carry while ``Xi`` does, so it bounds (it does not equal) the error
+#: it puts on an element: the bound is reached only for spectra that vary
+#: strongly over the missing part. 1e-2 is where that bound reaches the size of
+#: the errors ACC already carries and reports (E->B leakage 0.5-1% per block;
+#: Eq. 33 translation up to a few percent), so a smaller mismatch is never the
+#: dominant error. Measured, for reference: 1e-4 on the HEALPix nside-16 test
+#: configuration, 5e-5 on the same with GL, and 3.4e-3 on the survey
+#: configuration (lw = 875, kernels 2 nside = 512), where it is the kernel's
+#: L range that cuts the tail, not lw (the mismatch there is 2.7e-5 at
+#: d = 0 and grows with d) -- so none of these warn, while a mask with power
+#: beyond lw does (1e-2 to 1e-1 for a sharp-edged cap at lw = 8 to 40).
+XI_MISMATCH_WARNING = 1e-2
 
 #: What the leakage and translation terms were measured to be on an apodised
 #: test mask (nside 512, about 4% of the sky, GL, l* = 250, dmax 5), quoted in the
@@ -169,9 +207,178 @@ def leakage_ratio(strategy, ell: int | None = None, ell_prime: int | None = None
     }
 
 
-def error_budget(strategy, covariance_keys, band_edges=None) -> dict | None:
+def normalisation_consistency(strategy, threshold: float = XI_MISMATCH_WARNING) -> dict:
+    r"""
+    Check that the kernels and ``Cov.Xi`` normalise the same mask (Eq. 22).
+
+    The sum rule of Eq. 22 for the ``TT x TT`` kernel of the pair ``(l, l')``
+    is ``sum_{L1 L2} Theta_{l l'}(L1, L2) = n Xi^{00}_{l l'}[W^2]`` with
+    ``n = (2l+1)(2l'+1)``. It holds to round-off when ``Theta`` and ``Xi`` are
+    built from one and the same band-limited mask, and this function measures
+    how far it is from holding, at ``(l*, l* + d)`` for every diagonal
+    ``d`` in ``range(dmax)`` -- the pairs the run loads:
+
+        max_d | sum Theta^{TT x TT}_{l*, l*+d} / n  /  Xi^{00}_{l*, l*+d} - 1 | .
+
+    Conventions (checked numerically to 1e-11 on a test mask, see
+    ``tests/test_acc_xi_consistency.py``): a kernel is stored as the plain
+    ``Theta(L1, L2)`` array of ``precompute_acc_kernels``, with no
+    normalisation applied on disk, so its full sum is the left side; ``Cov.Xi``
+    is ``(4, lmax, lmax)`` indexed ``[channel, l, l']`` with channel
+    :data:`~cmbcov.kernels.coupling.KERNEL_TT` = ``Xi^{00}[W^2]``, already
+    without the ``(2l'+1)`` of the MASTER matrix.
+
+    What the number means. ``Cov.Xi`` is built from the mask at its own band
+    limit (``2 nside`` of the mask), the kernels from the mask truncated at
+    ``acc_precompute.lw`` and stored only for ``L1, L2 < 2 nside_acc``. ACC
+    takes the amplitude from ``Xi`` and only the unit-sum *shape* from the
+    kernel, so a mismatch ``eps`` is not an ``eps`` error on the covariance:
+    it is the share of the mask's weight that the shape lacks, and bounds the
+    element error (reached only if the spectra vary strongly over that missing
+    part). Two things make it non-zero, told apart by the diagonal: a mask
+    with power beyond ``lw`` shows at every ``d`` (including ``d = 0``, which
+    is returned as ``mismatch_first``); a kernel range ``2 nside_acc`` that
+    cuts the tail of ``Theta`` grows with ``d``. On the HEALPix grid the
+    number also holds the quadrature error of the kernels; with
+    ``term_selection`` set, the dropped terms. The manifest's ``grid``,
+    ``lw``, ``nside`` and ``term_selection`` are returned so the number can be
+    read against them.
+
+    The cost is one load of each ``TT x TT`` kernel of the run (through the
+    strategy's memoised, validated loader, so no new read when the covariance
+    has just been computed from them) and one array sum each.
+
+    Parameters
+    ----------
+    strategy : ACCStrategy
+    threshold : float
+        Relative mismatch above which a WARNING is logged.
+
+    Returns
+    -------
+    dict
+        ``{"max_relative_mismatch": float, "worst_pair": (l, l'),
+        "mismatch_first": float, "diagonals_checked": int,
+        "threshold": float, "exceeds": bool,
+        "lw", "grid", "nside", "term_selection"}``; or
+        ``{"max_relative_mismatch": None, "unavailable": reason}`` when the
+        cache has no ``TT x TT`` kernel (an EE-only or BB-only run) or
+        anything else prevents the check. Never raises: this is a
+        diagnostic, a failure is logged and reported as unavailable.
     """
-    The polarised error budget of one ACC run.
+    try:
+        return _normalisation_consistency(strategy, threshold)
+    except Exception as error:  # noqa: BLE001 - diagnostics must not fail a run
+        reason = f"{type(error).__name__}: {error}"
+        logger.warning(
+            "ACC normalisation check (Cov.Xi against kernels) failed: %s", reason
+        )
+        return {
+            "max_relative_mismatch": None,
+            "threshold": threshold,
+            "unavailable": f"the check failed ({reason}).",
+        }
+
+
+def _normalisation_consistency(strategy, threshold: float) -> dict:
+    cov = strategy.cov
+    central = cov.config.centralell
+    xi00 = np.asarray(cov.Xi)[KERNEL_TT]
+    diagonals = [d for d in range(cov.config.dmax) if central + d < xi00.shape[1]]
+    if not diagonals or central >= xi00.shape[0]:
+        return {
+            "max_relative_mismatch": None,
+            "threshold": threshold,
+            "unavailable": "Cov.Xi does not reach the run's kernel pairs.",
+        }
+
+    worst, worst_pair, first = -1.0, None, None
+    for d in diagonals:
+        ell_prime = central + d
+        try:
+            kernels = strategy.get_covariance_coupling(
+                central, ell_prime, pairs=[("TT", "TT")]
+            )
+        except (OSError, ValueError) as error:
+            reason = f"no TT x TT coupling kernel in the cache ({error}). "
+            logger.info("ACC normalisation check skipped: %s", reason)
+            return {
+                "max_relative_mismatch": None,
+                "threshold": threshold,
+                "unavailable": (
+                    reason + "Eq. 22 is only checked on TT x TT, so nothing "
+                    "is compared for this run."
+                ),
+            }
+        n = (2 * central + 1) * (2 * ell_prime + 1)
+        xi = float(xi00[central, ell_prime])
+        if xi == 0.0:
+            continue
+        mismatch = abs(float(np.sum(kernels[("TT", "TT")])) / n / xi - 1.0)
+        if first is None:
+            first = mismatch
+        if mismatch > worst:
+            worst, worst_pair = mismatch, (central, ell_prime)
+    if worst_pair is None:
+        return {
+            "max_relative_mismatch": None,
+            "threshold": threshold,
+            "unavailable": "Xi^00 vanishes at every kernel pair of the run.",
+        }
+
+    manifest = strategy.get_covariance_coupling_manifest(central, central) or {}
+    result = {
+        "max_relative_mismatch": worst,
+        "worst_pair": worst_pair,
+        "mismatch_first": first,
+        "diagonals_checked": len(diagonals),
+        "threshold": threshold,
+        "exceeds": worst > threshold,
+        "lw": manifest.get("lw"),
+        "grid": manifest.get("grid"),
+        "nside": manifest.get("nside"),
+        "term_selection": manifest.get("term_selection"),
+    }
+    if result["exceeds"]:
+        logger.warning(
+            "ACC normalisation: the coupling kernels and Cov.Xi disagree by "
+            "%.2e (worst at (l, l') = %s; %.2e at d = 0; threshold %.0e). "
+            "Cov.Xi carries mask weight that the kernel shapes lack, so ACC "
+            "elements are off by up to about this fraction. If the mismatch "
+            "is already large at d = 0, the mask has power beyond the "
+            "kernels' lw (%s): raise acc_precompute.lw and recompute the "
+            "kernels. If it grows with d, the kernel range 2 nside (nside "
+            "%s) cuts the tail: raise acc_precompute.nside. (Kernel grid %s "
+            "and term_selection %s can also contribute.)",
+            worst,
+            worst_pair,
+            first,
+            threshold,
+            result["lw"],
+            result["nside"],
+            result["grid"],
+            result["term_selection"],
+        )
+    else:
+        logger.info(
+            "ACC normalisation: kernels and Cov.Xi agree to %.2e (max over %d "
+            "diagonals, worst at %s; threshold %.0e).",
+            worst,
+            len(diagonals),
+            worst_pair,
+            threshold,
+        )
+    return result
+
+
+def error_budget(strategy, covariance_keys, band_edges=None) -> dict:
+    """
+    The error budget of one ACC run.
+
+    Every ACC run gets one, because the normalisation check (section 3)
+    needs only the ``TT x TT`` kernel and ``Cov.Xi``. The leakage and
+    translation sections describe polarised blocks made with the Eq. 23
+    normalisation, so they apply to a T/E run with a polarised leg only.
 
     Parameters
     ----------
@@ -185,11 +392,22 @@ def error_budget(strategy, covariance_keys, band_edges=None) -> dict | None:
 
     Returns
     -------
-    dict or None
-        ``None`` if no block of the run has a polarised leg -- a TT-only run
-        has no polarised error budget, and reporting an empty one would only
-        invite reading a bound into it.
+    dict
+        For a T/E run with a polarised leg: ``method``, ``centralell``,
+        ``dmax``, ``lmin``, ``lmax``, ``leakage`` (``lambda`` is ``None``,
+        with ``unavailable``, when it could not be bounded), ``normalisation``,
+        ``blocks``, ``translation`` and ``measured_reference``.
+
+        For a run to which those two terms do not apply -- TT-only, or with
+        a B observable -- the dict has ``"applicable": False`` and
+        ``"reason"`` (``"tt_only"`` or ``"b_run"``), the same run header, the
+        ``normalisation`` entry, an empty ``blocks``, and ``leakage`` and
+        ``translation`` reduced to ``{"applicable": False, "reason": text}``.
+        (``leakage["lambda"] is None`` keeps its other meaning, "could not be
+        bounded", for the first kind only.)
     """
+    from ..covariance import has_b_observable
+
     blocks = {}
     for cov_key in covariance_keys.keys():
         n_polarised = polarised_leg_count(cov_key)
@@ -199,8 +417,10 @@ def error_budget(strategy, covariance_keys, band_edges=None) -> dict | None:
                 "frequencies": cov_key.freqkey(),
                 "n_E": n_polarised,
             }
+    if has_b_observable(covariance_keys):
+        return _budget_without_bias_terms(strategy, "b_run", B_RUN_REASONS)
     if not blocks:
-        return None
+        return _budget_without_bias_terms(strategy, "tt_only", TT_ONLY_REASONS)
 
     config = strategy.cov.config
     leakage = leakage_ratio(strategy)
@@ -223,6 +443,7 @@ def error_budget(strategy, covariance_keys, band_edges=None) -> dict | None:
         "lmin": config.lmin,
         "lmax": lmax,
         "leakage": leakage,
+        "normalisation": normalisation_consistency(strategy),
         "blocks": blocks,
         "translation": {
             "bounded": False,
@@ -242,11 +463,65 @@ def error_budget(strategy, covariance_keys, band_edges=None) -> dict | None:
     }
 
 
+#: Why the leakage and translation sections do not apply to a TT-only run.
+TT_ONLY_REASONS = {
+    "leakage": (
+        "This run has no polarised leg. The E->B leakage of the Eq. 23 "
+        "normalisation biases only blocks with a polarised leg, and TT-only "
+        "blocks are unaffected."
+    ),
+    "translation": (
+        "Not reported: the calibration this report quotes for the Eq. 33 "
+        "translation was measured on polarised blocks, and this run has no "
+        "polarised leg. The translation also acts on TT blocks and is not "
+        "bounded per run either."
+    ),
+}
+
+#: Why they do not apply to a run with a B observable (the reasoning of the
+#: former ``ACCStrategy.error_budget``).
+B_RUN_REASONS = {
+    "leakage": (
+        "This run has a B observable, so its blocks use the per-Wick-term "
+        "normalisation (docs/theory/bmode_kernels.md), which is exact at l* "
+        "and carries no Eq. 23 leakage bias of the (n_E / 2) lambda form "
+        "quoted for T/E runs."
+    ),
+    "translation": (
+        "Not bounded per run. The measured accuracy of a run with a B "
+        "observable off l* is given in docs/theory/bmode_kernels.md, Sect. 8 "
+        "'Known limits'; the translation calibration quoted for T/E runs does "
+        "not describe the per-Wick-term rule."
+    ),
+}
+
+
+def _budget_without_bias_terms(strategy, kind: str, reasons: dict) -> dict:
+    """The budget of a run to which the leakage and translation terms do not
+    apply: the run header and the normalisation check, which does."""
+    config = strategy.cov.config
+    return {
+        "applicable": False,
+        "reason": kind,
+        "method": config.method.value,
+        "centralell": config.centralell,
+        "dmax": config.dmax,
+        "lmin": config.lmin,
+        "lmax": strategy.cov.lmax,
+        "leakage": {"applicable": False, "reason": reasons["leakage"]},
+        "translation": {"applicable": False, "reason": reasons["translation"]},
+        "normalisation": normalisation_consistency(strategy),
+        "blocks": {},
+    }
+
+
 def format_error_budget(budget: dict) -> str:
     """
     The budget as the text written beside the covariance. Reports; changes
     nothing.
     """
+    if budget.get("applicable", True) is False:
+        return _format_without_bias_terms(budget)
     leakage = budget["leakage"]
     lines = [
         "ACC polarised error budget",
@@ -294,4 +569,82 @@ def format_error_budget(budget: dict) -> str:
         "   l = 500 and +3.8% at l = 100.",
         "",
     ]
+    lines += _format_normalisation(budget.get("normalisation"))
     return "\n".join(lines)
+
+
+def _format_without_bias_terms(budget: dict) -> str:
+    """The report of a run to which sections 1 and 2 do not apply."""
+    lines = [
+        "ACC error budget",
+        "================",
+        "",
+        "Reported, not applied: the covariance is unchanged by this file.",
+        "",
+        f"centralell (l*) = {budget['centralell']}, dmax = {budget['dmax']}, "
+        f"lmin = {budget['lmin']}, lmax = {budget['lmax']}",
+        "",
+    ]
+    for number, title, key in (
+        (1, "E->B leakage of the kernel set", "leakage"),
+        (2, "Eq. 33 translation error", "translation"),
+    ):
+        lines += [
+            f"{number}. {title}: NOT APPLICABLE",
+            textwrap.fill(
+                budget[key]["reason"],
+                width=76,
+                initial_indent="   ",
+                subsequent_indent="   ",
+            ),
+            "",
+        ]
+    return "\n".join(lines + _format_normalisation(budget.get("normalisation")))
+
+
+def _format_normalisation(norm: dict | None) -> list[str]:
+    """Section 3 of the report: the Eq. 22 consistency of kernels and Xi."""
+    lines = [
+        "3. Normalisation: kernels against Cov.Xi (Eq. 22 sum rule)",
+        "   sum Theta^{TT x TT}_{l*,l*+d} / n  vs  Xi^{00}_{l*,l*+d},"
+        "  n = (2l+1)(2l'+1)",
+    ]
+    if norm is None:
+        return lines + ["   NOT AVAILABLE: not computed.", ""]
+    if norm["max_relative_mismatch"] is None:
+        return lines + [
+            textwrap.fill(
+                "NOT AVAILABLE: " + norm["unavailable"],
+                width=76,
+                initial_indent="   ",
+                subsequent_indent="   ",
+            ),
+            "",
+        ]
+    lines.append(
+        f"   max relative mismatch = {norm['max_relative_mismatch']:.3e} over "
+        f"{norm['diagonals_checked']} diagonals (worst at (l, l') = "
+        f"{tuple(norm['worst_pair'])}); warning threshold "
+        f"{norm['threshold']:.0e}: " + ("EXCEEDED" if norm["exceeds"] else "ok")
+    )
+    lines.append(
+        f"   at d = 0: {norm['mismatch_first']:.3e}; kernels built with "
+        f"lw = {norm['lw']}, nside = {norm['nside']}, grid = {norm['grid']}, "
+        f"term_selection = {norm['term_selection']}"
+    )
+    if norm["exceeds"]:
+        lines.append(
+            textwrap.fill(
+                "Cov.Xi carries mask weight that the kernel shapes lack, so ACC "
+                "elements are off by up to about this fraction. Large already "
+                "at d = 0: the mask has power beyond the kernels' lw; raise "
+                "acc_precompute.lw and recompute the kernels. Growing with d: "
+                "the kernel range 2 nside cuts the tail; raise "
+                "acc_precompute.nside.",
+                width=76,
+                initial_indent="   ",
+                subsequent_indent="   ",
+            )
+        )
+    lines.append("")
+    return lines

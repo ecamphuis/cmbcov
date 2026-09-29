@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.4.0 — 2026-09-29
+
+### Breaking changes
+
+- **B-mode runs need a larger kernel cache.** Runs with a B observable now
+  need the kernels of both orientations of every block: 24 or 25 kernel
+  pairs instead of 17 or 18 for a typical run, 45 instead of 31 or 40 for
+  the larger sets. T/E-only and BB-only runs are unchanged. **An existing
+  B-mode cache is refused** with a message naming the missing pairs; add
+  them with `precompute_acc_kernels(..., pairs=[...])` (now safe, see
+  below) or rerun `cmbcov-precompute`. The precompute takes 2–5% longer and
+  about 40% more disk.
+
+### Fixed
+
+- **Multi-frequency B-mode covariances depended on the order of the
+  spectra and could fail to be positive-definite**, the same bug 0.3.0
+  fixed for T/E runs. Every element is now computed in its own
+  orientation, so the result no longer depends on how frequencies or
+  observables are listed, and is exact at the central multipole.
+- **Adding kernel pairs to an existing cache was unsafe.** It could leave
+  a wrong record of what the cache holds, and a precompute with different
+  settings into the same directory could leave stale kernels that were
+  then used. Each cache record now lists its kernel files and is merged on
+  extension; kernel files not in the record are refused. Caches written by
+  earlier versions still load as before.
+
+### Added
+
+- **`conditioning.txt`** beside every covariance: the eigenvalues of the
+  correlation matrix, whether it is positive-definite, and its condition
+  number, with a warning in the log if it is not positive-definite.
+- **A normalisation check in `error_budget.txt`**, which ACC now writes for
+  every run (TT-only and B-mode runs included, with the sections that do
+  not apply marked as such). It checks the kernels against the MASTER
+  normalisation on every diagonal and warns above 1%.
+
+### Performance
+
+- **A multi-frequency run is about 4× faster.** The ACC assembly now shares
+  kernel products between blocks (byte-identical output), and the PolSpice
+  transform, D_ℓ scaling, debiasing and binning are folded into one
+  projection per spectrum. On a three-frequency T/E run at ℓmax = 3500 the
+  whole computation goes from about 10 to 2.5 minutes, with about 1 GB
+  less memory. B-mode runs gain 4–6× on the assembly.
+- The folding changes results at round-off level only: at most 2e-15 of
+  the largest element on that run. Where it would not pay (nearly unbinned
+  output, PolSpice off), the previous code runs and results are
+  bit-identical.
+
 ## 0.3.0 — 2026-09-29
 
 ### Fixed

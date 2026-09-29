@@ -194,10 +194,10 @@ def _a_spectra(odd):
 @pytest.fixture(scope="module")
 def rippled(tmp_path_factory):
     """The rippled cap as a band-limited map, with GL kernels for every one
-    of the 81 ordered pairs (so every block is computed in its natural
-    orientation) and, in a second directory, only the 18-pair minimal set."""
+    of the 81 ordered pairs and, in a second directory, only the 25-pair
+    set of required_kernel_pairs (both orientations of every block)."""
     full = str(tmp_path_factory.mktemp("rippled_full"))
-    minimal = str(tmp_path_factory.mktemp("rippled_18"))
+    minimal = str(tmp_path_factory.mktemp("rippled_25"))
     for work, pairs in (
         (full, ALL_PAIRS),
         (minimal, sorted(required_kernel_pairs(SIX))),
@@ -264,35 +264,101 @@ def test_every_block_is_exact_at_lstar(rippled, odd):
     assert worst_plain <= 1e-10 and worst_natural <= 1e-10
 
 
-def test_transposed_orientation_from_the_minimal_cache(rippled):
-    """With only the 18-pair cache (best orientation,
-    docs/theory/bmode_kernels.md, Sect. 6), Cov(TE, BB)
-    is computed as Cov(BB, TE)^T: its exact element is then (l*+Delta, l*),
-    and the raw-block identity records the orientation."""
+def test_minimal_cache_computes_both_orientations(rippled):
+    """With only the 25-pair cache (required_kernel_pairs), a block between
+    two different spectra is computed in both orientations (the raw-block
+    identity records ``"both"``), so both of its triangles are exact at l*,
+    and the result is bit-identical to the 81-pair cache's."""
     cls = _a_spectra(False)
     cl = {"ff": {**cls, "ET": cls["TE"], "BT": cls["TB"], "BE": cls["EB"]}}
-    cov = _acc_cov(rippled["minimal"], A_LMAX, A_DMAX, A_LSTAR)
-    strategy = StrategyFactory.create_strategy(cov)
-    strategy.configure_run(CovKeys([], ["f"], observables=SIX), cl)
+    keys = CovKeys([], ["f"], observables=SIX)
+    strategies = {}
+    for name, cov in (
+        ("minimal", _acc_cov(rippled["minimal"], A_LMAX, A_DMAX, A_LSTAR)),
+        ("full", rippled["cov"]),
+    ):
+        strategies[name] = StrategyFactory.create_strategy(cov)
+        strategies[name].configure_run(keys, cl)
+    strategy = strategies["minimal"]
     orientation = {
         blk: strategy.raw_block_inputs(_key(*blk), cl)[1]["acc_block_orientation"]
-        for blk in [("TE", "BB"), ("BB", "TE"), ("TB", "EB"), ("EB", "TB")]
+        for blk in [
+            ("TE", "BB"),
+            ("BB", "TE"),
+            ("TB", "EB"),
+            ("EB", "TB"),
+            ("BB", "BB"),
+        ]
     }
     assert orientation == {
-        ("TE", "BB"): "transposed",
-        ("BB", "TE"): "natural",
-        ("TB", "EB"): "transposed",
-        ("EB", "TB"): "natural",
+        ("TE", "BB"): "both",
+        ("BB", "TE"): "both",
+        ("TB", "EB"): "both",
+        ("EB", "TB"): "both",
+        ("BB", "BB"): "natural",
     }
-    block = strategy.compute_covariance_term(_key("TE", "BB"), cl)
-    rows = {
-        0: exact_covariance_row_pol(
-            rippled["alm"], cls, A_LSTAR, A_LMAX, spectra=SIX, lw=A_LW, lmax_int=40
+    row = exact_covariance_row_pol(
+        rippled["alm"], cls, A_LSTAR, A_LMAX, spectra=SIX, lw=A_LW, lmax_int=40
+    )
+    for s1, s2 in [("TE", "BB"), ("BB", "TE"), ("TT", "BB"), ("TB", "EB")]:
+        block = strategy.compute_covariance_term(_key(s1, s2), cl)
+        np.testing.assert_array_equal(
+            block, strategies["full"].compute_covariance_term(_key(s1, s2), cl)
         )
+        for d in range(A_DMAX):
+            ref = row[(s1, s2)][A_LSTAR + d]  # Cov(s1 at l*+d, s2 at l*)
+            assert abs(block[A_LSTAR + d, A_LSTAR] / ref - 1) <= 1e-10, (s1, s2, d)
+            ref = row[(s2, s1)][A_LSTAR + d]  # Cov(s1 at l*, s2 at l*+d)
+            assert abs(block[A_LSTAR, A_LSTAR + d] / ref - 1) <= 1e-10, (s1, s2, d)
+
+
+def test_one_orientation_cache_is_refused(rippled, tmp_path):
+    """A cache holding one orientation of TE x BB (the pairs of Cov(BB, TE)
+    only, as the 18-pair set of cmbcov 0.3.0 did) is refused for that block,
+    naming its missing pairs, instead of computing its lower triangle from
+    the kernel of the other orientation. The single-orientation auto block
+    BB x BB still runs on it."""
+    from cmbcov.bmode_wick import covkey_wick_terms
+
+    one = sorted(
+        {
+            (t.channel_1, t.channel_2)
+            for t in covkey_wick_terms(tuple("BBTE"), ("f",) * 4)
+        }
+        | {
+            (t.channel_1, t.channel_2)
+            for t in covkey_wick_terms(tuple("BBBB"), ("f",) * 4)
+        }
+    )
+    other = {
+        (t.channel_1, t.channel_2) for t in covkey_wick_terms(tuple("TEBB"), ("f",) * 4)
     }
-    for d in range(A_DMAX):
-        ref = rows[0][("TE", "BB")][A_LSTAR + d]  # Cov(TE_{l*+d}, BB_{l*})
-        assert abs(block[A_LSTAR + d, A_LSTAR] / ref - 1) <= 1e-10, d
+    missing = sorted(other - set(one))
+    assert missing
+    work = str(tmp_path)
+    shutil.copy(os.path.join(rippled["full"], "mask.fits"), work)
+    precompute_acc_kernels(
+        "mask.fits",
+        work,
+        centralell=A_LSTAR,
+        dmax=A_DMAX,
+        mask_path=work,
+        nside=A_NSIDE_ACC,
+        grid="gl",
+        lw=A_LW,
+        pairs=one,
+    )
+    cls = _a_spectra(False)
+    cl = {"ff": {**cls, "ET": cls["TE"], "BT": cls["TB"], "BE": cls["EB"]}}
+    strategy = StrategyFactory.create_strategy(_acc_cov(work, A_LMAX, A_DMAX, A_LSTAR))
+    strategy.configure_run(CovKeys([], ["f"], observables=SIX), cl)
+    for blk in [("TE", "BB"), ("BB", "TE")]:
+        with pytest.raises(OSError, match="both orientations") as excinfo:
+            strategy.compute_covariance_term(_key(*blk), cl)
+        message = str(excinfo.value)
+        assert all("x".join(p) in message for p in missing)
+        assert "changed after cmbcov 0.3.0" in message
+    assert np.any(strategy.compute_covariance_term(_key("BB", "BB"), cl))
 
 
 def test_parity_mixed_block_is_zero_unless_requested(rippled):
@@ -732,10 +798,10 @@ def _generator_run(workdir, observables, parity_mixed, nonzero_odd, freqs):
 @pytest.mark.parametrize(
     "level, observables, parity_mixed, nonzero_odd, n_pairs",
     [
-        (2, ["TT", "EE", "TE", "BB"], False, False, 17),
-        (3, SIX, False, False, 18),
-        (3, SIX, False, True, 40),
-        (4, SIX, True, False, 31),
+        (2, ["TT", "EE", "TE", "BB"], False, False, 24),
+        (3, SIX, False, False, 25),
+        (3, SIX, False, True, 45),
+        (4, SIX, True, False, 45),
     ],
     ids=["level2", "level3", "level3-nonzero-TB-EB", "level4"],
 )

@@ -45,19 +45,22 @@ def _cov(save_dir, save_raw_blocks, lmax=32):
 
 
 def _counting(monkeypatch):
-    """Count calls to every strategy's compute_covariance_term."""
+    """Count the blocks every strategy computes: one per block yielded by
+    compute_covariance_terms, which is how Cov.compute_covariance_matrix
+    has the strategy compute the blocks the cache does not hold."""
     calls = []
     real = StrategyFactory.create_strategy
 
     def create(cov):
         strategy = real(cov)
-        inner = strategy.compute_covariance_term
+        inner = strategy.compute_covariance_terms
 
         def counted(*args, **kwargs):
-            calls.append(1)
-            return inner(*args, **kwargs)
+            for item in inner(*args, **kwargs):
+                calls.append(1)
+                yield item
 
-        strategy.compute_covariance_term = counted
+        strategy.compute_covariance_terms = counted
         return strategy
 
     monkeypatch.setattr(StrategyFactory, "create_strategy", staticmethod(create))

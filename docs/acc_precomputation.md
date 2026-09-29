@@ -18,7 +18,7 @@ and `dmax` trades off against accuracy.
 | `dmax` | Number of diagonal bands `\|l - l'\| < dmax` ACC computes (zero outside the band). | For binned output, set by the bin width $w$: `dmax >= w` for correct bandpower error bars (a bandpower variance sums pairs separated by 0 to $w - 1$), `dmax >= 2w` for correct correlations between adjacent bandpowers (their covariance sums pairs separated by 1 to $2w - 1$). Below either threshold ACC silently drops those pairs and the validator warns. For an unbinned, per-multipole covariance, size it instead by how fast the *true* mask-induced correlation between $\ell$ and $\ell'$ decays for your footprint: compute one exact row (`cmbcov.exact.exact_covariance_row`) at a representative $\ell$ and read off where it falls below your target. Either way, the cost of ACC is one kernel pair per value of `dmax`; the recompute step (spectra, noise, beams, binning) also grows with `dmax`, since it touches `dmax` diagonals, but stays cheap -- a few seconds at `dmax` 20 to 100 on a 66-bandpower T/E run. |
 | `nside` | ACC working resolution; kernels are `S = 2 * nside` square. | `None` derives it from `centralell + dmax` (at least 128); higher is more accurate and slower. It also sets how far past `lmax` every run must supply spectra: `lmax_int = lmax + max(0, S - 1 - centralell)` (see [`getting_started.md`](getting_started.md), "The ACC internal band limit"). |
 | `grid` | Quadrature backend: `gl` (default) or `healpix`. | `gl` is exact for a band-limited mask and the only grid that supports B-mode observables; `healpix` computes T, E and B from one joint transform but has no term-selection support. |
-| `lw` | Mask band-limit, `grid: gl` only. | `None` means `3 * nside - 1`. Larger is more accurate (up to the mask's true band-limit) and more expensive. |
+| `lw` | Mask band-limit, `grid: gl` only. | `None` means `3 * nside - 1`. Larger is more accurate (up to the mask's true band-limit) and more expensive. Each ACC run checks it: `error_budget.txt` reports how far the kernels' Eq. 22 sum falls from `Cov.Xi` and logs a warning above $10^{-2}$; a mismatch that is already large at $d = 0$ says `lw` is too low for the mask ([`theory/acc.md`](theory/acc.md), Sect. 2). |
 
 The secondary multipoles are not a free choice: for every offset `d` in
 `range(dmax)`, ACC loads the kernel of `(centralell, centralell + d)` and
@@ -86,8 +86,13 @@ chunks, since the central integrals are recomputed once per chunk.
 Kernels are saved as `.npy` files under `{save_dir}/covariance_coupling/`,
 named `{stokes1}x{stokes2}_{ell}x{ellp}.npy`. A manifest,
 `manifest_{ell}x{ellp}.json`, is written next to them, recording `spectra`,
-`grid`, `lw`, `nside`, `centralell`, the mask's digest and the package
-revision. `Cov` (and `cmbcov-precompute`) load them automatically as long as
+the kernel files written (`pairs`), `grid`, `lw`, `nside`, `centralell`,
+the mask's digest and the package revision. A later precompute into the
+same directory with the same mask and settings extends the cache: its pairs
+are added to the record, so a cache can be built in steps (for instance to
+add the pairs a newer version needs). One with a different mask or
+settings starts a new record, and the kernels it did not rewrite are no
+longer served. `Cov` (and `cmbcov-precompute`) load them automatically as long as
 they point at the same directory, the same mask, and a `centralell`/`dmax`
 no larger than what was precomputed — checked against the manifest on every
 load. Changing the mask or `centralell` without rerunning `cmbcov-precompute`
@@ -131,6 +136,14 @@ rule and its accuracy/cost trade-off.
   `(centralell, centralell + d)` pair, `centralell`/`dmax` do not match what
   was precomputed, or `save_dir`/`acc_kernel_dir` does not point at the
   directory holding `covariance_coupling/`.
+- **"ACC coupling kernels not found ... N of them are missing"** in a run
+  with a B observable: the cache lacks kernel pairs the run needs, listed in
+  the message. A B-mode cache precomputed by cmbcov 0.3.0 or earlier holds
+  one orientation per block and lacks the pairs of the other
+  ([B-mode kernels](theory/bmode_kernels.md), Sect. 6); rerun
+  `cmbcov-precompute`, or add the listed pairs with
+  `precompute_acc_kernels(..., pairs=[...])` and the settings the cache was
+  built with.
 - **"cache mismatch in 'mask_digest'" or `'centralell'`**: the cache was
   built for a different mask or `centralell`; rerun `cmbcov-precompute`.
 - **A spectrum-length error naming `lmax_int`**: the spectra must reach

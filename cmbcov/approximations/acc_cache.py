@@ -26,6 +26,8 @@ __all__ = [
     "coupling_save_path",
     "coupling_manifest_path",
     "coupling_kernel_candidates",
+    "kernel_file_pair",
+    "locate_coupling_kernel",
     "read_coupling_manifest",
     "write_coupling_kernels",
     "write_generation",
@@ -221,6 +223,64 @@ def coupling_kernel_candidates(
     return candidates
 
 
+def kernel_file_pair(path: str) -> str:
+    """The ``"s1xs2"`` label of a kernel file, from its name
+    (``.../covariance_coupling/s1xs2_<ell>x<ell_prime>.npy``) -- the pair as
+    stored on disk, whatever orientation or name a caller asked for."""
+    return os.path.basename(path).split("_", 1)[0]
+
+
+def _pair_label(key) -> str:
+    """``"s1xs2"`` for a kernel key given as ``"s1xs2"`` or ``(s1, s2)``."""
+    return key if isinstance(key, str) else "x".join(key)
+
+
+def locate_coupling_kernel(
+    save_dir: str,
+    stokes_key: tuple[str, str],
+    ell: int,
+    ell_prime: int,
+    known_spectra: Sequence[str],
+    legacy_names: dict[str, str] | None = None,
+    manifest: dict | bool | None = None,
+) -> tuple[tuple[str, bool] | None, list[str]]:
+    """
+    The file that serves the kernel of ``stokes_key`` at ``(ell,
+    ell_prime)``, exactly as :func:`load_coupling_kernels` picks it.
+
+    Returns ``(found, unrecorded)``. ``found`` is ``(path, transposed)`` of
+    the first of :func:`coupling_kernel_candidates` (own name, legacy name,
+    transposed own name, transposed legacy name) that exists and that the
+    manifest's pair record lists, or ``None``. ``unrecorded`` lists the
+    candidates that exist but are NOT in that record: files the precompute
+    that wrote the manifest did not write, left over from an earlier cache
+    with a different identity (:func:`write_coupling_kernels`), which are
+    never served. A manifest with no ``pairs`` record (written before the
+    record existed, or ``manifest`` falsy: no manifest) lists every file.
+    """
+    recorded = None
+    if manifest and manifest.get("pairs") is not None:
+        recorded = set(manifest["pairs"])
+    stokes_key = tuple(stokes_key)
+    unrecorded = []
+    for path, transposed in coupling_kernel_candidates(
+        save_dir, stokes_key, ell, ell_prime, known_spectra, legacy_names
+    ):
+        if not os.path.exists(path):
+            continue
+        # A legacy-named file holds the kernel of the pair it stands for,
+        # so either its own name or that pair's may be the recorded one.
+        represents = "x".join(stokes_key[::-1] if transposed else stokes_key)
+        if recorded is not None and not (
+            kernel_file_pair(path) in recorded or represents in recorded
+        ):
+            if path not in unrecorded:
+                unrecorded.append(path)
+            continue
+        return (path, transposed), unrecorded
+    return None, unrecorded
+
+
 def read_coupling_manifest(save_dir: str, ell: int, ell_prime: int) -> dict | None:
     """
     Read the manifest :func:`write_coupling_kernels` writes next to the
@@ -229,10 +289,13 @@ def read_coupling_manifest(save_dir: str, ell: int, ell_prime: int) -> dict | No
     computed).
 
     The manifest records ``spectra`` (the requested subset of the caller's
-    spectra set that pair was computed for), ``grid``, ``lw``, ``nside``,
-    ``centralell`` and ``git_hash`` -- enough for :func:`load_coupling_kernels`
-    to tell "this cache was built for a smaller spectrum set" apart from
-    "this file is missing because something went wrong".
+    spectra set that pair was computed for), ``pairs`` (the kernel files
+    written, as ``"s1xs2"``; absent in manifests written by cmbcov 0.3.0
+    and earlier), ``grid``, ``lw``, ``nside``, ``centralell`` and ``git_hash`` --
+    enough for :func:`load_coupling_kernels` to tell "this cache was built
+    for a smaller spectrum set" apart from "this file is missing because
+    something went wrong". ``spectra`` and ``pairs`` cover every write into
+    the directory with the same identity (:func:`write_coupling_kernels`).
     """
     path = coupling_manifest_path(save_dir, ell, ell_prime)
     if not os.path.exists(path):
@@ -295,6 +358,24 @@ def write_coupling_kernels(
     ``lw`` and ``grid`` (see :func:`_validate_cache_identity`), so a cache
     read back right after being written in this process always validates
     cleanly against it.
+
+    **Extending a cache.** The manifest records the kernel files written
+    (``pairs``, as ``"s1xs2"``) and their channels (``spectra``). When the
+    directory already holds a manifest for ``(ell, ellp)`` with the same
+    identity (every field of :data:`_MANIFEST_IDENTITY_FIELDS`: mask digest,
+    ``centralell``, ``grid``, ``lw``, ``nside``, term selection and its
+    statistics, HEALPix ``map2alm_iter`` and kernel version), the new write
+    is an extension of that cache: ``pairs`` and ``spectra`` become the
+    union of both records (``spectra`` in ``known_spectra`` order), so
+    adding pairs to a cache in several precomputes gives the manifest of a
+    one-shot precompute of their union (``git_hash`` is the latest
+    write's). Otherwise (no manifest, or a different identity) the manifest
+    records this write alone, and the old manifest is removed before any
+    kernel file is written, so an interrupted write never leaves kernels
+    certified by the wrong identity. :func:`load_coupling_kernels` never
+    serves a file the ``pairs`` record does not list, so the kernels an
+    earlier cache left in the directory are refused rather than validated
+    against this write's identity.
     """
     os.makedirs(
         os.path.dirname(
@@ -307,22 +388,11 @@ def write_coupling_kernels(
     # generation that predates a partially completed write.
     _WRITE_GENERATION[abs_dir] = _WRITE_GENERATION.get(abs_dir, 0) + 1
 
-    for key in coupling_kernels.keys():
-        save_path = coupling_save_path(save_dir, key, ell, ellp, known_spectra)
-        try:
-            # save_path already ends in .npy; np.save would append another
-            # .npy if it didn't, but never doubles an existing one.
-            np.save(save_path, coupling_kernels[key])
-            if verbose:
-                print(f"  Saved {key} coupling to {save_path}")
-        except Exception as e:
-            print(f"  Error saving {key}: {e}")
-            raise
-
     manifest = {
         "ell": ell,
         "ellp": ellp,
         "spectra": list(spectra),
+        "pairs": sorted({_pair_label(key) for key in coupling_kernels}),
         "grid": grid,
         "lw": lw,
         "nside": nside,
@@ -342,6 +412,24 @@ def write_coupling_kernels(
     if healpix_kernel_version is not None:
         manifest["healpix_kernel_version"] = healpix_kernel_version
     manifest_path = coupling_manifest_path(save_dir, ell, ellp)
+    existing = read_coupling_manifest(save_dir, ell, ellp)
+    if existing is not None and not _same_identity(existing, manifest):
+        os.remove(manifest_path)
+        existing = None
+    manifest = _merged_manifest(existing, manifest, known_spectra)
+
+    for key in coupling_kernels.keys():
+        save_path = coupling_save_path(save_dir, key, ell, ellp, known_spectra)
+        try:
+            # save_path already ends in .npy; np.save would append another
+            # .npy if it didn't, but never doubles an existing one.
+            np.save(save_path, coupling_kernels[key])
+            if verbose:
+                print(f"  Saved {key} coupling to {save_path}")
+        except Exception as e:
+            print(f"  Error saving {key}: {e}")
+            raise
+
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2, sort_keys=True)
     if verbose:
@@ -350,6 +438,66 @@ def write_coupling_kernels(
     _CACHE_REFERENCE[os.path.abspath(save_dir)] = {
         field: manifest.get(field) for field in _REFERENCE_FIELDS
     }
+
+
+#: Manifest fields that identify how the kernels of one ``(ell, ellp)``
+#: were computed: a write whose manifest agrees with the one on disk on all
+#: of them extends that cache (:func:`write_coupling_kernels`); any
+#: difference, a field present in one and absent in the other included,
+#: starts a new one. ``git_hash`` is deliberately not one of them (a code
+#: change alone does not invalidate a cache, :func:`load_coupling_kernels`).
+_MANIFEST_IDENTITY_FIELDS = (
+    "ell",
+    "ellp",
+    "centralell",
+    "mask_digest",
+    "grid",
+    "lw",
+    "nside",
+    "term_selection",
+    "term_selection_stats",
+    "map2alm_iter",
+    "healpix_kernel_version",
+)
+
+_ABSENT = object()
+
+
+def _same_identity(existing: dict, new: dict) -> bool:
+    """Whether two manifests agree on every :data:`_MANIFEST_IDENTITY_FIELDS`
+    field (absent counts as a value of its own)."""
+    return all(
+        existing.get(field, _ABSENT) == new.get(field, _ABSENT)
+        for field in _MANIFEST_IDENTITY_FIELDS
+    )
+
+
+def _merged_manifest(
+    existing: dict | None, new: dict, known_spectra: Sequence[str]
+) -> dict:
+    """
+    The manifest to write for ``new`` given the one on disk: ``new`` itself
+    unless ``existing`` has the same identity (:func:`_same_identity`), in
+    which case ``spectra`` and ``pairs`` are the unions of both records.
+    ``spectra`` is then in ``known_spectra`` order (labels outside it after,
+    in first-seen order), as a one-shot precompute of the union writes it.
+    ``pairs`` stays absent if ``existing`` has no ``pairs`` record (a
+    manifest from cmbcov 0.3.0 or earlier: which files it covered is not
+    known, so no record would be complete).
+    """
+    if existing is None or not _same_identity(existing, new):
+        return new
+    merged = dict(new)
+    seen = list(existing.get("spectra", []))
+    seen += [s for s in new.get("spectra", []) if s not in seen]
+    merged["spectra"] = [s for s in known_spectra if s in seen] + [
+        s for s in seen if s not in known_spectra
+    ]
+    if existing.get("pairs") is None:
+        merged.pop("pairs", None)
+    else:
+        merged["pairs"] = sorted(set(existing["pairs"]) | set(new["pairs"]))
+    return merged
 
 
 def _unverifiable_summary(save_dir: str) -> str:
@@ -701,7 +849,10 @@ def load_coupling_kernels(
         substitution. Otherwise, an ET file that is missing while its TE
         counterpart exists means the cache predates ET kernels being
         computed separately from TE; such kernels must also be recomputed,
-        with no fallback.
+        with no fallback. A file that exists but that the manifest's
+        ``pairs`` record does not list (left over from an earlier cache
+        with another identity, :func:`write_coupling_kernels`) is not
+        served either: the message names it.
     """
     if pairs is None:
         pairs = default_pairs
@@ -709,12 +860,11 @@ def load_coupling_kernels(
         pairs = list(pairs)
 
     coupling_kernels = {}
-    manifest: dict | bool | None = None  # False once looked up and absent
+    # False when there is none. Read up front: its pair record decides which
+    # files may be served (locate_coupling_kernel).
+    manifest: dict | bool = read_coupling_manifest(save_dir, ell, ell_prime) or False
 
     if current is not None:
-        manifest = read_coupling_manifest(save_dir, ell, ell_prime)
-        if manifest is None:
-            manifest = False
         _validate_cache_identity(manifest, current, save_dir, ell, ell_prime)
 
     for stokes_1, stokes_2 in pairs:
@@ -729,30 +879,39 @@ def load_coupling_kernels(
             save_dir, stokes_key, ell, ell_prime, known_spectra
         )
 
-        if os.path.exists(coupling_path):
-            coupling_kernels[stokes_key] = np.load(coupling_path)
-            continue
-
         # Own name, legacy name, transposed own name, transposed legacy
         # name (docs/theory/bmode_kernels.md): a cache that only
-        # stores the other orientation of this pair -- e.g. a B-mode
-        # precompute's minimal pair set -- still serves it, exactly
-        # (transposing a real array is exact; no recompute needed).
-        found = False
-        for candidate_path, transposed in coupling_kernel_candidates(
-            save_dir, stokes_key, ell, ell_prime, known_spectra, legacy_names
-        ):
-            if candidate_path == coupling_path:
-                continue  # already tried above
-            if os.path.exists(candidate_path):
-                array = np.load(candidate_path)
-                coupling_kernels[stokes_key] = (
-                    np.ascontiguousarray(array.T) if transposed else array
-                )
-                found = True
-                break
-        if found:
+        # stores the other orientation of this pair still serves it,
+        # exactly (transposing a real array is exact; no recompute needed).
+        found, unrecorded = locate_coupling_kernel(
+            save_dir,
+            stokes_key,
+            ell,
+            ell_prime,
+            known_spectra,
+            legacy_names,
+            manifest,
+        )
+        if found is not None:
+            path, transposed = found
+            array = np.load(path)
+            coupling_kernels[stokes_key] = (
+                np.ascontiguousarray(array.T) if transposed else array
+            )
             continue
+        if unrecorded:
+            manifest_path = coupling_manifest_path(save_dir, ell, ell_prime)
+            raise OSError(
+                f"Covariance coupling of {stokes_key!r} not served: "
+                f"{', '.join(unrecorded)} exists but the manifest "
+                f"{manifest_path} does not list it (its record: "
+                f"{manifest['pairs']}). The last precompute into this "
+                "directory had a different identity (mask, centralell, grid, "
+                "lw, nside or term selection) and did not rewrite this pair, "
+                "so the file is left over from an earlier cache. Recompute it "
+                "with precompute_acc_kernels(..., pairs=[...]) using this "
+                "run's settings, or remove it."
+            )
 
         legacy_path = _legacy_text_path(coupling_path)
         if os.path.exists(legacy_path):
@@ -765,11 +924,6 @@ def load_coupling_kernels(
                 "(add --remove-text to delete the .txt files after "
                 "verification), then rerun."
             )
-
-        if manifest is None:
-            manifest = read_coupling_manifest(save_dir, ell, ell_prime)
-            if manifest is None:
-                manifest = False
 
         covered = manifest and _spectra_covered(
             (stokes_1, stokes_2), manifest["spectra"], legacy_names

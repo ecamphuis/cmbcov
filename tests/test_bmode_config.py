@@ -276,34 +276,100 @@ def test_level1_equals_todays_pairs():
     assert level1 == _today_pairs()
 
 
+#: The one-orientation pair sets cmbcov 0.3.0 returned (17, 18, 31, 40 pairs):
+#: the new sets add, for every off-diagonal block, the pairs of its other
+#: orientation (docs/theory/bmode_kernels.md, Sect. 6).
+_ADDED_18_TO_25 = {
+    ("DD", "TD"),
+    ("DL", "TL"),
+    ("DT", "DT"),
+    ("DT", "TT"),
+    ("LD", "TL"),
+    ("LL", "TD"),
+    ("LT", "LT"),
+}
+
+
 def test_level2_bb_pair_count():
-    """16 four-spectrum blocks, one orientation (Sect. 9.6): 17 pairs."""
-    assert len(required_kernel_pairs(["TT", "EE", "TE", "BB"])) == 17
+    """16 four-spectrum blocks, both orientations: 24 pairs (17 with one)."""
+    assert len(required_kernel_pairs(["TT", "EE", "TE", "BB"])) == 24
 
 
 def test_level3_parity_respecting_pair_count():
-    """13 parity-respecting six-spectrum blocks, best orientation: 18 pairs."""
+    """13 parity-respecting six-spectrum blocks, both orientations: 25 pairs
+    (18 at the best single orientation), the 7 added ones being the
+    leg-swapped channels of the one-orientation set."""
     observables = ["TT", "EE", "TE", "BB", "TB", "EB"]
-    assert len(required_kernel_pairs(observables)) == 18
+    pairs = required_kernel_pairs(observables)
+    assert len(pairs) == 25
+    assert _ADDED_18_TO_25 <= pairs
 
 
 def test_level4_parity_mixed_pair_count():
-    """All 21 blocks, best orientation: 31 pairs."""
+    """All 21 blocks, both orientations: 45 pairs, every unordered pair of
+    the nine channels (31 at the best single orientation)."""
     observables = ["TT", "EE", "TE", "BB", "TB", "EB"]
-    assert len(required_kernel_pairs(observables, parity_mixed_blocks=True)) == 31
+    assert len(required_kernel_pairs(observables, parity_mixed_blocks=True)) == 45
 
 
 def test_nonzero_tb_eb_pair_count():
-    """C^TB, C^EB != 0: 40 pairs, whether or not parity_mixed_blocks."""
+    """C^TB, C^EB != 0: 45 pairs (40 in one orientation), whether or not
+    parity_mixed_blocks."""
     observables = ["TT", "EE", "TE", "BB", "TB", "EB"]
-    assert len(required_kernel_pairs(observables, parity_odd_nonzero=True)) == 40
+    assert len(required_kernel_pairs(observables, parity_odd_nonzero=True)) == 45
     assert (
         len(
             required_kernel_pairs(
                 observables, parity_odd_nonzero=True, parity_mixed_blocks=True
             )
         )
-        == 40
+        == 45
+    )
+
+
+def test_bb_only_and_ee_bb_pair_counts_unchanged():
+    """No off-diagonal block needs other pairs in its other orientation."""
+    assert len(required_kernel_pairs(["BB"])) == 3
+    assert len(required_kernel_pairs(["EE", "BB"])) == 6
+
+
+@pytest.mark.parametrize(
+    "observables, parity_odd_nonzero, parity_mixed_blocks",
+    [
+        (["BB"], False, False),
+        (["EE", "BB"], False, False),
+        (["TT", "EE", "TE", "BB"], False, False),
+        (["TT", "EE", "TE", "BB", "TB", "EB"], False, False),
+        (["TT", "EE", "TE", "BB", "TB", "EB"], False, True),
+        (["TT", "EE", "TE", "BB", "TB", "EB"], True, False),
+    ],
+)
+@pytest.mark.parametrize("n_freq", [1, 2, 3])
+def test_required_pairs_are_those_both_orientations_of_every_block_read(
+    observables, parity_odd_nonzero, parity_mixed_blocks, n_freq
+):
+    """The set is exactly the union of the kernel pairs the assembly reads
+    (covkey_wick_terms of every block of the run and of its transpose),
+    for 1, 2 and 3 frequencies, and does not depend on the order of the
+    observables."""
+    from cmbcov.bmode_wick import covkey_wick_terms
+
+    pairs = required_kernel_pairs(observables, parity_odd_nonzero, parity_mixed_blocks)
+    keys = CovKeys(
+        [],
+        [f"f{i}" for i in range(n_freq)],
+        observables=observables,
+        parity_mixed_blocks=parity_mixed_blocks,
+    )
+    odd = parity_odd_nonzero and any(o in ("TB", "EB") for o in observables)
+    read = set()
+    for key in keys.keys():
+        for oriented in (key, key.transpose()):
+            for term in covkey_wick_terms(oriented.stoke, oriented.freq, odd):
+                read.add((term.channel_1, term.channel_2))
+    assert read == pairs
+    assert pairs == required_kernel_pairs(
+        observables[::-1], parity_odd_nonzero, parity_mixed_blocks
     )
 
 
@@ -469,7 +535,7 @@ def test_precompute_pairs_absent_tb_eb_columns(tmp_path):
     plan = _precompute_plan(
         tmp_path, _acc_bmode_params(tmp_path, str(cmb)), "p_absent.yml"
     )
-    assert len(plan["pairs"]) == 18
+    assert len(plan["pairs"]) == 25
 
 
 def test_precompute_pairs_all_zero_tb_eb(tmp_path):
@@ -478,7 +544,7 @@ def test_precompute_pairs_all_zero_tb_eb(tmp_path):
     plan = _precompute_plan(
         tmp_path, _acc_bmode_params(tmp_path, str(cmb)), "p_zero.yml"
     )
-    assert len(plan["pairs"]) == 18
+    assert len(plan["pairs"]) == 25
 
 
 def test_precompute_pairs_nonzero_tb(tmp_path):
@@ -487,51 +553,83 @@ def test_precompute_pairs_nonzero_tb(tmp_path):
     plan = _precompute_plan(
         tmp_path, _acc_bmode_params(tmp_path, str(cmb)), "p_nonzero.yml"
     )
-    assert len(plan["pairs"]) == 40
+    assert len(plan["pairs"]) == 45
 
 
 # --------------------------------------------------------------------------- #
-# The recompute guard: non-zero TB/EB against an 18-pair cache must refuse
+# The recompute guard: a cache that lacks pairs the run needs must refuse,
+# naming every missing pair
 # --------------------------------------------------------------------------- #
 
 
-def test_recompute_error_against_18_pair_cache():
-    """A cache built for the 18-pair (EB-null-test) set does not cover the
-    40-pair (non-zero C^TB/C^EB) set: require_acc_cache_pairs must raise the
-    existing "recompute" error naming the missing pairs, not silently give a
-    partial answer. The 18-pair set itself, which the cache was built for,
-    still passes."""
-    import shutil
-    import tempfile
+def _precompute(kernel_dir, pairs, dmax=1):
+    precompute_acc_kernels(
+        "baseline_mask.fits",
+        kernel_dir,
+        centralell=16,
+        dmax=dmax,
+        mask_path=DATA,
+        nside=16,
+        grid="healpix",
+        pairs=pairs,
+    )
 
+
+def _pairs_named(message):
+    """Every ``AxB`` channel pair named in ``message``."""
+    import re
+
+    from cmbcov.approximations.acc import COUPLING_CHANNELS
+
+    names = "|".join(COUPLING_CHANNELS)
+    return set(re.findall(rf"\b({names})x({names})\b", message))
+
+
+def test_recompute_error_against_25_pair_cache(tmp_path):
+    """A cache built for the 25-pair (EB-null-test) set does not cover the
+    45-pair (non-zero C^TB/C^EB) set: require_acc_cache_pairs raises,
+    naming every one of the 20 missing pairs, not only the first. The
+    25-pair set itself, which the cache was built for, still passes."""
     observables = ["TT", "EE", "TE", "BB", "TB", "EB"]
-    pairs_18 = sorted(required_kernel_pairs(observables))
-    pairs_40 = sorted(required_kernel_pairs(observables, parity_odd_nonzero=True))
-    assert len(pairs_18) == 18 and len(pairs_40) == 40
+    pairs_25 = sorted(required_kernel_pairs(observables))
+    pairs_45 = sorted(required_kernel_pairs(observables, parity_odd_nonzero=True))
+    assert len(pairs_25) == 25 and len(pairs_45) == 45
 
-    kernel_dir = tempfile.mkdtemp()
-    try:
-        precompute_acc_kernels(
-            "baseline_mask.fits",
-            kernel_dir,
-            centralell=16,
-            dmax=1,
-            mask_path=DATA,
-            nside=16,
-            grid="healpix",
-            pairs=pairs_18,
-        )
-        require_acc_cache_pairs(kernel_dir, 16, 1, pairs_18)  # does not raise
-        missing = sorted(set(pairs_40) - set(pairs_18))
-        assert missing
-        with pytest.raises(OSError, match="not found") as excinfo:
-            require_acc_cache_pairs(kernel_dir, 16, 1, pairs_40)
-        # The missing pair the error names is genuinely one of the 22 pairs
-        # the 40-pair set adds over the 18-pair one (not e.g. a mistaken
-        # complaint about a pair both sets share).
-        assert any(f"{a}x{b}" in str(excinfo.value) for a, b in missing)
-    finally:
-        shutil.rmtree(kernel_dir, ignore_errors=True)
+    kernel_dir = str(tmp_path)
+    _precompute(kernel_dir, pairs_25, dmax=2)
+    require_acc_cache_pairs(kernel_dir, 16, 2, pairs_25)  # does not raise
+    missing = set(pairs_45) - set(pairs_25)
+    assert len(missing) == 20
+    with pytest.raises(OSError, match="not found") as excinfo:
+        require_acc_cache_pairs(kernel_dir, 16, 2, pairs_45)
+    message = str(excinfo.value)
+    listed = message.split("are missing", 1)[1].split(".", 1)[0]
+    assert _pairs_named(listed) == missing
+    assert "every diagonal" in message
+
+
+def test_one_orientation_cache_of_0_3_0_is_refused_with_the_new_requirement(
+    tmp_path,
+):
+    """A B-mode cache precomputed by cmbcov 0.3.0 (the one-orientation
+    18-pair set) lacks the 7 leg-swapped pairs the run now needs: refused
+    with a message naming exactly those, saying the requirement changed and
+    what to run."""
+    observables = ["TT", "EE", "TE", "BB", "TB", "EB"]
+    pairs_25 = required_kernel_pairs(observables)
+    pairs_18 = sorted(pairs_25 - _ADDED_18_TO_25)
+    assert len(pairs_18) == 18
+    kernel_dir = str(tmp_path)
+    _precompute(kernel_dir, pairs_18)
+    with pytest.raises(OSError) as excinfo:
+        require_acc_cache_pairs(kernel_dir, 16, 1, sorted(pairs_25))
+    message = str(excinfo.value)
+    listed = message.split("are missing", 1)[1].split(".", 1)[0]
+    assert _pairs_named(listed) == _ADDED_18_TO_25
+    assert "changed after cmbcov 0.3.0" in message
+    assert "both of its orientations" in message
+    assert "cmbcov-precompute" in message
+    assert "precompute_acc_kernels" in message
 
 
 def test_bb_pixel_window_matches_ee():

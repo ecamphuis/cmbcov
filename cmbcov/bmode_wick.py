@@ -22,7 +22,6 @@ docs/theory/bmode_kernels.md, Sect. 5.
 
 from __future__ import annotations
 
-import itertools
 from typing import NamedTuple
 
 from .approximations.acc import CHANNEL_ALIASES
@@ -150,34 +149,13 @@ def _pairs_of(
     return pairs
 
 
-def _minimal_pairs(
-    blocks: list[tuple[str, str]], parity_odd: bool, bb_needed: bool
-) -> set[tuple[str, str]]:
-    """
-    The channel-pair set of :func:`_pairs_of`, minimised over which
-    orientation of each off-diagonal block is used (``Cov(a, b)`` or
-    ``Cov(b, a)``): docs/theory/bmode_kernels.md, "best
-    orientation". Ported from the test's ``_minimal_over_orientation``, which
-    the derivation's 18/31/40 pair counts come from; brute force over the
-    off-diagonal blocks (``2**n_off``), fine for the handful of blocks six
-    observables give (``n_off <= 15``).
-    """
-    diag = [b for b in blocks if b[0] == b[1]]
-    off = [b for b in blocks if b[0] != b[1]]
-    base = _pairs_of(diag, parity_odd, bb_needed)
-    options = [
-        (
-            _pairs_of([b], parity_odd, bb_needed),
-            _pairs_of([b[::-1]], parity_odd, bb_needed),
-        )
-        for b in off
-    ]
-    best: set[tuple[str, str]] | None = None
-    for choice in itertools.product((0, 1), repeat=len(off)):
-        pairs = set(base).union(*(opt[c] for opt, c in zip(options, choice)))
-        if best is None or len(pairs) < len(best):
-            best = pairs
-    return best if best is not None else base
+def _both_orientations(blocks: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """``blocks`` plus the transpose ``(b, a)`` of every off-diagonal block
+    ``(a, b)``: the kernel of ``Cov(a, b)`` at ``(l*, l* + Delta)`` is exact
+    only with ``a`` on the lower multipole, so the lower triangle of the
+    block is computed from the Wick terms of ``Cov(b, a)``
+    (docs/theory/bmode_kernels.md, Sect. 6)."""
+    return list(blocks) + [b[::-1] for b in blocks if b[0] != b[1]]
 
 
 def required_kernel_pairs(
@@ -217,19 +195,39 @@ def required_kernel_pairs(
     Notes
     -----
     For an ``observables`` set with no B letter at all, this delegates to
-    the pre-existing, unminimised mechanism
+    the pre-existing mechanism
     (:meth:`~cmbcov.keys.SpecKey.kernel_stokekey` via
     :meth:`~cmbcov.keys.CovKey.key_to_cross_kernel`),
     which is what an ACC run over ``stokes: [T, E]`` has always loaded --
     the point being that this does not change a single pair a default
-    run reads, byte for byte. Level >= 2 (any B observable) instead uses the
-    Wick generator above with :func:`_minimal_pairs`; the two mechanisms
-    are not required to agree pair-for-pair on the T/E-only sub-blocks of a
-    B-mode run, only on their overall counts against the derivation
-    (docs/theory/bmode_kernels.md): a design choice available
-    because :func:`required_kernel_pairs` does not itself implement the
-    assembly that consumes these pairs, so nothing depends on which
-    minimisation is used.
+    run reads, byte for byte (its 10 pairs already hold both orientations
+    of every block).
+
+    With a B observable, the set is every pair the Wick terms of every
+    requested block need in BOTH orientations, ``Cov(a, b)`` and
+    ``Cov(b, a)``: the per-Wick-term assembly computes the upper triangle
+    of an off-diagonal block from the first and the lower one from the
+    second, so that every element is exact at ``l*``
+    (:meth:`~cmbcov.approximations.acc.ACCStrategy._wick_plan`,
+    docs/theory/bmode_kernels.md, Sect. 6). The two orientations need
+    different pairs: ``Cov(b, a)`` has the fields of the two legs exchanged
+    in every channel (``TL <-> LT``, ``DL <-> LD``, ``TD <-> DT``), and those
+    kernels cannot be derived from the others. Counts: 24 for ``TT, EE,
+    TE, BB``; 25 for the six spectra with ``C^TB = C^EB = 0``; 45 (every
+    unordered pair of the nine channels) for the six with
+    ``parity_mixed_blocks`` or non-zero ``C^TB``/``C^EB``; 3 for ``BB``
+    alone and 6 for ``EE, BB``. Up to cmbcov 0.3.0 this returned one
+    orientation per off-diagonal block (17, 18, 31, 40 pairs), so a B-mode
+    cache precomputed then lacks some of these; a run refuses it with a
+    message naming them
+    (:func:`~cmbcov.approximations.acc.require_acc_cache_pairs`).
+
+    Since every block brings both orientations, the result does not depend
+    on the order of ``observables``. Nor does it depend on the number of
+    frequencies: the union of the pairs :func:`covkey_wick_terms` gives
+    for both orientations of every block of a
+    :class:`~cmbcov.keys.CovKeys` run is this set for 1, 2 and 3
+    frequencies (tests/test_bmode_config.py).
     """
     canon = [canonical_spectrum(o) for o in observables]
     if not any("B" in o for o in canon):
@@ -237,18 +235,8 @@ def required_kernel_pairs(
 
     bb_needed = any("B" in o for o in canon)
     parity_odd = parity_odd_nonzero and any(o in PARITY_ODD_SPECTRA for o in canon)
-    blocks = _blocks(canon, parity_mixed_blocks)
-    if parity_odd:
-        # With C^TB, C^EB possibly non-zero every block couples to the
-        # parity-mixed kernels; the documented pair count (40,
-        # docs/theory/bmode_kernels.md, Sect. 6) is the plain, unminimised
-        # one, so this is kept unminimised here to match it exactly.
-        # Orientation minimisation (_minimal_pairs) does find a smaller,
-        # valid 32-pair cover in this case -- a possible later optimisation,
-        # not applied here since it would not match the documented 40.
-        old_pairs = _pairs_of(blocks, parity_odd, bb_needed)
-    else:
-        old_pairs = _minimal_pairs(blocks, parity_odd, bb_needed)
+    blocks = _both_orientations(_blocks(canon, parity_mixed_blocks))
+    old_pairs = _pairs_of(blocks, parity_odd, bb_needed)
     return {(CHANNEL_ALIASES[a], CHANNEL_ALIASES[b]) for a, b in old_pairs}
 
 

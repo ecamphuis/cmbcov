@@ -145,7 +145,7 @@ def detect_parity_odd_nonzero(
     not merely up to ``lmax``: a non-zero value past ``lmax`` only costs extra
     ACC kernel pairs, so being conservative over the whole file is fine, and
     an EB null test (TB/EB requested but zero or absent) must get the
-    smaller, 18-pair kernel set, not 40.
+    smaller, 25-pair kernel set, not 45.
 
     Needs no ``lmax`` and therefore no ACC kernel cache -- unlike
     :attr:`SpectraLoader.spectra_lmax` -- which is what lets both the ACC
@@ -345,8 +345,8 @@ class SpectraLoader:
         if any("B" in obs for obs in config.observables):
             # A B observable: derive the needed pairs from the observables
             # list, not the plain T/E channel square, and -- unlike the
-            # plain path below -- fail loudly (the existing "recompute"
-            # error, naming the missing pairs) if the on-disk cache does
+            # plain path below -- fail loudly (require_acc_cache_pairs,
+            # naming every missing pair) if the on-disk cache does
             # not cover them, rather than silently reporting whatever size
             # the pairs it does have imply.
             from .bmode_wick import required_kernel_pairs
@@ -1042,8 +1042,8 @@ class SpectraLoader:
         """
         Whether ``C^TB`` or ``C^EB`` is non-zero anywhere it was requested:
         the usual EB null test has both exactly zero, which is the smaller
-        (18-pair) ACC kernel set; any non-zero value needs the larger
-        (40-pair) one (:func:`~cmbcov.bmode_wick.required_kernel_pairs`).
+        (25-pair) ACC kernel set; any non-zero value needs the larger
+        (45-pair) one (:func:`~cmbcov.bmode_wick.required_kernel_pairs`).
         False (not an error) if TB/EB were not requested at all
         (``"TB"``/``"EB"`` absent from :attr:`combined_stokes`) -- they are
         then not even read (:func:`stokes_columns`), so there is nothing to

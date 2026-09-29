@@ -121,6 +121,21 @@ Completeness of the spherical harmonics gives the sum rule of Eq. 22:
 \sum_{L_1 L_2}\Theta_{\ell\ell'}^{TT\times TT}(L_1, L_2) = n\thinspace\Xi_{\ell\ell'}^{00}[W^2] .
 ```
 
+The sum rule is exact only when $\Theta$ and $\Xi$ come from the same
+band-limited mask and $\Theta$ is summed over its full support. In practice
+$\Xi$ (`Cov.Xi`) is built from the mask at its own band limit, the kernels
+from the mask truncated at `acc_precompute.lw` and stored for
+$L_1, L_2 < 2\thinspace n_{\rm side}$. The error budget written beside every
+ACC covariance (`error_budget.txt`) therefore evaluates the sum rule at
+$(\ell_\ast, \ell_\ast + d)$ for every diagonal $d < d_{\max}$ and reports
+$\max_d \left|\sum\Theta^{TT\times TT}/(n\thinspace\Xi^{00}) - 1\right|$,
+warning above $10^{-2}$. It is the share of the mask's weight that the kernel
+shape lacks and $\Xi$ carries, so it bounds the error on an element rather
+than equalling it. A value already large at $d = 0$ means the mask has power
+beyond `lw`; one that grows with $d$ means the kernel range cuts the tail of
+$\Theta$ (raise `nside`). It is a check, not a correction: nothing enters
+the covariance.
+
 ACC therefore splits the kernel into an amplitude, carried by $\Xi$, and a
 unit-sum shape $\bar\Theta = \Theta / \sum\Theta$. Eq. 23 is
 
@@ -180,7 +195,35 @@ between two TT spectra or two EE spectra have the same contractions in both
 orientations and are unchanged, so T-only and E-only runs are too, bit for
 bit. The other blocks cost up to twice the kernel products; over a whole
 T/E run the assembly does 37%, 54% and 61% more of them with 1, 2 and 3
-frequencies.
+frequencies. Runs with a B observable follow the same rule for every
+block, and their kernel-pair sets include both orientations of every block
+([B-mode kernels](bmode_kernels.md), Sect. 6).
+
+That cost is won back by computing the blocks of a run together. On
+diagonal $\Delta$ the band of one contraction is, for every
+$m = \min(\ell, \ell')$ at once, the row-wise product of
+$W^{a}\thinspace\bar\Theta$ with $W^{b}$, where row $m$ of the window
+matrix $W^{a}$ holds the $S$ multipoles of $C^{a}$ the translated kernel
+sees. The matrix product $W^{a}\thinspace\bar\Theta$, about
+$n_\ell S^2$ operations, is nearly all of the cost; the row-wise product
+with $W^{b}$ is $n_\ell S$. Many blocks of a run need the same product, and
+many more the same left factor $W^{a}\thinspace\bar\Theta$ with a
+different right spectrum. `Cov.compute_covariance_matrix` therefore hands
+the strategy all its blocks (`compute_covariance_terms`); ACC groups the
+blocks that share left factors into batches bounded in memory (512 MiB)
+and, diagonal by diagonal, computes every left factor of a batch once and
+every distinct product once. Each product is evaluated by exactly the
+operations a block alone would use, and each block sums its terms in the
+same order, so the result is bit-identical; products are shared by the
+content of the spectra, so equal arrays under different keys (TE and ET of
+one frequency pair, in a survey data model) share them too. On the survey
+footprint above this takes the matrix products per diagonal from 635 to
+109 with 3 frequencies (392 before the orientation fix) and from 136 to 43
+with 2 (88 before); the assembly of the 3-frequency run went from 514 s
+to 127 s (341 s before the fix). One frequency gains nothing: its 11 products per
+diagonal (8 before) have 11 different left factors. The cost that remains
+is set by the distinct left factors of the run, not by the number of
+blocks.
 
 Up to cmbcov 0.2.0 both triangles took the upper value, and which element of
 a block had the right kernel depended on the order of the spectra: in a

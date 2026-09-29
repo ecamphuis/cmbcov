@@ -165,9 +165,16 @@ Each `cmbcov-cov` run creates a fresh versioned directory under
   $D_\ell$ units (`Dl: true`). Block layout follows `covariance_keys`
   (frequency x Stokes combinations), each block `n_bins x n_bins`.
 - `lbins.dat` — the bandpower centres, one per output row/column block.
+- `conditioning.txt` — every run: the eigenvalues of the covariance's
+  correlation matrix ($D^{-1/2} C D^{-1/2}$), its condition number, and
+  whether it is positive definite. A likelihood needs an invertible,
+  positive-definite matrix, and multi-frequency covariances are genuinely
+  near-singular, so this is worth checking rather than assuming.
 - a copy of the parameter file that produced the run.
-- `error_budget.txt` — only for an ACC run with a polarised leg: the E→B
-  leakage bound and the (unbounded) Eq. 33 translation-error range; see
+- `error_budget.txt` — for every ACC run: the E→B
+  leakage bound and the (unbounded) Eq. 33 translation-error range (reported
+  as not applicable for a TT-only run or a run with a B observable) and the
+  kernel-against-`Cov.Xi` normalisation check; see
   [`approximations.md`](approximations.md).
 - `bb_leakage_warning.txt` — only for the BB-only NKA/INKA escape hatch; see
   [`polarisation.md`](polarisation.md).

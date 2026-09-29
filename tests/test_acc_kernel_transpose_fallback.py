@@ -193,7 +193,7 @@ def test_level1_run_on_bmode_precompute_cache_matches_full_square(tmp_path):
         nside=NSIDE,
         grid="healpix",
     )
-    pairs18 = sorted(required_kernel_pairs(["TT", "EE", "TE", "BB", "TB", "EB"]))
+    pairs_b = sorted(required_kernel_pairs(["TT", "EE", "TE", "BB", "TB", "EB"]))
     precompute_acc_kernels(
         "baseline_mask.fits",
         str(b_dir),
@@ -202,7 +202,7 @@ def test_level1_run_on_bmode_precompute_cache_matches_full_square(tmp_path):
         mask_path=DATA,
         nside=NSIDE,
         grid="healpix",
-        pairs=pairs18,
+        pairs=pairs_b,
     )
 
     cov_full = _cov(str(full_dir), dmax=2)

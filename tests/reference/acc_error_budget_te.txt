@@ -1,0 +1,82 @@
+ACC polarised error budget
+==========================
+
+Reported, not applied: the covariance is unchanged by this file.
+
+centralell (l*) = 16, dmax = 2, lmin = 2, lmax = 48
+
+1. E->B leakage of the kernel set
+   lambda = sum Theta^{TT x BB} / sum Theta^{TT x EE} at (l*, l*) = (16, 16)
+   lambda = 5.112e-02   (sum TTxBB = 3.740883e-03, sum TTxEE = 7.318055e-02)
+
+   A block with n_E polarised legs among its four is biased HIGH
+   by (n_E / 2) lambda; TT-only blocks are unaffected.
+
+   block                               n_E   relative bias
+   EExEE 090GHz090GHzx090GHz090GHz       4      +1.022e-01
+   EExEE 090GHz090GHzx090GHz150GHz       4      +1.022e-01
+   EExEE 090GHz090GHzx150GHz150GHz       4      +1.022e-01
+   EExEE 090GHz150GHzx090GHz150GHz       4      +1.022e-01
+   EExEE 090GHz150GHzx150GHz150GHz       4      +1.022e-01
+   EExEE 150GHz150GHzx150GHz150GHz       4      +1.022e-01
+   EExET 090GHz090GHzx090GHz150GHz       3      +7.668e-02
+   EExTE 090GHz090GHzx090GHz150GHz       3      +7.668e-02
+   EExTE 090GHz090GHzx150GHz150GHz       3      +7.668e-02
+   EExTE 090GHz150GHzx150GHz150GHz       3      +7.668e-02
+   EExTT 090GHz090GHzx090GHz150GHz       2      +5.112e-02
+   EExTT 090GHz090GHzx150GHz150GHz       2      +5.112e-02
+   EExTT 090GHz150GHzx150GHz150GHz       2      +5.112e-02
+   ETxEE 090GHz150GHzx090GHz150GHz       3      +7.668e-02
+   ETxEE 090GHz150GHzx150GHz150GHz       3      +7.668e-02
+   ETxET 090GHz150GHzx090GHz150GHz       2      +5.112e-02
+   ETxTE 090GHz150GHzx150GHz150GHz       2      +5.112e-02
+   ETxTT 090GHz150GHzx150GHz150GHz       1      +2.556e-02
+   TExEE 090GHz090GHzx090GHz090GHz       3      +7.668e-02
+   TExEE 090GHz090GHzx090GHz150GHz       3      +7.668e-02
+   TExEE 090GHz090GHzx150GHz150GHz       3      +7.668e-02
+   TExEE 090GHz150GHzx090GHz150GHz       3      +7.668e-02
+   TExEE 090GHz150GHzx150GHz150GHz       3      +7.668e-02
+   TExEE 150GHz150GHzx150GHz150GHz       3      +7.668e-02
+   TExET 090GHz090GHzx090GHz150GHz       2      +5.112e-02
+   TExET 090GHz150GHzx090GHz150GHz       2      +5.112e-02
+   TExTE 090GHz090GHzx090GHz090GHz       2      +5.112e-02
+   TExTE 090GHz090GHzx090GHz150GHz       2      +5.112e-02
+   TExTE 090GHz090GHzx150GHz150GHz       2      +5.112e-02
+   TExTE 090GHz150GHzx090GHz150GHz       2      +5.112e-02
+   TExTE 090GHz150GHzx150GHz150GHz       2      +5.112e-02
+   TExTE 150GHz150GHzx150GHz150GHz       2      +5.112e-02
+   TExTT 090GHz090GHzx090GHz150GHz       1      +2.556e-02
+   TExTT 090GHz090GHzx150GHz150GHz       1      +2.556e-02
+   TExTT 090GHz150GHzx150GHz150GHz       1      +2.556e-02
+   TTxEE 090GHz090GHzx090GHz090GHz       2      +5.112e-02
+   TTxEE 090GHz090GHzx090GHz150GHz       2      +5.112e-02
+   TTxEE 090GHz090GHzx150GHz150GHz       2      +5.112e-02
+   TTxEE 090GHz150GHzx090GHz150GHz       2      +5.112e-02
+   TTxEE 090GHz150GHzx150GHz150GHz       2      +5.112e-02
+   TTxEE 150GHz150GHzx150GHz150GHz       2      +5.112e-02
+   TTxET 090GHz090GHzx090GHz150GHz       1      +2.556e-02
+   TTxET 090GHz150GHzx090GHz150GHz       1      +2.556e-02
+   TTxTE 090GHz090GHzx090GHz090GHz       1      +2.556e-02
+   TTxTE 090GHz090GHzx090GHz150GHz       1      +2.556e-02
+   TTxTE 090GHz090GHzx150GHz150GHz       1      +2.556e-02
+   TTxTE 090GHz150GHzx090GHz150GHz       1      +2.556e-02
+   TTxTE 090GHz150GHzx150GHz150GHz       1      +2.556e-02
+   TTxTE 150GHz150GHzx150GHz150GHz       1      +2.556e-02
+
+2. Eq. 33 translation error: NOT BOUNDED
+   band edges [2, 48], max |l - l*| = 32
+   The Eq. 33 translation error grows with |l - l*| and is not bounded per
+   run: no quantity a run can cheaply evaluate was found to track the
+   measured error (see the module docstring for the two that were tried and
+   how they failed). Use the measured mask calibration below as the only
+   guide.
+
+   Measured on an apodised test mask (nside 512, about 4% of the
+   sky, GL, l* = 250, dmax 5): lambda = 4.92e-03, Cov(EE,EE) ACC/exact
+   +0.99% at l = l*, of which the translation part is -0.56% at
+   l = 500 and +3.8% at l = 100.
+
+3. Normalisation: kernels against Cov.Xi (Eq. 22 sum rule)
+   sum Theta^{TT x TT}_{l*,l*+d} / n  vs  Xi^{00}_{l*,l*+d},  n = (2l+1)(2l'+1)
+   max relative mismatch = 1.448e-04 over 2 diagonals (worst at (l, l') = (16, 17)); warning threshold 1e-02: ok
+   at d = 0: 1.186e-04; kernels built with lw = None, nside = 16, grid = healpix, term_selection = None

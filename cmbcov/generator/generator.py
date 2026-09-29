@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 
 from cmbcov.bmode_wick import required_kernel_pairs
+from cmbcov.conditioning import conditioning_report, format_conditioning_report
 from cmbcov.keys import CovKeys
 from cmbcov.utils import (
     add_nested_dicts,
@@ -341,7 +342,7 @@ class CovarianceMatrixGenerator:
         # cannot disagree with what was precomputed here), over every
         # frequency pair this run uses. A run whose C^TB/C^EB nonetheless
         # turn out non-zero (a file changed after this precompute, say)
-        # against an 18-pair cache is refused by the existing "recompute"
+        # against a 25-pair cache is refused by the existing "recompute"
         # error, naming the missing pairs (SpectraLoader._resolve_spectra_lmax).
         pairs = None
         if settings.spectra is None and any("B" in obs for obs in config.observables):
@@ -528,6 +529,7 @@ class CovarianceMatrixGenerator:
         np.savetxt(path_to_lbins, ls)
         np.savetxt(path_to_final_cov, final_cov)
 
+        self._save_conditioning_report(base_dir, final_cov)
         self._save_error_budget(base_dir)
         self._save_bb_leakage_report(base_dir)
 
@@ -536,6 +538,40 @@ class CovarianceMatrixGenerator:
             self._save_window_functions(base_dir, ls)
 
         self.logger.info("Results saved successfully")
+
+    #: Name of the conditioning report written beside the covariance.
+    CONDITIONING_REPORT_NAME = "conditioning.txt"
+
+    def _save_conditioning_report(self, base_dir: str, final_cov: np.ndarray) -> None:
+        """
+        Write how well-conditioned the delivered covariance is beside it,
+        and log its headline numbers.
+
+        A likelihood needs a positive-definite, invertible matrix, and this
+        is a report only -- it reads back the covariance just saved and
+        changes nothing, so a failure here must not fail the run.
+        """
+        try:
+            report = conditioning_report(final_cov)
+            path = os.path.join(base_dir, self.CONDITIONING_REPORT_NAME)
+            with open(path, "w") as handle:
+                handle.write(format_conditioning_report(report))
+        except Exception as error:  # noqa: BLE001 - diagnostics must not fail a run
+            self.logger.warning(f"Could not build the conditioning report: {error}")
+            return
+        if report["positive_definite"]:
+            self.logger.info(
+                f"Conditioning: min eigenvalue = {report['min_eigenvalue']:.3e}, "
+                f"condition number = {report['condition_number']:.3e}. "
+                f"Report: {path}"
+            )
+        else:
+            self.logger.warning(
+                "Conditioning: the covariance is not positive definite "
+                f"(min eigenvalue = {report['min_eigenvalue']:.3e}, "
+                f"{report['n_negative']} negative eigenvalue(s)). "
+                f"Report: {path}"
+            )
 
     #: Name of the error-budget report written beside the covariance.
     ERROR_BUDGET_NAME = "error_budget.txt"
@@ -577,7 +613,7 @@ class CovarianceMatrixGenerator:
         Write the method's known-error report beside the covariance, and log
         its headline number.
 
-        Only ACC has one, and only when the run has a polarised leg
+        Only ACC has one, and every ACC run gets it
         (:mod:`~cmbcov.approximations.acc_budget`); nothing
         is written otherwise. This is a report: it reads the kernels already
         in the cache, computes nothing new, and cannot change the covariance
@@ -603,6 +639,10 @@ class CovarianceMatrixGenerator:
         path = os.path.join(base_dir, self.ERROR_BUDGET_NAME)
         with open(path, "w") as handle:
             handle.write(acc_budget.format_error_budget(budget))
+        if budget.get("applicable", True) is False:
+            # TT-only or B run: no leakage message. The normalisation line
+            # (INFO, or WARNING above the threshold) was logged by the check.
+            return
         leakage = budget["leakage"]["lambda"]
         if leakage is None:
             self.logger.warning(

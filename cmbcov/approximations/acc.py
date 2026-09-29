@@ -13,7 +13,7 @@ import json
 import math
 import os
 import warnings
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 
 import numpy as np
 
@@ -1073,6 +1073,56 @@ def acc_cached_kernel_size(
     return size
 
 
+def _missing_kernel_pairs(
+    kernel_dir: str,
+    centralell: int,
+    ell_prime: int,
+    pairs: Iterable[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """
+    The pairs of ``pairs`` that :func:`~cmbcov.approximations.acc_cache.load_coupling_kernels`
+    cannot serve at ``(centralell, ell_prime)``: no file under the pair's own
+    name, its legacy name or those of its transpose, or only files the
+    manifest's pair record does not list
+    (:func:`~cmbcov.approximations.acc_cache.locate_coupling_kernel`, the
+    loader's own rule). File existence only; nothing is loaded.
+    """
+    manifest = acc_cache.read_coupling_manifest(kernel_dir, centralell, ell_prime)
+    missing = []
+    for pair in pairs:
+        found, _ = acc_cache.locate_coupling_kernel(
+            kernel_dir,
+            tuple(pair),
+            centralell,
+            ell_prime,
+            COUPLING_CHANNELS,
+            LEGACY_CHANNEL_NAMES,
+            manifest or False,
+        )
+        if found is None:
+            missing.append(tuple(pair))
+    return missing
+
+
+#: Why a B-mode cache can lack pairs a run needs, and what to run: shared by
+#: :func:`require_acc_cache_pairs` and :meth:`ACCStrategy._wick_plan`.
+_BMODE_PAIRS_HELP = (
+    "The kernel pairs a run with a B observable needs changed after cmbcov "
+    "0.3.0: every off-diagonal block now needs the pairs of both of its "
+    "orientations, Cov(a, b) and Cov(b, a), so that both of its triangles "
+    "are exact at centralell (bmode_wick.required_kernel_pairs: 24, 25 or "
+    "45 pairs where 0.3.0 asked for 17, 18, 31 or 40; "
+    "docs/theory/bmode_kernels.md, Sect. 6). A B-mode cache precomputed by "
+    "cmbcov 0.3.0 or earlier therefore lacks some; so does a cache built for "
+    "C^TB = C^EB = 0 when this run's TB or EB spectra are non-zero. Rerun "
+    "`cmbcov-precompute` on the parameter file, or add only the missing "
+    "pairs to this cache with precompute_acc_kernels(<mask>, <kernel_dir>, "
+    "centralell=..., dmax=..., pairs=[...]) and the nside, lw and grid it "
+    "was built with: the kernels already there are kept, and the manifests "
+    "merge (acc_cache.write_coupling_kernels)."
+)
+
+
 def require_acc_cache_pairs(
     kernel_dir: str,
     centralell: int,
@@ -1080,41 +1130,66 @@ def require_acc_cache_pairs(
     pairs: Iterable[tuple[str, str]],
 ) -> None:
     """
-    Raise the on-disk cache's existing "recompute" error if it does not
-    cover every one of ``pairs``, for every diagonal ``(centralell,
-    centralell + d)``, ``d < dmax``.
+    Raise ``OSError`` if the on-disk cache does not cover every one of
+    ``pairs``, for every diagonal ``(centralell, centralell + d)``,
+    ``d < dmax``, naming every missing pair.
 
-    A thin wrapper around :func:`~cmbcov.approximations.acc_cache.load_coupling_kernels`,
-    which already raises ``OSError`` naming the missing pair's file, for the
-    plain ACC T/E assembly; this is the same check, run early against the
-    pairs a B-mode ``observables`` list needs
-    (:func:`~cmbcov.bmode_wick.required_kernel_pairs`),
-    so that a run whose spectra turn out to need the 40-pair set is refused
-    against an 18-pair cache before anything else, not silently given a
-    partial answer. A no-op for an empty ``pairs``.
-
-    The manifest (:func:`~cmbcov.approximations.acc_cache.write_coupling_kernels`)
-    records the *channels* a precompute covered, not the exact pairs
-    (``pairs=`` can restrict a precompute to fewer pairs than the full
-    square of its channels), so an 18-vs-40-pair cache -- both built from
-    the same nine :data:`COUPLING_CHANNELS` -- gets the plain "not found"
-    form of the error (naming the missing pair's file directly) rather than
-    the "computed for spectra ... only" form; both are the one existing
-    mechanism, and both name the missing pair.
+    Run early (:class:`~cmbcov.spectra.SpectraLoader`) against the pairs a
+    B-mode ``observables`` list needs
+    (:func:`~cmbcov.bmode_wick.required_kernel_pairs`), so that a run is
+    refused before anything else rather than failing on its first block
+    (or, before the both-orientation requirement, silently computing one
+    triangle of some blocks from the other orientation's kernel). A pair
+    counts as covered when the loader would serve it
+    (:func:`_missing_kernel_pairs`): under its own or legacy name, or
+    stored only as its transpose. The message lists the missing pairs (the
+    union over the diagonals, and the diagonals affected), says that the
+    B-mode requirement changed after cmbcov 0.3.0 and what to run, and
+    ends with the loader's own error for the first missing pair (which
+    names its file and, where it applies, the manifest's spectra or a
+    left-over file). A legacy text-format cache raises the loader's
+    ``FileNotFoundError`` unchanged. A no-op for an empty ``pairs``.
     """
-    pairs = list(pairs)
+    pairs = sorted({tuple(pair) for pair in pairs})
     if not pairs:
         return
+    missing: dict[tuple[str, str], list[int]] = {}
     for diagonal_offset in range(int(dmax)):
+        ell_prime = centralell + diagonal_offset
+        for pair in _missing_kernel_pairs(kernel_dir, centralell, ell_prime, pairs):
+            missing.setdefault(pair, []).append(ell_prime)
+    if not missing:
+        return
+    first_pair = min(missing, key=lambda p: (missing[p][0], p))
+    try:
         acc_cache.load_coupling_kernels(
             kernel_dir,
             centralell,
-            centralell + diagonal_offset,
+            missing[first_pair][0],
             COUPLING_CHANNELS,
-            pairs,
-            pairs=pairs,
+            [first_pair],
+            pairs=[first_pair],
             legacy_names=LEGACY_CHANNEL_NAMES,
         )
+        loader_error = None
+    except FileNotFoundError:
+        raise
+    except OSError as err:
+        loader_error = str(err)
+    affected = sorted({lp for lps in missing.values() for lp in lps})
+    where = (
+        f"on every diagonal (centralell, centralell + d), d < {int(dmax)}"
+        if len(affected) == int(dmax)
+        else f"at (centralell, l') for l' in {affected}"
+    )
+    listed = ", ".join("x".join(pair) for pair in sorted(missing))
+    raise OSError(
+        f"ACC coupling kernels not found under {kernel_dir!r} (centralell "
+        f"{centralell}): this run needs {len(pairs)} kernel pairs, and "
+        f"{len(missing)} of them are missing {where}: {listed}. "
+        f"{_BMODE_PAIRS_HELP}"
+        + (f" First missing file: {loader_error}" if loader_error else "")
+    )
 
 
 def _unit_sum_kernel(coupling_matrix: np.ndarray) -> np.ndarray:
@@ -1182,6 +1257,191 @@ def _acc_band(
         w2 = w1 if same else np.ascontiguousarray(windows_2[start:stop])
         out[start:stop] = np.einsum("ij,ij->i", w1 @ kernel, w2)
     return out
+
+
+#: Memory the batched ACC assembly (:meth:`ACCStrategy.compute_covariance_terms`)
+#: may hold for one batch of blocks: their flattened diagonals,
+#: ``(2 dmax - 1) x lmax`` doubles each, plus the bands of their kernel
+#: products on the current diagonal. A block alone is never split, so a
+#: batch always holds at least one. At ``lmax = 3500``, ``dmax = 100`` a
+#: block takes 5.6 MB, so a batch holds ~90 blocks.
+_ASSEMBLY_BATCH_BYTES = 512 * 1024**2
+
+
+def _spectrum_identity(spectrum: np.ndarray) -> tuple:
+    """
+    Content identity of a spectrum array: dtype, shape and a blake2b digest
+    of its bytes. Two arrays with the same identity give the same padded
+    spectrum (:func:`_padded_spectrum`) and so bit-identical kernel products;
+    the batched assembly shares products between blocks by this identity, not
+    by ``id()`` (a run's ``cl`` often holds equal arrays under different keys,
+    e.g. ``TE`` and ``ET`` of one frequency pair).
+    """
+    array = np.ascontiguousarray(spectrum)
+    digest = hashlib.blake2b(memoryview(array).cast("B"), digest_size=16)
+    return (array.dtype.str, array.shape, digest.hexdigest())
+
+
+def _identity_memo() -> Callable[[np.ndarray], tuple]:
+    """
+    :func:`_spectrum_identity`, memoised by ``id()`` for the duration of one
+    assembly call: the arrays are referenced by the call's ``cl`` throughout,
+    so an ``id`` cannot be reused within it. Never kept between calls, so a
+    spectrum changed in place between two calls is hashed afresh.
+    """
+    identities: dict[int, tuple] = {}
+
+    def identity(array: np.ndarray) -> tuple:
+        key = id(array)
+        if key not in identities:
+            identities[key] = _spectrum_identity(array)
+        return identities[key]
+
+    return identity
+
+
+def _acc_bands(
+    products: dict,
+    n_ell: int,
+) -> dict:
+    """
+    :func:`_acc_band` for many products on one diagonal:
+    ``products[key] = (kernel, padded_1, padded_2)`` gives
+    ``bands[key] = _acc_band(kernel, padded_1, padded_2, n_ell, chunk)``,
+    bit for bit, with the left factor ``w1 @ kernel`` of each chunk (the
+    ``n_ell x S x S`` matrix product, nearly all of the cost) computed once
+    per distinct ``(padded_1, kernel)`` pair of arrays and shared by every
+    product with that left factor. Each product is otherwise evaluated
+    exactly as :func:`_acc_band` does: same chunks (``chunk`` from
+    :data:`_ASSEMBLY_CHUNK_BYTES` and the kernel size), same contiguous
+    window copies, same ``np.einsum`` on the same operands.
+    """
+    groups: dict[tuple[int, int], list] = {}
+    for key, (kernel, padded_1, _) in products.items():
+        groups.setdefault((id(padded_1), id(kernel)), []).append(key)
+    bands = {}
+    for keys in groups.values():
+        kernel, padded_1, _ = products[keys[0]]
+        size = kernel.shape[0]
+        if kernel.shape != (size, size):
+            raise ValueError(f"ACC coupling kernel must be square, got {kernel.shape}")
+        chunk = max(1, _ASSEMBLY_CHUNK_BYTES // (24 * size))
+        windows_1 = np.lib.stride_tricks.sliding_window_view(padded_1, size)
+        rights = []
+        for key in keys:
+            padded_2 = products[key][2]
+            same = padded_2 is padded_1
+            windows_2 = (
+                windows_1
+                if same
+                else np.lib.stride_tricks.sliding_window_view(padded_2, size)
+            )
+            out = np.empty(n_ell)
+            bands[key] = out
+            rights.append((out, same, windows_2))
+        for start in range(0, n_ell, chunk):
+            stop = min(n_ell, start + chunk)
+            w1 = np.ascontiguousarray(windows_1[start:stop])
+            left = w1 @ kernel
+            for out, same, windows_2 in rights:
+                w2 = w1 if same else np.ascontiguousarray(windows_2[start:stop])
+                out[start:stop] = np.einsum("ij,ij->i", left, w2)
+    return bands
+
+
+def _group_blocks(factors: list[set], batch_size: int) -> list[list[int]]:
+    """
+    Split blocks ``0 .. len(factors) - 1`` into batches of at most
+    ``batch_size``, greedily, so that blocks sharing left factors
+    (``factors[i]``, the ``(left spectrum, kernel)`` pairs of block ``i``'s
+    kernel products) land in the same batch: each batch is grown by the
+    block adding the fewest left factors not already in it, among those the
+    one sharing the most (ties: the lowest index). Deterministic; every
+    block appears exactly once, and a batch lists its blocks in increasing
+    index. The grouping only decides which products are computed together,
+    never a value.
+    """
+    n = len(factors)
+    if n <= batch_size:
+        return [list(range(n))] if n else []
+    users: dict = {}
+    for i, block_factors in enumerate(factors):
+        for factor in block_factors:
+            users.setdefault(factor, []).append(i)
+    sizes = np.array([len(f) for f in factors], dtype=np.int64)
+    weight = int(sizes.max()) + 1  # new factors first, then shared ones
+    remaining = np.ones(n, dtype=bool)
+    unused = np.iinfo(np.int64).max
+    batches = []
+    while remaining.any():
+        new = sizes.copy()
+        shared = np.zeros(n, dtype=np.int64)
+        covered: set = set()
+        batch = []
+        while len(batch) < batch_size and remaining.any():
+            score = np.where(remaining, new * weight - shared, unused)
+            j = int(np.argmin(score))
+            batch.append(j)
+            remaining[j] = False
+            for factor in factors[j]:
+                if factor not in covered:
+                    covered.add(factor)
+                    for i in users[factor]:
+                        new[i] -= 1
+                        shared[i] += 1
+        batches.append(sorted(batch))
+    return batches
+
+
+class _BlockPlan:
+    """
+    How one block of the batched ACC assembly is computed, fixed before any
+    kernel is read (:meth:`ACCStrategy._plan_te_block`,
+    :meth:`ACCStrategy._plan_wick_block`):
+
+    - ``kind``: ``"te"`` (Eq. 23 per contraction, T/E-only run), ``"wick"``
+      (per-Wick-term normalisation, run with a B observable) or ``"zero"``
+      (a parity-mixed block the run does not ask for);
+    - ``upper``, ``lower``: ``(product key, weight)`` per contraction or
+      Wick term, in the order the per-block assembly summed them; the
+      weight is the ``norm_Xi`` matrix (``"te"``) or the
+      :class:`~cmbcov.bmode_wick.WickTerm` (``"wick"``). ``lower`` is
+      ``None`` when the lower triangle is not computed from terms of its
+      own (auto blocks; for ``"wick"`` also one-orientation blocks, see
+      ``same_band_lower``);
+    - ``products``: ``product key -> (spectrum_1, label_1, spectrum_2,
+      label_2, kernel pair)``; a product key is ``(identity_1, identity_2,
+      kernel pair)`` with the spectra's content identities
+      (:func:`_spectrum_identity`), so equal products of different blocks
+      share one key;
+    - ``pairs``: the kernel pairs the block reads from the cache (for
+      ``"te"`` also that of a contraction whose band is a reversed direct
+      one, which the per-block assembly asked the loader for too).
+    """
+
+    __slots__ = ("cov_key", "kind", "auto", "upper", "lower", "products", "pairs")
+
+    def __init__(
+        self,
+        cov_key,
+        kind,
+        auto=False,
+        upper=(),
+        lower=None,
+        products=None,
+        pairs=None,
+    ):
+        self.cov_key = cov_key
+        self.kind = kind
+        self.auto = auto
+        self.upper = list(upper)
+        self.lower = None if lower is None else list(lower)
+        self.products = products or {}
+        self.pairs = set(pairs or ())
+
+    def left_factors(self) -> set:
+        """The ``(left spectrum identity, kernel pair)`` of every product."""
+        return {(key[0], key[2]) for key in self.products}
 
 
 #: Version tag of the ACC normalisation used by a run with a B observable,
@@ -1287,8 +1547,9 @@ class ACCStrategy(CovarianceStrategy):
         blocks included, is instead the sum over its expanded Wick terms,
         each translated as above and normalised by its own ``N_t``
         (:meth:`_compute_covariance_term_wick`,
-        docs/theory/bmode_kernels.md). A T/E-only run
-        (level 1) takes the path below.
+        docs/theory/bmode_kernels.md), with the same orientation rule as
+        below when the cache holds the kernel pairs of both orientations
+        (:meth:`_wick_plan`). A T/E-only run (level 1) takes the path below.
 
         Each element is computed in the orientation its kernel is exact in:
         the upper triangle (``ell1 <= ell2``) of a block ``Cov(a, b)`` from
@@ -1301,6 +1562,11 @@ class ACCStrategy(CovarianceStrategy):
         spectra) is symmetric and computed once, bit-identical to the
         single-orientation assembly of cmbcov 0.2.0.
 
+        The block is computed by the batched assembly of
+        :meth:`compute_covariance_terms` as a batch of one; a run's
+        :meth:`~cmbcov.covariance.Cov.compute_covariance_matrix` computes
+        its blocks together there, with the same result bit for bit.
+
         Raises
         ------
         ValueError
@@ -1309,57 +1575,129 @@ class ACCStrategy(CovarianceStrategy):
             In a B run also if a Wick term's true spectrum is missing from
             ``cl``, ``centralell < 2``, or the kernels are not GL-grid ones.
         """
-        # Validate configuration
         self.validate_config()
+        for _, block in self._assemble([cov_key], cl):
+            return block
 
-        if self._wick_mode(cov_key):
-            # A run with a B observable (levels 2-4): every block, T/E ones
-            # included, is a sum over expanded Wick terms, each with its own
-            # normalisation (docs/theory/bmode_kernels.md).
-            # Everything below is the unchanged level-1 path.
-            return self._compute_covariance_term_wick(cov_key, cl)
+    def compute_covariance_terms(
+        self, cov_keys: Iterable[CovKey], cl: dict[str, dict[str, np.ndarray]]
+    ) -> Iterator[tuple[CovKey, np.ndarray]]:
+        """
+        ``(cov_key, compute_covariance_term(cov_key, cl))`` for every key of
+        ``cov_keys``, bit for bit, computed together: the order in which the
+        pairs are yielded is not that of ``cov_keys``.
+
+        Many blocks of a run evaluate the same kernel product
+        ``C1 . Theta . C2`` on a diagonal, and many more share its left
+        factor, the window matrix of ``C1`` times ``Theta`` (nearly all of the
+        cost). A block alone computes its own; here the blocks are taken in
+        batches of blocks sharing left factors (:func:`_group_blocks`),
+        bounded by :data:`_ASSEMBLY_BATCH_BYTES`, and each batch runs
+        diagonal by diagonal: every distinct product of the batch once, and
+        every left factor once (:func:`_acc_bands`). The value of every
+        element is unchanged, since each product is evaluated by the same
+        operations on the same operands and each block sums its terms in the
+        same order. Nothing is kept between calls.
+
+        Used by :meth:`~cmbcov.covariance.Cov.compute_covariance_matrix`;
+        the blocks of one batch are held (flattened) until the batch is done,
+        and each is expanded to ``(lmax, lmax)`` only when it is yielded.
+        """
+        self.validate_config()
+        yield from self._assemble(list(cov_keys), cl)
+
+    def _assemble(
+        self, cov_keys: list[CovKey], cl: dict[str, dict[str, np.ndarray]]
+    ) -> Iterator[tuple[CovKey, np.ndarray]]:
+        """Plan every block of ``cov_keys``, group them in batches and yield
+        each block when its batch is done (see
+        :meth:`compute_covariance_terms`)."""
+        identity = _identity_memo()
+        plans = []
+        for cov_key in cov_keys:
+            if self._wick_mode(cov_key):
+                plans.append(self._plan_wick_block(cov_key, cl, identity))
+            else:
+                plans.append(self._plan_te_block(cov_key, cl, identity))
 
         dmax = self.cov.config.dmax
-        centralell = self.cov.config.centralell
+        lmax = self.cov.lmax
+        # T/E and B blocks are never batched together (they only meet in
+        # direct calls without run context): one normalises the kernels,
+        # the other does not.
+        for kind in ("te", "wick"):
+            members = [i for i, plan in enumerate(plans) if plan.kind == kind]
+            if not members:
+                continue
+            per_block = max(
+                (2 * dmax - 1 + len(plans[i].products)) * lmax * 8 for i in members
+            )
+            batch_size = max(1, _ASSEMBLY_BATCH_BYTES // max(1, per_block))
+            groups = _group_blocks(
+                [plans[i].left_factors() for i in members], batch_size
+            )
+            for group in groups:
+                batch = [plans[members[g]] for g in group]
+                flats = self._assemble_batch(batch, kind)
+                for index, plan in enumerate(batch):
+                    # Release each flattened block as it is expanded, and
+                    # the whole batch before the next one is computed, so
+                    # that at most one batch is held.
+                    block = self._unflatten_cov(flats[index])
+                    flats[index] = None
+                    yield plan.cov_key, block
+                    del block
+                del flats
+        for plan in plans:
+            if plan.kind == "zero":
+                yield plan.cov_key, self._unflatten_cov(self._empty_flatten_cov(dmax))
 
-        # Initialize flattened covariance
-        flat_cov = self._empty_flatten_cov(dmax)
+    def _plan_te_block(self, cov_key: CovKey, cl, identity) -> _BlockPlan:
+        """
+        The contractions of a block of a T/E-only run and the kernel
+        product each one reads, chosen exactly as the per-block assembly
+        of cmbcov 0.3.0 chose them (so the result is bit-identical to it).
 
-        # Orientation. The exact covariance is not symmetric within a block
-        # between two different spectra, Cov(a_l, b_l') != Cov(a_l', b_l),
-        # and ACC is exact at l* only in the orientation its kernel was
-        # computed in: spectrum a on the l* leg, b on the l* + Delta leg.
-        # Every element is therefore computed in that orientation: the upper
-        # triangle (ell1 <= ell2) from the Wick contractions of cov_key, the
-        # lower one from those of the transposed key, since
-        # Cov(a_{l+D}, b_l) = Cov(b_l, a_{l+D}). An element then depends on
-        # its two spectra and on which of its multipoles is the smaller, never
-        # on the order in which the run lists its spectra. Using the upper
-        # value for both triangles, as before, made Cov(TE_l, EE_l') and
-        # Cov(EE_l, TE_l') of different frequency pairs disagree on which
-        # element is exact, so the CMB no longer cancelled in the frequency
-        # differences and a multi-frequency T/E matrix was not positive
-        # definite (docs/theory/acc.md, Sect. 3). An auto block is
-        # symmetric and has one orientation.
-        #
-        # Kernel lookup keys (covariance_coupling is keyed by
-        # COUPLING_CHANNELS, via SpecKey.kernel_stokekey -- e.g. "DT" != "TD"
-        # off the diagonal) keep the true Wick order of
-        # CovKey.key_to_cross_kernel; the cl lookup uses key_to_cross, whose
-        # sorted_copy() order is right for spectra ("TE" and "ET" are the
-        # same spectrum). The loader is asked for exactly the kernel pairs
-        # of these (at most four) contractions.
-        #
-        # Batched form of the element loop over compute_acc_term (kept below
-        # as the scalar reference). For each Wick contraction w:
-        #   spectra  cl[combination_w[k].freqkey()][combination_w[k].stokekey()]
-        #   kernel   coupling_kernels[kernel_w[0].kernel_stokekey(), kernel_w[1].kernel_stokekey()]
-        #   prefactor norm_Xi[combination_w[0].stokekey(), combination_w[1].stokekey()]
-        # read at the element's own (row, column) multipoles.
-        # compute_acc_term depends on (ell1, ell2) only through
-        # min(ell1, ell2): both kernel indices are shifted by the same amount
-        # and the section is square. So on diagonal Delta one band per
-        # contraction gives the whole upper (or lower) diagonal.
+        Orientation. The exact covariance is not symmetric within a block
+        between two different spectra, Cov(a_l, b_l') != Cov(a_l', b_l),
+        and ACC is exact at l* only in the orientation its kernel was
+        computed in: spectrum a on the l* leg, b on the l* + Delta leg.
+        Every element is therefore computed in that orientation: the upper
+        triangle (ell1 <= ell2) from the Wick contractions of cov_key, the
+        lower one from those of the transposed key, since
+        Cov(a_{l+D}, b_l) = Cov(b_l, a_{l+D}). An element then depends on
+        its two spectra and on which of its multipoles is the smaller, never
+        on the order in which the run lists its spectra. Using the upper
+        value for both triangles, as before, made Cov(TE_l, EE_l') and
+        Cov(EE_l, TE_l') of different frequency pairs disagree on which
+        element is exact, so the CMB no longer cancelled in the frequency
+        differences and a multi-frequency T/E matrix was not positive
+        definite (docs/theory/acc.md, Sect. 3). An auto block is
+        symmetric and has one orientation.
+
+        Kernel lookup keys (covariance_coupling is keyed by
+        COUPLING_CHANNELS, via SpecKey.kernel_stokekey -- e.g. "DT" != "TD"
+        off the diagonal) keep the true Wick order of
+        CovKey.key_to_cross_kernel; the cl lookup uses key_to_cross, whose
+        sorted_copy() order is right for spectra ("TE" and "ET" are the
+        same spectrum). For each Wick contraction w:
+          spectra  cl[combination_w[k].freqkey()][combination_w[k].stokekey()]
+          kernel   coupling_kernels[kernel_w[0].kernel_stokekey(), kernel_w[1].kernel_stokekey()]
+          prefactor norm_Xi[combination_w[0].stokekey(), combination_w[1].stokekey()]
+        read at the element's own (row, column) multipoles.
+        compute_acc_term depends on (ell1, ell2) only through
+        min(ell1, ell2): both kernel indices are shifted by the same amount
+        and the section is square. So on diagonal Delta one band per
+        contraction gives the whole upper (or lower) diagonal.
+
+        Band reuse within the block (what fixes the operands of each band):
+        a contraction whose (spectrum_1, spectrum_2, kernel pair) arrays
+        already have a band reuses it; a lower-triangle contraction that is
+        a direct one read backwards, C1 . Theta^{pq} . C2 = C2 . Theta^{qp} . C1
+        (the definition gives Theta^{qp} = (Theta^{pq})^T, and the cache
+        stores it so: s2xs1 is written as the transpose of s1xs2, a p x p
+        kernel is a symmetric Gram matrix), reuses the direct band.
+        """
         names: dict[int, str] = {}
         auto = cov_key.auto()
         upper_contractions = self._te_contractions(cov_key, cl, names)
@@ -1378,94 +1716,287 @@ class ACCStrategy(CovarianceStrategy):
         ) == _contraction_multiset(lower_contractions)
         if one_orientation:
             lower_contractions = upper_contractions
-        needed_pairs = {
+
+        products: dict[tuple, tuple] = {}
+        chosen: dict[tuple, tuple] = {}
+
+        def product(spec_1, spec_2, kernel_key) -> tuple:
+            key = (identity(spec_1), identity(spec_2), kernel_key)
+            if key not in products:
+                products[key] = (
+                    spec_1,
+                    names[id(spec_1)],
+                    spec_2,
+                    names[id(spec_2)],
+                    kernel_key,
+                )
+            return key
+
+        upper = []
+        for (spec_1, spec_2), kernel_key, norm in upper_contractions:
+            memo = (id(spec_1), id(spec_2), kernel_key)
+            if memo not in chosen:
+                chosen[memo] = product(spec_1, spec_2, kernel_key)
+            upper.append((chosen[memo], norm))
+        lower = None
+        if not auto:
+            lower = []
+            for (spec_1, spec_2), kernel_key, norm in lower_contractions:
+                memo = (id(spec_1), id(spec_2), kernel_key)
+                reverse = (id(spec_2), id(spec_1), kernel_key[::-1])
+                if memo in chosen:
+                    key = chosen[memo]
+                elif reverse in chosen:
+                    key = chosen[reverse]
+                else:
+                    key = chosen[memo] = product(spec_1, spec_2, kernel_key)
+                lower.append((key, norm))
+        # The kernels read are those of every contraction, including one
+        # whose band is a reversed direct one (as before: the cache must
+        # hold them).
+        pairs = {
             kernel_key for _, kernel_key, _ in upper_contractions + lower_contractions
         }
+        return _BlockPlan(cov_key, "te", auto, upper, lower, products, pairs)
 
+    def _plan_wick_block(self, cov_key: CovKey, cl, identity) -> _BlockPlan:
+        """
+        The Wick terms of a block of a run with a B observable
+        (:meth:`_wick_plan`) and the kernel product each one reads; a
+        parity-mixed block the run does not ask for is ``"zero"``. See
+        :meth:`_compute_covariance_term_wick`.
+        """
+        from ..keys import _is_parity_odd_spec
+
+        flags = self._run_flags(cov_key, cl)
+        if (
+            _is_parity_odd_spec(cov_key.left) != _is_parity_odd_spec(cov_key.right)
+            and not flags["parity_mixed_blocks"]
+        ):
+            return _BlockPlan(cov_key, "zero")
+
+        upper_terms, lower_terms, _ = self._wick_plan(cov_key, cl)
+        spectra = {}
+        for term in upper_terms + (lower_terms or []):
+            for side in (term.left, term.right):
+                if side not in spectra:
+                    spectra[side] = self._wick_spectrum(cl, side)
+        products: dict[tuple, tuple] = {}
+
+        def product(term) -> tuple:
+            pair = (term.channel_1, term.channel_2)
+            (name_1, spec_1), (name_2, spec_2) = spectra[term.left], spectra[term.right]
+            key = (identity(spec_1), identity(spec_2), pair)
+            if key not in products:
+                products[key] = (spec_1, f"cl[{name_1}]", spec_2, f"cl[{name_2}]", pair)
+            return key
+
+        upper = [(product(term), term) for term in upper_terms]
+        lower = (
+            None
+            if lower_terms is None
+            else [(product(term), term) for term in lower_terms]
+        )
+        pairs = {entry[4] for entry in products.values()}
+        return _BlockPlan(
+            cov_key, "wick", cov_key.auto(), upper, lower, products, pairs
+        )
+
+    def _assemble_batch(self, batch: list[_BlockPlan], kind: str) -> list[np.ndarray]:
+        """
+        The flattened blocks of one batch of plans of one ``kind``,
+        diagonal by diagonal: the kernels once per diagonal, every distinct
+        product once (:func:`_acc_bands`), then each block's upper and lower
+        bands summed exactly as the per-block assembly summed them.
+        """
+        config = self.cov.config
+        dmax = config.dmax
+        centralell = config.centralell
         lmax = self.cov.lmax
-        padded: dict[tuple[int, int], np.ndarray] = {}
+        flats = [self._empty_flatten_cov(dmax) for _ in batch]
+        products: dict[tuple, tuple] = {}
+        for plan in batch:
+            products.update(plan.products)
+        needed_pairs = set().union(*(plan.pairs for plan in batch))
+        used_pairs = {entry[4] for entry in products.values()}
+        padded: dict[tuple, np.ndarray] = {}
 
-        def band(bands, kernels, n_ell, spec_1, spec_2, kernel_key, reuse_reversed):
-            """The ACC band of one contraction on the current diagonal,
-            memoised in ``bands`` (same spectra arrays, same kernel)."""
-            memo = (id(spec_1), id(spec_2), kernel_key)
-            if memo in bands:
-                return bands[memo]
-            if reuse_reversed:
-                # C1 . Theta^{pq} . C2 = C2 . Theta^{qp} . C1: the definition
-                # gives Theta^{qp} = (Theta^{pq})^T, and the cache stores it
-                # so (s2xs1 is written as the transpose of s1xs2; a p x p
-                # kernel is a symmetric Gram matrix). A transposed
-                # contraction that is a direct one read backwards therefore
-                # reuses its band.
-                reverse = (id(spec_2), id(spec_1), kernel_key[::-1])
-                if reverse in bands:
-                    return bands[reverse]
-            matrix = kernels[kernel_key]
-            size = matrix.shape[0]
-            n_read = acc_internal_lmax(lmax, size, centralell)
-            for spectrum in (spec_1, spec_2):
-                if (id(spectrum), size) not in padded:
-                    _check_spectrum_length(
-                        spectrum, names[id(spectrum)], lmax, size, centralell
-                    )
-                    padded[id(spectrum), size] = _padded_spectrum(
-                        spectrum, centralell, n_read, size
-                    )
-            chunk = max(1, _ASSEMBLY_CHUNK_BYTES // (24 * size))
-            bands[memo] = _acc_band(
-                matrix,
-                padded[id(spec_1), size],
-                padded[id(spec_2), size],
-                n_ell,
-                chunk,
-            )
-            return bands[memo]
+        def padded_spectrum(spectrum, identity, label, size):
+            if (identity, size) not in padded:
+                _check_spectrum_length(spectrum, label, lmax, size, centralell)
+                n_read = acc_internal_lmax(lmax, size, centralell)
+                padded[identity, size] = _padded_spectrum(
+                    spectrum, centralell, n_read, size
+                )
+            return padded[identity, size]
 
         for diagonal_offset in range(dmax):
-            coupling_kernels = self.get_covariance_coupling(
-                centralell, centralell + diagonal_offset, pairs=needed_pairs
-            )
             n_ell = lmax - diagonal_offset
-            if n_ell <= 0:
-                continue
+            ell_prime = centralell + diagonal_offset
+            if kind == "te":
+                # (the T/E path reads the kernels before the n_ell check)
+                coupling_kernels = self.get_covariance_coupling(
+                    centralell, ell_prime, pairs=needed_pairs
+                )
+                if n_ell <= 0:
+                    continue
+                # Normalise each distinct kernel once per diagonal.
+                kernels = {
+                    pair: _unit_sum_kernel(coupling_kernels[pair])
+                    for pair in used_pairs
+                }
+            else:
+                if n_ell <= 0:
+                    continue
+                coupling_kernels = self.get_covariance_coupling(
+                    centralell, ell_prime, pairs=sorted(needed_pairs)
+                )
+                self._require_gl_kernels(centralell, ell_prime)
+                kernels = {
+                    pair: np.asarray(coupling_kernels[pair], dtype=float)
+                    for pair in used_pairs
+                }
+                kernel_sums = {
+                    pair: float(np.sum(coupling_kernels[pair])) for pair in used_pairs
+                }
             ell1 = np.arange(n_ell)
             ell2 = ell1 + diagonal_offset
 
-            # Normalise each distinct kernel once per diagonal, not per element.
-            kernels = {}
-            for _, kernel_key, _ in upper_contractions + lower_contractions:
-                if kernel_key not in kernels:
-                    kernels[kernel_key] = _unit_sum_kernel(coupling_kernels[kernel_key])
-
-            # One band of ACC values per distinct contraction (same spectra
-            # arrays, same kernel), evaluated once.
-            bands: dict[tuple, np.ndarray] = {}
-
-            upper = np.zeros(n_ell)
-            for (spec_1, spec_2), kernel_key, norm in upper_contractions:
-                upper += (
-                    band(bands, kernels, n_ell, spec_1, spec_2, kernel_key, False)
-                    * norm[ell1, ell2]
+            work = {}
+            for key, (spec_1, label_1, spec_2, label_2, pair) in products.items():
+                kernel = kernels[pair]
+                size = kernel.shape[0]
+                work[key] = (
+                    kernel,
+                    padded_spectrum(spec_1, key[0], label_1, size),
+                    padded_spectrum(spec_2, key[1], label_2, size),
                 )
-            flat_cov[diagonal_offset + dmax - 1, :n_ell] = upper
+            bands = _acc_bands(work, n_ell)
+            del work
 
+            upper_row = diagonal_offset + dmax - 1
+            lower_row = -diagonal_offset + dmax - 1
+            if kind == "te":
+                self._sum_te_bands(
+                    batch,
+                    flats,
+                    bands,
+                    diagonal_offset,
+                    ell1,
+                    ell2,
+                    upper_row,
+                    lower_row,
+                )
+            else:
+                self._sum_wick_bands(
+                    batch,
+                    flats,
+                    bands,
+                    kernel_sums,
+                    diagonal_offset,
+                    ell1,
+                    ell2,
+                    upper_row,
+                    lower_row,
+                )
+        return flats
+
+    @staticmethod
+    def _sum_te_bands(
+        batch, flats, bands, diagonal_offset, ell1, ell2, upper_row, lower_row
+    ):
+        """
+        One diagonal of every T/E block of a batch from the bands of its
+        products: each contraction's band times ``norm_Xi`` read at the
+        element's own (row, column), summed in the block's contraction order
+        (upper triangle at ``norm[ell1, ell2]``, lower at
+        ``norm[ell2, ell1]``); an auto block's lower triangle is its upper
+        one. ``norm[...]`` is gathered once per matrix and triangle per
+        diagonal (the same values each block read before).
+        """
+        n_ell = ell1.size
+        norms: dict[tuple, np.ndarray] = {}
+        for plan, flat in zip(batch, flats):
+            upper = np.zeros(n_ell)
+            for key, norm in plan.upper:
+                memo = (id(norm), False)
+                if memo not in norms:
+                    norms[memo] = norm[ell1, ell2]
+                upper += bands[key] * norms[memo]
+            flat[upper_row, :n_ell] = upper
             if diagonal_offset != 0:
-                if auto:
+                if plan.auto:
                     lower = upper
                 else:
                     lower = np.zeros(n_ell)
-                    for (spec_1, spec_2), kernel_key, norm in lower_contractions:
-                        lower += (
-                            band(
-                                bands, kernels, n_ell, spec_1, spec_2, kernel_key, True
-                            )
-                            * norm[ell2, ell1]
-                        )
-                flat_cov[-diagonal_offset + dmax - 1, :n_ell] = lower
+                    for key, norm in plan.lower:
+                        memo = (id(norm), True)
+                        if memo not in norms:
+                            norms[memo] = norm[ell2, ell1]
+                        lower += bands[key] * norms[memo]
+                flat[lower_row, :n_ell] = lower
 
-        # Unflatten and return full matrix (consistent with other strategies)
-        return self._unflatten_cov(flat_cov)
+    def _sum_wick_bands(
+        self,
+        batch,
+        flats,
+        bands,
+        kernel_sums,
+        diagonal_offset,
+        ell1,
+        ell2,
+        upper_row,
+        lower_row,
+    ):
+        """
+        One diagonal of every block of a batch of a run with a B observable
+        from the bands of its products: each Wick term's
+        ``coefficient * band * F_t`` (:meth:`~cmbcov.covariance.Cov.acc_term_scale`),
+        in the block's term order. ``F_t`` depends on the term's kernel
+        pair, the diagonal and the triangle only, so it is computed once per
+        pair and triangle per diagonal (the same values each block computed
+        before).
+        """
+        n_ell = ell1.size
+        scales: dict[tuple, np.ndarray] = {}
+
+        def scale(term, lower_triangle):
+            pair = (term.channel_1, term.channel_2)
+            memo = (pair, lower_triangle)
+            if memo not in scales:
+                scales[memo] = self.cov.acc_term_scale(
+                    term.channel_1,
+                    term.channel_2,
+                    diagonal_offset,
+                    kernel_sums[pair],
+                    ell2 if lower_triangle else ell1,
+                    ell1 if lower_triangle else ell2,
+                )
+            return scales[memo]
+
+        for plan, flat in zip(batch, flats):
+            upper = np.zeros(n_ell)
+            lower = np.zeros(n_ell)
+            # One orientation (plan.lower is None): the lower triangle is the
+            # upper band with N_t read at (l + Delta, l), unchanged.
+            same_band_lower = (
+                diagonal_offset != 0 and not plan.auto and plan.lower is None
+            )
+            for key, term in plan.upper:
+                band = bands[key]
+                upper += term.coefficient * band * scale(term, False)
+                if same_band_lower:
+                    lower += term.coefficient * band * scale(term, True)
+            # Both orientations: the element (a at l + Delta, b at l) is
+            # Cov(b_l, a_{l+Delta}), i.e. the terms of the transposed key with
+            # b on the l* leg of their kernels, read at the element's own
+            # (row, column) multipoles like the level-1 path.
+            if diagonal_offset != 0 and plan.lower is not None:
+                for key, term in plan.lower:
+                    lower += term.coefficient * bands[key] * scale(term, True)
+            flat[upper_row, :n_ell] = upper
+            if diagonal_offset != 0:
+                flat[lower_row, :n_ell] = upper if plan.auto else lower
 
     def _te_contractions(
         self,
@@ -1521,18 +2052,24 @@ class ACCStrategy(CovarianceStrategy):
         without manifests.
 
         In a run with a B observable (:meth:`_wick_mode`) the spectra are
-        every true spectrum the block's expanded Wick terms read, the pairs
-        are those terms' kernel pairs, and the identity also records the
+        every true spectrum the block's expanded Wick terms read (those of
+        both orientations for a block computed in both), the pairs are
+        those terms' kernel pairs, and the identity also records the
         normalisation rule (:data:`ACC_NORMALISATION_RULE`), the pair list
-        and the orientation the block was computed in. A block saved by a
-        T/E-only run (Eq. 23 per contraction) therefore never matches a
-        B-run manifest, and a T/E-only run's manifest is unchanged.
+        and the orientation the block was computed in (``"natural"`` or
+        ``"both"``, :meth:`_wick_plan`). A block saved by a T/E-only run
+        (Eq. 23 per contraction) therefore never matches a B-run manifest, a
+        T/E-only run's manifest is unchanged, and a block saved before the
+        lower triangle of B runs was computed in its own orientation (up to
+        cmbcov 0.3.0, or from a one-orientation cache: ``"natural"`` or
+        ``"transposed"`` for a block that now has ``"both"``) is recomputed.
         """
         config = self.cov.config
         kernel_dir = os.path.abspath(self.cov.acc_kernel_dir)
         lmax = self.cov.lmax
         if self._wick_mode(cov_key):
-            terms, transposed = self._wick_orientation(cov_key, cl)
+            upper_terms, lower_terms, orientation = self._wick_plan(cov_key, cl)
+            terms = upper_terms + (lower_terms or [])
             pairs = sorted({(t.channel_1, t.channel_2) for t in terms})
             size = acc_cached_kernel_size(
                 kernel_dir, config.centralell, config.dmax, pairs=pairs
@@ -1552,9 +2089,7 @@ class ACCStrategy(CovarianceStrategy):
                 {
                     "acc_normalisation": ACC_NORMALISATION_RULE,
                     "acc_kernel_pairs": ["x".join(pair) for pair in pairs],
-                    "acc_block_orientation": (
-                        "transposed" if transposed else "natural"
-                    ),
+                    "acc_block_orientation": orientation,
                 }
             )
             return spectra, identity
@@ -1721,55 +2256,90 @@ class ACCStrategy(CovarianceStrategy):
         return f"{freq_key}/{stokes_key}", array
 
     def _pairs_on_disk(self, pairs: Iterable[tuple[str, str]]) -> bool:
-        """Whether every pair's kernel file exists (new or legacy name) for
-        the first diagonal ``(centralell, centralell)``."""
+        """Whether the kernel loader can serve every pair on the first
+        diagonal ``(centralell, centralell)``: under its own or legacy name,
+        or stored only as its transpose, and listed by the manifest's pair
+        record if it has one (:func:`_missing_kernel_pairs`, the loader's own
+        rule, :func:`~cmbcov.approximations.acc_cache.locate_coupling_kernel`)."""
         ell = self.cov.config.centralell
-        kernel_dir = self.cov.acc_kernel_dir
-        for pair in pairs:
-            path = acc_cache.coupling_save_path(
-                kernel_dir, pair, ell, ell, COUPLING_CHANNELS
-            )
-            if os.path.exists(path):
-                continue
-            legacy = tuple(LEGACY_CHANNEL_NAMES.get(s, s) for s in pair)
-            legacy_path = os.path.join(
-                kernel_dir,
-                f"covariance_coupling/{legacy[0]}x{legacy[1]}_{ell}x{ell}.npy",
-            )
-            if legacy == tuple(pair) or not os.path.exists(legacy_path):
-                return False
-        return True
+        return not _missing_kernel_pairs(self.cov.acc_kernel_dir, ell, ell, pairs)
 
-    def _wick_orientation(self, cov_key: CovKey, cl) -> tuple[list, bool]:
+    def _wick_term_multiset(self, terms, cl) -> list:
         """
-        The expanded Wick terms this block is computed from, and whether they
-        are those of the transposed block ``Cov(b, a)``.
+        The Wick terms of a block as a sorted list of ``(identity,
+        coefficient)``, each term taken up to the identity
+        ``C1 . Theta^{pq} . C2 = C2 . Theta^{qp} . C1`` and with its spectra
+        identified by the arrays ``cl`` holds for them: two blocks with the
+        same list have the same ACC value on every element (the Wick
+        counterpart of :func:`_contraction_multiset`).
+        """
+        merged: dict[tuple, int] = {}
+        for term in terms:
+            left = id(self._wick_spectrum(cl, term.left)[1])
+            right = id(self._wick_spectrum(cl, term.right)[1])
+            forward = (left, term.channel_1, term.channel_2, right)
+            reverse = (right, term.channel_2, term.channel_1, left)
+            key = min(forward, reverse)
+            merged[key] = merged.get(key, 0) + term.coefficient
+        return sorted((k, v) for k, v in merged.items() if v)
 
-        The precompute stores, for every off-diagonal block, the kernel pairs
-        of ONE orientation, the one minimising the pair count
-        (:func:`~cmbcov.bmode_wick.required_kernel_pairs`,
-        docs/theory/bmode_kernels.md): e.g. Cov(BB, TE)
-        rather than Cov(TE, BB). The natural orientation is used when its
-        kernels are all on disk, else the transposed one when its are, else
-        the natural one (whose load then raises the "recompute" error naming
-        the missing pair). ``Cov(a, b)_{l l'} = Cov(b, a)_{l' l}`` exactly;
-        in ACC the two orientations differ only in which of the two
-        elements ``(l*, l*+Delta)`` / ``(l*+Delta, l*)`` is exact.
+    def _wick_plan(self, cov_key: CovKey, cl) -> tuple[list, list | None, str]:
+        """
+        How a block of a run with a B observable is assembled:
+        ``(upper_terms, lower_terms, orientation)``.
+
+        The exact covariance of two different spectra is not symmetric
+        within its block, and the kernel of ``Cov(a, b)`` at
+        ``(l*, l* + Delta)`` is exact only with ``a`` on the lower multipole
+        (docs/theory/acc.md, Sect. 3; docs/theory/bmode_kernels.md,
+        Sect. 6). So, as in the T/E-only path, every element is computed in
+        its own orientation:
+
+        - an auto block, or a block whose transposed key has the same Wick
+          terms (:meth:`_wick_term_multiset`; e.g. two TT, EE or BB spectra
+          at different frequencies), has one orientation: ``lower_terms`` is
+          ``None``, its lower triangle is its upper band, and
+          ``orientation`` is ``"natural"``;
+        - every other block takes its upper triangle from the terms of
+          ``Cov(a, b)`` and its lower one from those of ``Cov(b, a)``
+          (``orientation = "both"``), so the lower triangle is the
+          transposed upper triangle of ``Cov(b, a)`` and the block does not
+          depend on the order in which the run lists its spectra.
+
+        The kernel pairs of both orientations must be on disk
+        (:func:`~cmbcov.bmode_wick.required_kernel_pairs` includes them).
+        There is no single-orientation fallback: a cache that lacks some
+        (e.g. a B-mode cache precomputed by cmbcov 0.3.0 or earlier, which
+        stored one orientation per block) raises ``OSError`` naming the
+        block and its missing pairs, rather than computing one triangle
+        from the other orientation's kernel.
         """
         from ..bmode_wick import covkey_wick_terms
 
         parity_odd = self._run_flags(cov_key, cl)["parity_odd"]
         natural = covkey_wick_terms(cov_key.stoke, cov_key.freq, parity_odd)
-        if cov_key.left == cov_key.right:
-            return natural, False
-        natural_pairs = {(t.channel_1, t.channel_2) for t in natural}
-        if self._pairs_on_disk(natural_pairs):
-            return natural, False
-        swapped = cov_key.transpose()
-        transposed = covkey_wick_terms(swapped.stoke, swapped.freq, parity_odd)
-        if self._pairs_on_disk({(t.channel_1, t.channel_2) for t in transposed}):
-            return transposed, True
-        return natural, False
+        lower = None
+        if cov_key.left != cov_key.right:
+            swapped = cov_key.transpose()
+            transposed = covkey_wick_terms(swapped.stoke, swapped.freq, parity_odd)
+            if self._wick_term_multiset(natural, cl) != self._wick_term_multiset(
+                transposed, cl
+            ):
+                lower = transposed
+        needed = sorted({(t.channel_1, t.channel_2) for t in natural + (lower or [])})
+        ell = self.cov.config.centralell
+        missing = _missing_kernel_pairs(self.cov.acc_kernel_dir, ell, ell, needed)
+        if missing:
+            raise OSError(
+                f"ACC coupling kernels not found under "
+                f"{self.cov.acc_kernel_dir!r} for the block "
+                f"{cov_key.stokekey()} ({cov_key.freqkey()}): it needs "
+                f"{len(needed)} kernel pairs"
+                + (" (both orientations)" if lower is not None else "")
+                + f", and {', '.join('x'.join(p) for p in missing)} are "
+                f"missing at ({ell}, {ell}). {_BMODE_PAIRS_HELP}"
+            )
+        return natural, lower, "natural" if lower is None else "both"
 
     def _require_gl_kernels(self, ell: int, ell_prime: int) -> None:
         """
@@ -1814,106 +2384,29 @@ class ACCStrategy(CovarianceStrategy):
         :math:`(\ell_*, \ell_*+\Delta)`, the Eq. 33 translation of today
         (:func:`_acc_band`), and :math:`N_t` the per-term rule
         (:meth:`~cmbcov.covariance.Cov.acc_term_scale`).
-        The lower triangle is filled as in the level-1 path (same band,
-        :math:`N_t` read at ``(l + Delta, l)``). A parity-mixed block
+        Each element is computed in its own orientation
+        (:meth:`_wick_plan`): the upper triangle from the terms of
+        ``cov_key``, the lower one from those of ``cov_key.transpose()``,
+        both with :math:`N_t` read at the element's own (row, column)
+        multipoles, so every element is exact at :math:`\ell_*` and the
+        result does not depend on the order in which the run lists its
+        spectra (docs/theory/bmode_kernels.md, Sect. 6). An auto block and a
+        block whose transposed key has the same terms take one band for both
+        triangles, :math:`N_t` read at ``(l + Delta, l)`` for the lower one.
+        A cache without the kernel pairs of both orientations is refused
+        (``OSError``). A parity-mixed block
         (one parity-odd observable) is zero unless the run asks for
         ``parity_mixed_blocks``.
+
+        :meth:`compute_covariance_term` of such a run computes the block
+        through the batched assembly (:meth:`compute_covariance_terms`), with
+        the same result; this method forces the per-Wick-term path for one
+        block whatever the run context.
         """
-        from ..keys import _is_parity_odd_spec
-
-        config = self.cov.config
-        dmax = config.dmax
-        centralell = config.centralell
-        lmax = self.cov.lmax
-        flags = self._run_flags(cov_key, cl)
-        flat_cov = self._empty_flatten_cov(dmax)
-
-        if (
-            _is_parity_odd_spec(cov_key.left) != _is_parity_odd_spec(cov_key.right)
-            and not flags["parity_mixed_blocks"]
-        ):
-            return self._unflatten_cov(flat_cov)
-
-        terms, transposed = self._wick_orientation(cov_key, cl)
-        needed_pairs = sorted({(t.channel_1, t.channel_2) for t in terms})
-        spectra = {}
-        for term in terms:
-            for side in (term.left, term.right):
-                if side not in spectra:
-                    spectra[side] = self._wick_spectrum(cl, side)
-        auto = cov_key.auto()
-        padded: dict[tuple[int, int], np.ndarray] = {}
-
-        for diagonal_offset in range(dmax):
-            n_ell = lmax - diagonal_offset
-            if n_ell <= 0:
-                continue
-            ell_prime = centralell + diagonal_offset
-            coupling_kernels = self.get_covariance_coupling(
-                centralell, ell_prime, pairs=needed_pairs
-            )
-            self._require_gl_kernels(centralell, ell_prime)
-            ell1 = np.arange(n_ell)
-            ell2 = ell1 + diagonal_offset
-
-            bands = {}
-            upper = np.zeros(n_ell)
-            lower = np.zeros(n_ell)
-            for term in terms:
-                pair = (term.channel_1, term.channel_2)
-                kernel = coupling_kernels[pair]
-                size = kernel.shape[0]
-                (name_1, spec_1), (name_2, spec_2) = (
-                    spectra[term.left],
-                    spectra[term.right],
-                )
-                memo = (id(spec_1), id(spec_2), pair)
-                if memo not in bands:
-                    n_read = acc_internal_lmax(lmax, size, centralell)
-                    for name, spectrum in ((name_1, spec_1), (name_2, spec_2)):
-                        if (id(spectrum), size) not in padded:
-                            _check_spectrum_length(
-                                spectrum, f"cl[{name}]", lmax, size, centralell
-                            )
-                            padded[id(spectrum), size] = _padded_spectrum(
-                                spectrum, centralell, n_read, size
-                            )
-                    chunk = max(1, _ASSEMBLY_CHUNK_BYTES // (24 * size))
-                    bands[memo] = _acc_band(
-                        np.asarray(kernel, dtype=float),
-                        padded[id(spec_1), size],
-                        padded[id(spec_2), size],
-                        n_ell,
-                        chunk,
-                    )
-                band = bands[memo]
-                kernel_sum = float(np.sum(kernel))
-                scale = self.cov.acc_term_scale(
-                    term.channel_1,
-                    term.channel_2,
-                    diagonal_offset,
-                    kernel_sum,
-                    ell1,
-                    ell2,
-                )
-                upper += term.coefficient * band * scale
-                if diagonal_offset != 0 and not auto:
-                    scale_lower = self.cov.acc_term_scale(
-                        term.channel_1,
-                        term.channel_2,
-                        diagonal_offset,
-                        kernel_sum,
-                        ell2,
-                        ell1,
-                    )
-                    lower += term.coefficient * band * scale_lower
-
-            flat_cov[diagonal_offset + dmax - 1, :n_ell] = upper
-            if diagonal_offset != 0:
-                flat_cov[-diagonal_offset + dmax - 1, :n_ell] = upper if auto else lower
-
-        block = self._unflatten_cov(flat_cov)
-        return np.ascontiguousarray(block.T) if transposed else block
+        plan = self._plan_wick_block(cov_key, cl, _identity_memo())
+        if plan.kind == "zero":
+            return self._unflatten_cov(self._empty_flatten_cov(self.cov.config.dmax))
+        return self._unflatten_cov(self._assemble_batch([plan], "wick")[0])
 
     def validate_config(self) -> None:
         """Validate configuration for ACC strategy."""
@@ -1932,19 +2425,19 @@ class ACCStrategy(CovarianceStrategy):
         if config.centralell <= 150:
             warn_low_centralell_once(config.centralell)
 
-    def error_budget(self, covariance_keys, band_edges=None) -> dict | None:
+    def error_budget(self, covariance_keys, band_edges=None) -> dict:
         """
-        The polarised error budget of this run, as a dict, or ``None`` when no
-        block has a polarised leg.
+        The error budget of this run, as a dict; every ACC run has one.
 
-        Two terms, from
-        :mod:`~cmbcov.approximations.acc_budget`: the E->B
-        leakage of the kernel set in use, ``lambda = sum Theta^{TT x BB} /
-        sum Theta^{TT x EE}``, giving ``(n_E / 2) lambda`` per block (the
-        ``BB`` kernels are already in the cache and read by nothing else, so
-        this computes nothing new); and the Eq. 33 translation error, which is
-        *not* bounded -- the budget reports ``|l - l*|`` at the band edges and
-        says so. See that module for what was tried and measured.
+        Three parts, from :mod:`~cmbcov.approximations.acc_budget`. For a
+        T/E run with a polarised leg: the E->B leakage of the kernel set in
+        use, ``lambda = sum Theta^{TT x BB} / sum Theta^{TT x EE}``, giving
+        ``(n_E / 2) lambda`` per block (the ``BB`` kernels are already in the
+        cache and read by nothing else, so this computes nothing new); and
+        the Eq. 33 translation error, which is *not* bounded -- the budget
+        reports ``|l - l*|`` at the band edges and says so. For every run:
+        the normalisation check of the kernels against ``Cov.Xi`` (Eq. 22).
+        See that module for what was tried and measured.
 
         Parameters
         ----------
@@ -1958,17 +2451,17 @@ class ACCStrategy(CovarianceStrategy):
         -----
         Reporting only. Nothing here touches the covariance.
 
-        ``None`` for a run with a B observable: its blocks use the
-        per-Wick-term normalisation (docs/theory/bmode_kernels.md), which
-        is exact at ``l*`` and carries no Eq. 23 leakage bias of the
-        ``(n_E / 2) lambda`` form this report quotes; its measured accuracy
-        off ``l*`` is docs/theory/bmode_kernels.md, "Known limits".
+        A TT-only run has no polarised leg, and a run with a B observable
+        uses the per-Wick-term normalisation (docs/theory/bmode_kernels.md),
+        which is exact at ``l*`` and carries no Eq. 23 leakage bias of the
+        ``(n_E / 2) lambda`` form; its measured accuracy off ``l*`` is
+        docs/theory/bmode_kernels.md, "Known limits". For both the leakage
+        and translation sections are reported as not applicable
+        (``"applicable": False`` in the dict) and only the normalisation
+        check is computed.
         """
-        from ..covariance import has_b_observable
         from . import acc_budget
 
-        if has_b_observable(covariance_keys):
-            return None
         return acc_budget.error_budget(self, covariance_keys, band_edges=band_edges)
 
     def get_covariance_coupling_save_path(

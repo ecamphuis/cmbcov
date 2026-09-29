@@ -196,8 +196,13 @@ def test_every_polarised_block_of_a_multi_frequency_run_is_listed(strategy):
 # ----------------------------------------------------------- when it is absent
 
 
-def test_a_tt_only_run_has_no_budget(strategy):
-    assert strategy.error_budget(_keys(stokes=("T",))) is None
+def test_a_tt_only_run_has_a_budget_without_the_polarised_terms(strategy):
+    # Every ACC run reports the Eq. 22 normalisation check; a TT-only run has
+    # no polarised leg, so its leakage and translation terms do not apply.
+    budget = strategy.error_budget(_keys(stokes=("T",)))
+    assert budget["applicable"] is False and budget["reason"] == "tt_only"
+    assert budget["leakage"]["applicable"] is False
+    assert "normalisation" in budget
 
 
 def test_nka_and_inka_have_no_budget(tmp_path):

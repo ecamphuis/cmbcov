@@ -226,3 +226,263 @@ def test_near_degenerate_two_frequency_matrix_is_positive_definite(level1_cov):
     project = np.kron(np.eye(len(keys.spec_keys)), binning)
     eigenvalues = np.linalg.eigvalsh(_correlation(project @ raw @ project.T))
     assert eigenvalues[0] > 1e-7, eigenvalues[:3]
+
+
+# --------------------------------------------------------------------------- #
+# Runs with a B observable (per-Wick-term assembly,
+# docs/theory/bmode_kernels.md, Sect. 6)
+# --------------------------------------------------------------------------- #
+#
+# ACCStrategy._compute_covariance_term_wick had the same orientation rule:
+# the band of Cov(a, b) served both triangles. With a cache holding the
+# kernel pairs of both orientations (e.g. all 81 ordered pairs) that was the
+# listed orientation, so the matrix depended on the order of the spectra;
+# with the one-orientation cache cmbcov 0.3.0 precomputed (18 pairs), the
+# blocks whose two orientations were both on disk (EE x BB, TE x TE and
+# EB x EB across frequency pairs, ...) still did. Measured on this
+# configuration (two frequencies, observables TT EE BB TE TB EB,
+# C^TB = C^EB = 0), before / after the fix:
+#
+#   identical maps, raw matrix on the frequency differences (correlation
+#   units): 81-pair cache 1.5e-1 / 1.3e-15, 18-pair cache 7.4e-2 / 1.3e-15;
+#   frequency order reversed, correlation change beyond the permutation:
+#   6.8e-2 / 6.7e-16 (81 pairs), 2.1e-2 / 6.7e-16 (18 pairs);
+#   white noise 1e-4, 2e-4, binned correlation matrix: lowest eigenvalue
+#   -3.4e-2 (9 negative) / +1.8e-6 (81 pairs), -2.3e-2 (3 negative) /
+#   +1.8e-6 (18 pairs).
+#
+# required_kernel_pairs now includes both orientations of every block (25
+# pairs here), so the "minimal" cache below computes every non-symmetric
+# block in both orientations, like the 81-pair one: the same null space,
+# order independence and PD, and both triangles exact at l*.
+
+B_OBS = ["TT", "EE", "BB", "TE", "TB", "EB"]
+B_FREQS = ["f1", "f2"]
+
+
+@pytest.fixture(scope="module")
+def bmode_covs(tmp_path_factory):
+    """The rippled cap with GL kernels for all 81 ordered channel pairs, and
+    with the 25-pair set required_kernel_pairs gives for B_OBS (both
+    orientations of every block)."""
+    from cmbcov.approximations.acc import COUPLING_CHANNELS
+    from cmbcov.bmode_wick import required_kernel_pairs
+
+    all_pairs = [(a, b) for a in COUPLING_CHANNELS for b in COUPLING_CHANNELS]
+    covs = {}
+    for name, pairs in (
+        ("full", all_pairs),
+        ("minimal", sorted(required_kernel_pairs(B_OBS))),
+    ):
+        work = str(tmp_path_factory.mktemp(f"acc_orientation_b_{name}"))
+        hp.write_map(
+            os.path.join(work, "mask.fits"),
+            rippled_cap_bandlimited(),
+            overwrite=True,
+            dtype=np.float64,
+        )
+        precompute_acc_kernels(
+            "mask.fits",
+            work,
+            centralell=CENTRALELL,
+            dmax=DMAX,
+            mask_path=work,
+            nside=NSIDE_ACC,
+            grid="gl",
+            lw=LW,
+            pairs=pairs,
+        )
+        config = CovarianceConfig(
+            method=CovarianceMethod.ACC,
+            lmax=LMAX,
+            lmin=2,
+            dmax=DMAX,
+            centralell=CENTRALELL,
+            polspice_postprocess=False,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            covs[name] = Cov("mask.fits", config=config, mask_path=work, save_dir=work)
+    return covs
+
+
+def _b_single_spectra(odd=False, n=80):
+    ell = np.arange(n)
+    tt, ee, bb = np.zeros(n), np.zeros(n), np.zeros(n)
+    tt[2:] = 1.0 / (ell[2:] * (ell[2:] + 1)) ** 0.8
+    ee[2:] = 0.3 / (ell[2:] + 3.0) ** 1.7 * (1 + 0.5 * np.cos(ell[2:] / 2.0))
+    bb[2:] = 0.05 / (ell[2:] + 1.0) ** 0.9 * (1 + 0.4 * np.sin(ell[2:] / 1.3))
+    te = 0.6 * np.sqrt(tt * ee) * np.cos(ell / 3.0)
+    tb = 0.1 * np.sqrt(tt * bb) * np.sin(ell / 2.5) if odd else 0 * tt
+    eb = 0.2 * np.sqrt(ee * bb) * np.cos(ell / 4.0 + 0.3) if odd else 0 * tt
+    return {"TT": tt, "EE": ee, "BB": bb, "TE": te, "TB": tb, "EB": eb}
+
+
+def _b_spectra(noise=None, distinct=False, odd=False):
+    """Two-frequency spectra of every letter pair: one sky, white noise
+    ``noise[i]`` in the auto-spectra of frequency ``i`` (twice that in EE
+    and BB); ``distinct`` scales each frequency pair differently and makes
+    XY and YX differ across frequencies."""
+    base = _b_single_spectra(odd)
+    cl = {}
+    for i, f1 in enumerate(B_FREQS):
+        for j, f2 in enumerate(B_FREQS):
+            white = 0.0 if noise is None or i != j else noise[i]
+            scale = 1.0 + 0.1 * i + 0.2 * j if distinct else 1.0
+            ab = 1.0 + 0.05 * i if distinct else 1.0
+            ba = 1.0 + 0.05 * j if distinct else 1.0
+            cl[f1 + f2] = {
+                "TT": scale * base["TT"] + white,
+                "EE": scale * base["EE"] + 2 * white,
+                "BB": scale * base["BB"] + 2 * white,
+                "TE": scale * ab * base["TE"],
+                "ET": scale * ba * base["TE"],
+                "TB": scale * ab * base["TB"],
+                "BT": scale * ba * base["TB"],
+                "EB": scale * ab * base["EB"],
+                "BE": scale * ba * base["EB"],
+            }
+    return cl
+
+
+@pytest.mark.parametrize("cache", ["full", "minimal"])
+def test_b_run_identical_frequencies_keep_the_exact_null_space(bmode_covs, cache):
+    """Same spectra at every frequency pair: every spectrum with the same two
+    letters (in either order) is one random variable, so their differences
+    have zero variance, B blocks included."""
+    keys = CovKeys([], B_FREQS, observables=B_OBS)
+    corr = _correlation(_raw_matrix(bmode_covs[cache], keys, _b_spectra()))
+    groups: dict[str, list[int]] = {}
+    for i, spec in enumerate(keys.spec_keys):
+        groups.setdefault("".join(sorted(spec.stokekey())), []).append(i)
+    assert sorted(len(g) for g in groups.values()) == [3, 3, 3, 4, 4, 4]
+    rows = []
+    for members in groups.values():
+        for other in members[1:]:
+            for ell in range(2, LMAX):
+                v = np.zeros(corr.shape[0])
+                v[members[0] * LMAX + ell] = 1.0
+                v[other * LMAX + ell] = -1.0
+                rows.append(v)
+    null = np.array(rows)
+    assert np.max(np.abs(null @ corr @ null.T)) <= 1e-12
+
+
+def _position_in(keys):
+    """Index in ``keys.spec_keys`` of a spectrum of another listing
+    (``XY`` at ``(f2, f1)`` is ``YX`` at ``(f1, f2)``)."""
+    labels = [(s.stokekey(), s.freqkey()) for s in keys.spec_keys]
+
+    def index(spec):
+        letters, freqs = spec.stokekey(), spec.freqkey()
+        if (letters, freqs) not in labels:
+            half = len(freqs) // 2
+            letters, freqs = letters[::-1], freqs[half:] + freqs[:half]
+        return labels.index((letters, freqs))
+
+    return index
+
+
+@pytest.mark.parametrize("cache", ["full", "minimal"])
+@pytest.mark.parametrize("odd", [False, True], ids=["TB=EB=0", "TB,EB!=0"])
+def test_b_run_spectrum_order_does_not_change_the_matrix(bmode_covs, cache, odd):
+    """Listing the frequencies, or the observables, in another order
+    permutes the matrix and changes nothing else."""
+    if odd and cache == "minimal":
+        pytest.skip("the 25-pair cache does not cover non-zero C^TB, C^EB")
+    cov = bmode_covs[cache]
+    cl = _b_spectra((0.01, 0.02), distinct=True, odd=odd)
+    keys = CovKeys([], B_FREQS, observables=B_OBS)
+    direct = _raw_matrix(cov, keys, cl)
+    index = _position_in(keys)
+    for other in (
+        CovKeys([], B_FREQS[::-1], observables=B_OBS),
+        CovKeys([], B_FREQS, observables=B_OBS[::-1]),
+    ):
+        order = [index(s) for s in other.spec_keys]
+        rows = np.concatenate([np.arange(k * LMAX, (k + 1) * LMAX) for k in order])
+        np.testing.assert_allclose(
+            direct[np.ix_(rows, rows)],
+            _raw_matrix(cov, other, cl),
+            rtol=0,
+            atol=1e-13 * np.max(np.abs(direct)),
+        )
+
+
+def test_b_run_lower_triangle_is_the_transposed_block(bmode_covs):
+    """With both orientations on disk, the lower triangle of every non-auto
+    block is the transposed upper triangle of the transposed block, and the
+    raw-block identity records the orientation."""
+    cl = _b_spectra((0.01, 0.02), distinct=True)
+    keys = CovKeys([], B_FREQS, observables=B_OBS, parity_mixed_blocks=True)
+    strategy = StrategyFactory.create_strategy(bmode_covs["full"])
+    strategy.configure_run(keys, cl)
+    orientations: dict[str, int] = {}
+    for key in keys.keys():
+        if key.auto():
+            continue
+        block = strategy.compute_covariance_term(key, cl)
+        transposed = strategy.compute_covariance_term(key.transpose(), cl)
+        scale = np.max(np.abs(block)) or 1.0
+        np.testing.assert_allclose(
+            np.tril(block, -1), np.tril(transposed.T, -1), rtol=0, atol=1e-13 * scale
+        )
+        orientation = strategy.raw_block_inputs(key, cl)[1]["acc_block_orientation"]
+        orientations[orientation] = orientations.get(orientation, 0) + 1
+    # "natural": blocks whose transposed key has the same Wick terms (two
+    # TT, two EE or two BB spectra, TB x TB-type ...), computed once
+    assert orientations.get("transposed", 0) == 0
+    assert orientations["both"] > 0 and orientations["natural"] > 0
+
+
+def test_b_run_both_triangles_exact_at_lstar(bmode_covs):
+    """Single frequency, every ordered pair of different parity-matched
+    spectra: the lower triangle is exact at l* too (``Cov(s1 at l* + Delta,
+    s2 at l*)``), with all 81 pairs on disk and with the 25-pair set of
+    required_kernel_pairs. With the one-orientation 18-pair set of cmbcov
+    0.3.0, TT x EE, TT x TE, EE x TE, TT x BB, BB x TE and EB x TB were off
+    there by their exact asymmetry: 1.2 to 3.8% (T/E), 6.7% (TB x EB), 29%
+    (TE x BB) and 49% (TT x BB) on this cap."""
+    from cmbcov.exact import exact_covariance_row_pol
+    from cmbcov.keys import CovKey
+    from cmbcov.sht import ducc0_map2alm
+
+    cls = _b_single_spectra()
+    cl = {"ff": {**cls, "ET": cls["TE"], "BT": cls["TB"], "BE": cls["EB"]}}
+    keys = CovKeys([], ["f"], observables=B_OBS)
+    alm = ducc0_map2alm(bmode_covs["full"].wlm.mask, lmax=LW, pol=False, iter=10)
+    row = exact_covariance_row_pol(
+        alm, cls, CENTRALELL, LMAX, spectra=B_OBS, lw=LW, lmax_int=40
+    )
+    worst = {}
+    for cache in ("full", "minimal"):
+        strategy = StrategyFactory.create_strategy(bmode_covs[cache])
+        strategy.configure_run(keys, cl)
+        for s1 in B_OBS:
+            for s2 in B_OBS:
+                if s1 == s2 or (s1 in ("TB", "EB")) != (s2 in ("TB", "EB")):
+                    continue
+                key = CovKey((s1[0], s1[1], s2[0], s2[1]), ("f",) * 4)
+                block = strategy.compute_covariance_term(key, cl)
+                ref = row[(s1, s2)]  # ref[l] = Cov(s1 at l, s2 at l*)
+                worst[cache, s1, s2] = max(
+                    abs(block[CENTRALELL + d, CENTRALELL] / ref[CENTRALELL + d] - 1)
+                    for d in range(1, DMAX)
+                )
+    assert len(worst) == 2 * 14
+    assert max(worst.values()) <= 1e-12, max(worst.items(), key=lambda kv: kv[1])
+
+
+def test_b_run_near_degenerate_two_frequency_matrix_is_positive_definite(bmode_covs):
+    """Low noise, all 81 pairs: the old orientation rule gave the binned
+    correlation matrix 9 negative eigenvalues, the lowest -3.4e-2."""
+    cl = _b_spectra((1e-4, 2e-4))
+    keys = CovKeys([], B_FREQS, observables=B_OBS)
+    raw = _raw_matrix(bmode_covs["full"], keys, cl)
+    n_bins, width, first = 3, 6, 2
+    binning = np.zeros((n_bins, LMAX))
+    for b in range(n_bins):
+        binning[b, first + width * b : first + width * (b + 1)] = 1.0 / width
+    project = np.kron(np.eye(len(keys.spec_keys)), binning)
+    eigenvalues = np.linalg.eigvalsh(_correlation(project @ raw @ project.T))
+    assert eigenvalues[0] > 1e-7, eigenvalues[:3]

@@ -168,6 +168,7 @@ Readings:
 - The other orientation of an off-diagonal block, for example Cov(BB,TE)
   against Cov(TE,BB), is a different expansion; it agrees at $\ell = \ell'$
   and differs off it, like the TT×EE asymmetry of [ACC](acc.md), Sect. 3.
+  Sect. 6 says which orientation each element of a block is computed from.
 
 **Parity-mixed blocks.** Blocks between a parity-even spectrum (TT, EE, BB,
 TE) and a parity-odd one (TB, EB), such as TT×TB, change sign under a
@@ -275,25 +276,127 @@ $\Xi^{EE\to EE}$, $\Xi^{EE\to BB}$ and $\rho$. Requirements that follow:
 
 ## 6. Kernel-pair sets
 
-The kernel pairs a run needs follow from the expansion of its blocks. Pairs
-are counted up to transposition, and for an off-diagonal block the
-orientation that minimises the total is stored; the other orientation is
-then computed as the transpose. `bmode_wick.required_kernel_pairs` returns
-the set, and a parameter-file precompute (`cmbcov-precompute`) requests it
-automatically unless an explicit `spectra` list is given, reading the TB
-and EB columns of the spectra files to decide whether they are zero.
+The kernel pairs a run needs follow from the expansion of its blocks, in
+both orientations of every off-diagonal block (see "Orientation" below).
+Pairs are counted up to transposition. `bmode_wick.required_kernel_pairs`
+returns the set, and a parameter-file precompute (`cmbcov-precompute`)
+requests it automatically unless an explicit `spectra` list is given,
+reading the TB and EB columns of the spectra files to decide whether they
+are zero.
 
 | observables | TB, EB spectra | kernel pairs | channels |
 |---|---|---|---|
 | TT, EE, TE | not read | 10 | TT, DD, TD, DT |
-| TT, EE, TE, BB | not read | 17 | + LL, TL, DL, LD |
-| TT, EE, TE, BB, TB, EB | zero | 18 | all nine |
-| TT, EE, TE, BB, TB, EB | non-zero | 40 | all nine |
-| as above, with `parity_mixed_blocks` | zero / non-zero | 31 / 40 | all nine |
+| TT, EE, TE, BB | not read | 24 | all nine |
+| TT, EE, TE, BB, TB, EB | zero | 25 | all nine |
+| TT, EE, TE, BB, TB, EB | non-zero | 45 | all nine |
+| as above, with `parity_mixed_blocks` | zero / non-zero | 45 / 45 | all nine |
+| EE, BB | not read | 6 | DD, LL, DL, LD |
 | BB only | not read | 3 | DD, LL |
 
-A cache built for the zero case is refused, with a message naming the
-missing pairs, by a run whose TB or EB spectra turn out non-zero.
+45 is every unordered pair of the nine channels. The set does not depend on
+the number of frequencies or on the order of the observables. A cache built
+for the zero case is refused, with a message naming the missing pairs, by a
+run whose TB or EB spectra turn out non-zero.
+
+**Orientation.** As for the T/E blocks ([ACC](acc.md), Sect. 3), the kernel
+of Cov(a, b) at $(\ell_\ast, \ell_\ast+\Delta)$ is exact only with spectrum
+a on the lower multipole. So each element is computed from the orientation
+that is exact for it: the upper triangle ($\ell \le \ell'$) from the Wick
+terms of Cov(a, b), the lower one from those of Cov(b, a), each term with
+$N_t$ read at the element's own multipoles. The lower triangle of
+Cov(a, b) is then the transposed upper triangle of Cov(b, a), every element
+is exact at $\ell_\ast$, and the matrix does not depend on the order in
+which the run lists its spectra or frequencies. A block whose transposed
+key has the same Wick terms (an auto block, two TT, EE or BB spectra at
+different frequencies) has one orientation and is computed once.
+
+The two orientations need different kernel pairs. Cov(b, a) has the fields
+of the two legs exchanged in every channel (TL becomes LT, DL becomes LD,
+TD becomes DT), and its kernels are different ones: they agree with those
+of Cov(a, b) at $\Delta = 0$ (to $10^{-13}$ on the test cap at
+$\ell_\ast = 8$) and differ for $\Delta \ge 1$, there by 0.3 to 4% of the
+kernel's largest entry without an L leg and by 2% up to order one with one,
+so they cannot be derived from the pairs of Cov(a, b). The only exact
+identity between stored kernels, $\Theta^{qp} = (\Theta^{pq})^{T}$ at the
+same $(\ell_\ast, \ell_\ast+\Delta)$, is the one Sect. 4 already uses to
+merge mirror terms. A kernel stored only as its transpose is served by
+transposing it, exactly.
+
+A run refuses a cache that lacks any pair of either orientation, naming
+the missing pairs; there is no single-orientation fallback.
+
+**Changes since cmbcov 0.3.0.** Up to 0.3.0 both triangles of every block
+took the band of one orientation. First, the listed one Cov(a, b) whenever
+its pairs were on disk, as the T/E blocks did before 0.3.0. The exact
+covariance is null on the differences between frequency pairs when all
+frequencies see the same spectra; on the test cap at $\ell_\ast = 8$ (two
+frequencies, the six observables, $C^{TB} = C^{EB} = 0$) the raw matrix
+restricted to those differences was $1.5\times10^{-1}$ in correlation units
+with all 81 ordered pairs on disk and $7.4\times10^{-2}$ with the 18-pair
+set of 0.3.0, and is now $1.3\times10^{-15}$. With white noise of
+$10^{-4}$ of the TT scale, the lowest eigenvalue of the binned correlation
+matrix went from $-3.4\times10^{-2}$ (9 negative) with all pairs and
+$-2.3\times10^{-2}$ (3 negative) with 18 pairs to $+1.8\times10^{-6}$. With
+all pairs on disk the lower triangle was off at $\ell_\ast$ by up to 98% of
+the element in the leakage blocks (BB×TT) and by $2.4\times10^{-2}$ of
+$\sqrt{\mathrm{Cov}\mathstrut_{aa}\mathrm{Cov}\mathstrut_{bb}}$ in EE×BB;
+it is now exact to $10^{-15}$.
+
+Second, `required_kernel_pairs` returned one orientation per off-diagonal
+block, the one minimising the total (17, 18, 31 and 40 pairs for the rows of
+the table above), and that orientation served both triangles. The triangle
+whose multipoles are the other way round was then computed with the kernel
+of the other orientation and was not exact at $\ell_\ast$; its error was
+the exact asymmetry of the block. With the 18-pair set this concerned
+TT×EE, TT×TE, EE×TE, TT×BB, TE×BB and TB×EB. On the test cap at
+$\ell_\ast = 8$ that triangle was off at $\ell_\ast$ by 1.2 to 3.8% of the
+element for the three T/E blocks, 6.7% for TB×EB, 29% for TE×BB and 49% for
+TT×BB, or $2\times10^{-3}$ to $1.6\times10^{-2}$ of
+$\sqrt{\mathrm{Cov}\mathstrut_{aa}\mathrm{Cov}\mathstrut_{bb}}$. On the
+same smooth cap, the exact asymmetry of these six blocks at
+$\Delta \le 3$ falls, in those units, to $3\times10^{-4}$ at
+$\ell_\ast = 30$, $2\times10^{-5}$ at 100 and $3\times10^{-6}$ at 250; the
+T/E ones also fall relative to their own diagonal element, to $10^{-4}$ or
+below, but that of TE×BB stays at 6 to 30% of its diagonal element and that
+of TT×BB above 10%. Both triangles are now exact at $\ell_\ast$ with the
+sets of the table, which add these pairs:
+
+| observables | TB, EB spectra | 0.3.0 | now | added pairs |
+|---|---|---|---|---|
+| TT, EE, TE, BB | not read | 17 | 24 | DD×TD, DT×DT, DT×TT, LD×LT, LL×TD, LT×DL, LT×LT |
+| TT, EE, TE, BB, TB, EB | zero | 18 | 25 | DD×TD, DL×TL, DT×DT, DT×TT, LD×TL, LL×TD, LT×LT |
+| as above, with `parity_mixed_blocks` | zero | 31 | 45 | 14 |
+| TT, EE, TE, BB, TB, EB | non-zero | 40 | 45 | DT×DT, DT×TT, LT×DT, LT×LT, LT×TT |
+| BB only, or EE and BB | not read | 3, 6 | 3, 6 | none |
+
+**Existing caches.** A B-mode cache precomputed by cmbcov 0.3.0 or earlier
+lacks the added pairs and is refused, with a message listing them. Either
+rerun `cmbcov-precompute`, or add only the missing pairs to the cache with
+`precompute_acc_kernels(..., pairs=[...])` and the mask, `centralell`,
+`dmax`, `nside`, `lw` and `grid` it was built with. Extending a cache is
+safe: the per-$(\ell, \ell')$ manifest records the kernel files written,
+and a precompute with the same identity (mask, `centralell`, grid, `lw`,
+`nside`, term selection) merges its pairs and channels into that record,
+so a cache built in steps has the manifests and kernels of a one-shot
+precompute of the union, bit for bit. A precompute with another identity
+starts a new record, and the kernels it did not rewrite are refused rather
+than served under the new identity.
+
+**Cost.** The added pairs add few kernel products to the precompute, whose
+cost is dominated by the coupling integrals. On the baseline test mask
+($\mathrm{dmax} = 5$, median of three runs) 25 pairs took 5.6% longer than
+18 at $\ell_\ast = 60$ with $n_{\mathrm{side}} = 64$ (5.9 s against
+5.6 s) and 1.5% longer at $\ell_\ast = 150$ with $n_{\mathrm{side}} = 128$
+(121 s against 119 s, within the run-to-run spread), for 39% more disk; an
+earlier measurement on a test cap at $\ell_\ast = 150$ gave 2 to 4%. A
+separate precompute of only the 7 added pairs costs 84 to 94% of the whole
+set, since it recomputes the integrals. Assembling both orientations costs 40 to 69% more kernel
+products than one orientation (1 to 3 frequencies). The batched assembly
+([ACC](acc.md), Sect. 3) more than wins that back, bit for bit: it computes
+each distinct left factor of a run once per diagonal, 129 matrix products
+per diagonal instead of 652 (407 with one orientation) for two frequencies
+and the six observables, and 267 instead of 3161 for three.
 
 ## 7. PolSpice post-processing
 
@@ -348,7 +451,11 @@ $\ell_\ast = 250$, 18 kernel pairs, $\mathrm{dmax} = 20$, Planck 2018 lensed
 spectra with lensing B modes, $C^{TB} = C^{EB} = 0$, no noise), against exact
 rows at $\ell' = 150$ to 400. Errors below are in units of
 $\sqrt{\mathrm{Cov}\mathstrut_{aa}\mathrm{Cov}\mathstrut_{bb}}$, the largest
-within 19 multipoles of each row, unless stated otherwise.
+within 19 multipoles of each row, unless stated otherwise. This validation
+used the one-orientation 18-pair set of cmbcov 0.3.0 (Sect. 6) and has not
+been repeated with the 25-pair set: the auto blocks and EE×BB are computed
+as they were then, while one triangle of TT×EE, TT×TE, EE×TE, TT×BB, TE×BB
+and TB×EB now comes from the other orientation.
 
 - **At $\ell_\ast$** every block is exact to the precision of the kernels:
   T/E blocks to $8\times10^{-5}$, leakage blocks to $2$ to $4\times10^{-4}$.

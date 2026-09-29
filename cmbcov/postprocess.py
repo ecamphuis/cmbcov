@@ -7,6 +7,11 @@ Sigma_hat = G Sigma G^T, plus optional D_ell scaling and calibration
 debiasing. A run with a B-mode observable instead goes through `pseudo_to_spice_bmode`,
 which is Eq. (55) plus the EE/BB decoupling mixing of
 docs/theory/bmode_kernels.md.
+
+`Cov.compute_covariance_matrix` applies these steps and the binning, all linear
+on each leg of a block, as one matrix per leg (`leg_projection`, `project`,
+`project_bmode`); `pseudo_to_spice`, `apply_Dl_scaling` and `apply_debiasing`
+are the step-by-step form it is checked against.
 """
 
 from collections.abc import Callable
@@ -209,6 +214,111 @@ class CovariancePostProcessor:
                 term = g_left @ block_provider(a, b) @ g_right.T
                 total = term if total is None else total + term
         return total
+
+    def project_bmode(
+        self,
+        stokes_key: str,
+        block_provider: Callable[[str, str], np.ndarray],
+        projection: Callable[[str, str], np.ndarray],
+    ) -> np.ndarray:
+        r"""
+        `pseudo_to_spice_bmode` with everything after the pseudo blocks
+        folded in: :math:`\sum_{a,b} P_{X\leftarrow a}\,
+        \mathrm{Cov}(\tilde C^a, \tilde C^b)\,P_{Y\leftarrow b}^{T}`, with
+        the same sources and block calls, where ``projection(side, source)``
+        returns :math:`P` (`leg_projection`) of the ``"left"`` or ``"right"``
+        leg of the block for pseudo source ``source``.
+        """
+        left, right = stokes_key.split("x")
+        total = None
+        for a in self.sources(left):
+            p_left = projection("left", a)
+            for b in self.sources(right):
+                term = self.project(
+                    p_left, block_provider(a, b), projection("right", b)
+                )
+                total = term if total is None else total + term
+        return total
+
+    # ---------- folded post-processing: one projection per spectrum leg ----------
+
+    @staticmethod
+    def leg_scaling(
+        freq_pair: str,
+        stokes: str,
+        lmax: int,
+        Dl: bool,
+        debiasing_dict: dict | None,
+    ) -> np.ndarray | None:
+        r"""
+        The diagonal of one leg's :math:`D_\ell` scaling and debiasing,
+        :math:`\delta_\ell\, d_\ell`, or ``None`` when neither applies.
+
+        The covariance-level operations of `apply_Dl_scaling` and
+        `apply_debiasing` are outer products of a per-leg vector, so each
+        leg carries the square root of them: ``delta`` for a leg of a
+        :math:`D_\ell` run and ``debiasing_dict[freq_pair][stokes][:lmax]``
+        when a debiasing dict is given (an empty one is no corrections, as
+        in `apply_debiasing`).
+
+        Parameters
+        ----------
+        freq_pair : str
+            The leg's frequency pair, e.g. ``"090GHz150GHz"`` (one half of
+            ``CovKey.freqkey()``).
+        stokes : str
+            The leg's output spectrum, e.g. ``"TE"``.
+        """
+        scaling = None
+        if Dl:
+            ell = np.arange(lmax)
+            scaling = ell * (ell + 1) / (2 * np.pi)
+        if debiasing_dict:
+            debiasing = np.asarray(debiasing_dict[freq_pair][stokes][:lmax])
+            scaling = debiasing if scaling is None else scaling * debiasing
+        return scaling
+
+    @staticmethod
+    def leg_projection(
+        kernel: np.ndarray | None,
+        scaling: np.ndarray | None,
+        bin_matrix: np.ndarray | None,
+        lmax: int,
+    ) -> np.ndarray:
+        r"""
+        One leg's whole post-processing as a single matrix,
+        :math:`P = B\,\mathrm{diag}(\delta d)\,G` (``n_bins x lmax``).
+
+        PolSpice transform, :math:`D_\ell` scaling, debiasing and binning are
+        each a linear map on every leg of a covariance block, so
+        :math:`B\,D_L\,(G_L\,C\,G_R^{T})\,D_R\,B^{T} = P_L\,C\,P_R^{T}`: two
+        products of size ``n_bins x lmax`` instead of two of ``lmax x lmax``
+        per block, with :math:`P` built once per leg
+        (:meth:`~cmbcov.covariance.Cov.compute_covariance_matrix`).
+
+        Parameters
+        ----------
+        kernel : np.ndarray or None
+            :math:`G` (``lmax x lmax``), or ``None`` without the PolSpice
+            transform.
+        scaling : np.ndarray or None
+            :math:`\delta d` from `leg_scaling`, or ``None``.
+        bin_matrix : np.ndarray or None
+            :math:`B`, or ``None`` for unbinned output (then :math:`P` is
+            ``lmax x lmax``).
+        lmax : int
+            Number of multipoles.
+        """
+        if bin_matrix is None:
+            base = np.eye(lmax) if kernel is None else kernel
+            return base if scaling is None else scaling[:, None] * base
+        weighted = bin_matrix if scaling is None else bin_matrix * scaling[None, :]
+        return weighted if kernel is None else weighted @ kernel
+
+    @staticmethod
+    def project(left: np.ndarray, block: np.ndarray, right: np.ndarray) -> np.ndarray:
+        """``left @ block @ right.T``, contracting the ``lmax`` axes first."""
+        return (left @ block) @ right.T
 
     def apply_debiasing(
         self,

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.1 — 2026-09-29
+
+### Fixed
+
+- **The test suite failed on Linux.** Three tests required the batched ACC
+  assembly of 0.4.0 to be bit-for-bit identical to the previous per-block
+  code. The two do the same arithmetic on matrices of different shapes, and
+  OpenBLAS (Linux) rounds such products differently in the last bit, where
+  Accelerate (macOS) does not: one element differed by 7e-17. The tests now
+  allow floating-point rounding (1e-13 of the block), which still catches
+  any real error. No change to the package code.
+- **Correction to the 0.4.0 notes:** the batched assembly is identical to
+  the previous code up to floating-point rounding, not bit-for-bit on every
+  platform. Bit-for-bit with the same BLAS library was checked on macOS.
+
 ## 0.4.0 — 2026-09-29
 
 ### Breaking changes
@@ -40,7 +55,8 @@
 ### Performance
 
 - **A multi-frequency run is about 4× faster.** The ACC assembly now shares
-  kernel products between blocks (byte-identical output), and the PolSpice
+  kernel products between blocks (identical up to floating-point rounding;
+  see 0.4.1), and the PolSpice
   transform, D_ℓ scaling, debiasing and binning are folded into one
   projection per spectrum. On a three-frequency T/E run at ℓmax = 3500 the
   whole computation goes from about 10 to 2.5 minutes, with about 1 GB

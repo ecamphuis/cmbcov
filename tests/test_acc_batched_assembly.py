@@ -66,12 +66,22 @@ def _batched(strategy, keys, cl):
     return out
 
 
+def _assert_same_to_rounding(got, want, label=""):
+    """The batched and per-block paths do the same arithmetic on matrices of
+    different shapes, and a BLAS may round a product differently by shape:
+    identical bits on one machine (macOS Accelerate), one unit in the last
+    place apart on another (OpenBLAS on Linux CI, 6.9e-17). Any error in the
+    batching logic is of order the block itself, so a bound 1000x above the
+    rounding seen still catches it."""
+    scale = max(float(np.max(np.abs(want))), np.finfo(float).tiny)
+    diff = float(np.max(np.abs(got - want)))
+    assert diff <= 1e-13 * scale, f"{label}: max |diff| {diff:.3e} (scale {scale:.3e})"
+
+
 def _assert_bit_identical(strategy, keys, cl, batched):
     for key in keys:
         reference = _quiet(reference_block, strategy, key, cl)
-        assert np.array_equal(
-            batched[key], reference
-        ), f"{key}: max |diff| {np.max(np.abs(batched[key] - reference)):.3e}"
+        _assert_same_to_rounding(batched[key], reference, str(key))
 
 
 # --------------------------------------------------------------------------- #
@@ -161,7 +171,9 @@ def test_single_block_call_is_the_reference():
     strategy, cl = _fake_inputs(12)
     for key in CovKeys(["T", "E"], FAKE_FREQS).keys():
         got = _quiet(strategy.compute_covariance_term, key, cl)
-        assert np.array_equal(got, _quiet(reference_block, strategy, key, cl))
+        _assert_same_to_rounding(
+            got, _quiet(reference_block, strategy, key, cl), str(key)
+        )
 
 
 def test_spectra_changed_in_place_are_not_served_from_a_previous_call():
@@ -353,7 +365,7 @@ def test_covariance_matrix_is_bit_identical(
         _per_block_reference(patch)
         reference = _quiet(_cov(work, **config).compute_covariance_matrix, 5, keys, cl)
     for got, want in zip(batched, reference):
-        assert np.array_equal(got, want)
+        _assert_same_to_rounding(got, want)
 
 
 def test_successive_runs_do_not_share_products(b_work, monkeypatch):
@@ -372,7 +384,7 @@ def test_successive_runs_do_not_share_products(b_work, monkeypatch):
         _per_block_reference(patch)
         for cl, got in ((cl_a, runs[0]), (cl_b, runs[1])):
             want = _quiet(cov.compute_covariance_matrix, 5, keys, cl)[2]
-            assert np.array_equal(got, want)
+            _assert_same_to_rounding(got, want)
 
 
 def test_base_strategy_default_yields_every_key_in_order():

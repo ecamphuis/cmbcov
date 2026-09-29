@@ -17,6 +17,7 @@ from cmbcov.bmode_wick import required_kernel_pairs
 from cmbcov.keys import CovKeys
 from cmbcov.utils import (
     add_nested_dicts,
+    safe_divide,
 )
 
 from ..approximations.acc import coupling_ellprange, precompute_acc_kernels
@@ -624,6 +625,29 @@ class CovarianceMatrixGenerator:
     #: owner's existing convention (``<X>_<f1>x<f2>_window_functions.txt``).
     WINDOW_FUNCTIONS_DIRNAME = "windows"
 
+    def _window_debiasing(self, freq_key: str, stoke_key: str) -> np.ndarray | None:
+        r"""
+        The output-axis factor of the saved windows for one spectrum: the
+        debiasing of the *data* bandpower, ``1 / data_model`` exactly
+        (reported multipoles only; 1 where the data model vanishes, as in
+        ``debiasing_dict``).
+
+        It is :attr:`debiasing_dict` without ``post_process_correction`` and
+        without the ``add_tf_uncertainty`` factor
+        :math:`1 + \sqrt{(1 - F_\ell)/3999}`: both multiply the covariance
+        only, never the data, so they have no place in the data's mean
+        (owner's decision, 2026-09-29). The arithmetic is
+        :meth:`~cmbcov.spectra.SpectraLoader.prepare_workflow`'s own, so with
+        neither set it is bit for bit ``debiasing_dict[freq_key][stoke_key]``.
+        ``None`` when the run has no data model for this spectrum.
+        """
+        model = (self.data_model or {}).get(freq_key, {}).get(stoke_key)
+        if model is None:
+            return None
+        lmax = self.spectra.lmax
+        factor = safe_divide(1.0, np.asarray(model)[:lmax], default=1.0)
+        return np.nan_to_num(factor, nan=1.0, posinf=1.0, neginf=1.0)
+
     def _save_window_functions(self, base_dir: str, ls: np.ndarray) -> None:
         r"""
         Save the bandpower window functions beside the covariance, one
@@ -631,13 +655,18 @@ class CovarianceMatrixGenerator:
         reports (the owner's existing convention), into
         :attr:`WINDOW_FUNCTIONS_DIRNAME`.
 
-        Each file is the linear map from the fiducial theory spectrum to
-        that pair's expected binned output spectrum
-        (:func:`~cmbcov.windows.build_window_functions`),
-        including the per-pair beam, pixel window, transfer function and
-        calibration debiasing this run's own ``debiasing_dict`` applies to
-        the covariance
-        (:meth:`~cmbcov.postprocess.CovariancePostProcessor.apply_debiasing`).
+        Each file is the linear map from the fiducial (sky, unbeamed) theory
+        spectrum to the mean of that pair's binned, debiased *data*
+        bandpower (:func:`~cmbcov.windows.build_window_functions`). The
+        instrument enters on both axes, as it does in the covariance: the
+        pair's data model ``data_model`` (beams of both frequencies, pixel
+        window, transfer function; the factor ``cl_dict_biased`` carries) on
+        the input axis, and the data's debiasing ``1 / data_model``
+        (:meth:`_window_debiasing`) on the output axis. This is the
+        covariance's ``debiasing_dict``
+        (:meth:`~cmbcov.postprocess.CovariancePostProcessor.apply_debiasing`)
+        without ``post_process_correction`` and the ``add_tf_uncertainty``
+        inflation, which multiply the covariance only.
         The spectra and frequency pairs, and their order, come from
         :attr:`cov_keys`'s own ``spec_keys`` -- the same list the covariance
         itself is built from.
@@ -682,7 +711,7 @@ class CovarianceMatrixGenerator:
 
         lbins = self._setup_bins()
         lmin = self.config.lmin
-        debiasing_dict = self.debiasing_dict or {}
+        data_model = self.data_model or {}
 
         windows_dir = os.path.join(base_dir, self.WINDOW_FUNCTIONS_DIRNAME)
         os.makedirs(windows_dir, exist_ok=True)
@@ -691,8 +720,13 @@ class CovarianceMatrixGenerator:
             stoke_key = spec.stokekey()
             freq_key = spec.freqkey()
 
-            leg_factor = debiasing_dict.get(freq_key, {}).get(stoke_key)
+            leg_factor = self._window_debiasing(freq_key, stoke_key)
             row_scale = {stoke_key: leg_factor} if leg_factor is not None else None
+            # The covariance is computed for cl_dict_biased = data_model * C
+            # (SpectraLoader.prepare_workflow), so the mean bandpower responds
+            # to the sky spectrum C through data_model on the input axis.
+            model = data_model.get(freq_key, {}).get(stoke_key)
+            column_scale = {stoke_key: model} if model is not None else None
 
             windows = build_window_functions(
                 [stoke_key],
@@ -701,6 +735,7 @@ class CovarianceMatrixGenerator:
                 Dl=self.config.Dl,
                 polspice_postprocess=polspice_postprocess,
                 row_scale=row_scale,
+                column_scale=column_scale,
             )
             ell = windows["ell"]
             w = windows[f"W_{stoke_key}"]
@@ -713,10 +748,13 @@ class CovarianceMatrixGenerator:
             header = (
                 f"Band powers window functions for {stoke_key} {freq_key}.\n"
                 "<C_hat_b> = sum_l W[b, l] * C_l, with C_l the fiducial "
-                "theory spectrum (cmb_spectrum); includes the beam, pixel "
-                "window, transfer function and calibration debiasing this "
-                "run applies to the covariance "
-                "(SpectraLoader.data_model/debiasing_dict)."
+                "sky theory spectrum (cmb_spectrum, no beam) and <C_hat_b> "
+                "the mean of the debiased data bandpower; W = Bin "
+                "diag(Dl / data_model) K diag(data_model) (K the mean "
+                "kernel), the beam, pixel window and transfer function "
+                "entering on both axes as in the covariance "
+                "(SpectraLoader.data_model); no post_process_correction or "
+                "add_tf_uncertainty factor (covariance only)."
             )
             np.savetxt(os.path.join(windows_dir, filename), rows, header=header)
 

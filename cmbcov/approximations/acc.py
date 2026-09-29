@@ -1195,6 +1195,22 @@ ACC_NORMALISATION_RULE = "per-wick-term-v1"
 _PARITY_ODD_CL_KEYS = ("TB", "BT", "EB", "BE")
 
 
+def _contraction_multiset(contractions) -> list:
+    """
+    The Wick contractions ``((spectrum_1, spectrum_2), kernel_key, norm)`` of
+    a T/E block as a sorted list of identities, each taken up to the
+    identity ``C1 . Theta^{pq} . C2 = C2 . Theta^{qp} . C1`` (the definition
+    gives ``Theta^{qp} = (Theta^{pq})^T``): two blocks with the same list
+    have the same ACC value on every element.
+    """
+    out = []
+    for (spec_1, spec_2), kernel_key, norm in contractions:
+        forward = (id(spec_1), id(spec_2), tuple(kernel_key), id(norm))
+        reverse = (id(spec_2), id(spec_1), tuple(kernel_key[::-1]), id(norm))
+        out.append(min(forward, reverse))
+    return sorted(out)
+
+
 def _parity_odd_nonzero(cl: dict[str, dict[str, np.ndarray]]) -> bool:
     """Whether any ``TB``/``BT``/``EB``/``BE`` spectrum in ``cl`` has a
     non-zero entry (at any frequency pair)."""
@@ -1272,7 +1288,18 @@ class ACCStrategy(CovarianceStrategy):
         each translated as above and normalised by its own ``N_t``
         (:meth:`_compute_covariance_term_wick`,
         docs/theory/bmode_kernels.md). A T/E-only run
-        (level 1) takes the unchanged path below, bit-identical to before.
+        (level 1) takes the path below.
+
+        Each element is computed in the orientation its kernel is exact in:
+        the upper triangle (``ell1 <= ell2``) of a block ``Cov(a, b)`` from
+        the Wick contractions of ``cov_key``, the lower triangle from those
+        of ``cov_key.transpose()``, so the lower triangle is the transposed
+        upper triangle of ``Cov(b, a)`` and the result does not depend on
+        the order in which the run lists its spectra
+        (docs/theory/acc.md, Sect. 3). A block whose transposed key has the
+        same contractions (an auto block, or one between two TT or two EE
+        spectra) is symmetric and computed once, bit-identical to the
+        single-orientation assembly of cmbcov 0.2.0.
 
         Raises
         ------
@@ -1298,33 +1325,165 @@ class ACCStrategy(CovarianceStrategy):
         # Initialize flattened covariance
         flat_cov = self._empty_flatten_cov(dmax)
 
-        combination_1, combination_2 = cov_key.key_to_cross()
-        # Stokes order for the KERNEL lookup only (covariance_coupling is
-        # keyed by COUPLING_CHANNELS, via SpecKey.kernel_stokekey -- e.g.
-        # "DT" != "TD" off the diagonal); combination_1/2 above keep their
-        # sorted_copy() order for the cl (power spectrum) lookup, where "TE"
-        # and "ET" are the same spectrum. See CovKey.key_to_cross_kernel.
-        # This CovKey needs at most two kernel pairs (the two Wick
-        # contractions), so the loader is asked to load only those -- not
-        # the full sixteen-pair default.
-        kernel_1, kernel_2 = cov_key.key_to_cross_kernel()
-        needed_pairs = {
-            (kernel_1[0].kernel_stokekey(), kernel_1[1].kernel_stokekey()),
-            (kernel_2[0].kernel_stokekey(), kernel_2[1].kernel_stokekey()),
-        }
-
+        # Orientation. The exact covariance is not symmetric within a block
+        # between two different spectra, Cov(a_l, b_l') != Cov(a_l', b_l),
+        # and ACC is exact at l* only in the orientation its kernel was
+        # computed in: spectrum a on the l* leg, b on the l* + Delta leg.
+        # Every element is therefore computed in that orientation: the upper
+        # triangle (ell1 <= ell2) from the Wick contractions of cov_key, the
+        # lower one from those of the transposed key, since
+        # Cov(a_{l+D}, b_l) = Cov(b_l, a_{l+D}). An element then depends on
+        # its two spectra and on which of its multipoles is the smaller, never
+        # on the order in which the run lists its spectra. Using the upper
+        # value for both triangles, as before, made Cov(TE_l, EE_l') and
+        # Cov(EE_l, TE_l') of different frequency pairs disagree on which
+        # element is exact, so the CMB no longer cancelled in the frequency
+        # differences and a multi-frequency T/E matrix was not positive
+        # definite (docs/theory/acc.md, Sect. 3). An auto block is
+        # symmetric and has one orientation.
+        #
+        # Kernel lookup keys (covariance_coupling is keyed by
+        # COUPLING_CHANNELS, via SpecKey.kernel_stokekey -- e.g. "DT" != "TD"
+        # off the diagonal) keep the true Wick order of
+        # CovKey.key_to_cross_kernel; the cl lookup uses key_to_cross, whose
+        # sorted_copy() order is right for spectra ("TE" and "ET" are the
+        # same spectrum). The loader is asked for exactly the kernel pairs
+        # of these (at most four) contractions.
+        #
         # Batched form of the element loop over compute_acc_term (kept below
         # as the scalar reference). For each Wick contraction w:
         #   spectra  cl[combination_w[k].freqkey()][combination_w[k].stokekey()]
         #   kernel   coupling_kernels[kernel_w[0].kernel_stokekey(), kernel_w[1].kernel_stokekey()]
         #   prefactor norm_Xi[combination_w[0].stokekey(), combination_w[1].stokekey()]
+        # read at the element's own (row, column) multipoles.
         # compute_acc_term depends on (ell1, ell2) only through
         # min(ell1, ell2): both kernel indices are shifted by the same amount
-        # and the section is square. So on diagonal Delta the upper element
-        # (ell1, ell1 + Delta) and the lower one (ell1 + Delta, ell1) share one
-        # ACC value, and only the norm_Xi index order differs between them.
-        contractions = []
+        # and the section is square. So on diagonal Delta one band per
+        # contraction gives the whole upper (or lower) diagonal.
         names: dict[int, str] = {}
+        auto = cov_key.auto()
+        upper_contractions = self._te_contractions(cov_key, cl, names)
+        lower_contractions = (
+            upper_contractions
+            if auto
+            else self._te_contractions(cov_key.transpose(), cl, names)
+        )
+        # A block whose transposed key has the same contractions, up to the
+        # identity C1 . Theta^{pq} . C2 = C2 . Theta^{qp} . C1 (every block
+        # between two TT, or two EE, spectra; so every block of a T-only or
+        # E-only run), has one orientation: its lower triangle is its upper
+        # band at norm_Xi[ell2, ell1], bit-identical to before.
+        one_orientation = auto or _contraction_multiset(
+            upper_contractions
+        ) == _contraction_multiset(lower_contractions)
+        if one_orientation:
+            lower_contractions = upper_contractions
+        needed_pairs = {
+            kernel_key for _, kernel_key, _ in upper_contractions + lower_contractions
+        }
+
+        lmax = self.cov.lmax
+        padded: dict[tuple[int, int], np.ndarray] = {}
+
+        def band(bands, kernels, n_ell, spec_1, spec_2, kernel_key, reuse_reversed):
+            """The ACC band of one contraction on the current diagonal,
+            memoised in ``bands`` (same spectra arrays, same kernel)."""
+            memo = (id(spec_1), id(spec_2), kernel_key)
+            if memo in bands:
+                return bands[memo]
+            if reuse_reversed:
+                # C1 . Theta^{pq} . C2 = C2 . Theta^{qp} . C1: the definition
+                # gives Theta^{qp} = (Theta^{pq})^T, and the cache stores it
+                # so (s2xs1 is written as the transpose of s1xs2; a p x p
+                # kernel is a symmetric Gram matrix). A transposed
+                # contraction that is a direct one read backwards therefore
+                # reuses its band.
+                reverse = (id(spec_2), id(spec_1), kernel_key[::-1])
+                if reverse in bands:
+                    return bands[reverse]
+            matrix = kernels[kernel_key]
+            size = matrix.shape[0]
+            n_read = acc_internal_lmax(lmax, size, centralell)
+            for spectrum in (spec_1, spec_2):
+                if (id(spectrum), size) not in padded:
+                    _check_spectrum_length(
+                        spectrum, names[id(spectrum)], lmax, size, centralell
+                    )
+                    padded[id(spectrum), size] = _padded_spectrum(
+                        spectrum, centralell, n_read, size
+                    )
+            chunk = max(1, _ASSEMBLY_CHUNK_BYTES // (24 * size))
+            bands[memo] = _acc_band(
+                matrix,
+                padded[id(spec_1), size],
+                padded[id(spec_2), size],
+                n_ell,
+                chunk,
+            )
+            return bands[memo]
+
+        for diagonal_offset in range(dmax):
+            coupling_kernels = self.get_covariance_coupling(
+                centralell, centralell + diagonal_offset, pairs=needed_pairs
+            )
+            n_ell = lmax - diagonal_offset
+            if n_ell <= 0:
+                continue
+            ell1 = np.arange(n_ell)
+            ell2 = ell1 + diagonal_offset
+
+            # Normalise each distinct kernel once per diagonal, not per element.
+            kernels = {}
+            for _, kernel_key, _ in upper_contractions + lower_contractions:
+                if kernel_key not in kernels:
+                    kernels[kernel_key] = _unit_sum_kernel(coupling_kernels[kernel_key])
+
+            # One band of ACC values per distinct contraction (same spectra
+            # arrays, same kernel), evaluated once.
+            bands: dict[tuple, np.ndarray] = {}
+
+            upper = np.zeros(n_ell)
+            for (spec_1, spec_2), kernel_key, norm in upper_contractions:
+                upper += (
+                    band(bands, kernels, n_ell, spec_1, spec_2, kernel_key, False)
+                    * norm[ell1, ell2]
+                )
+            flat_cov[diagonal_offset + dmax - 1, :n_ell] = upper
+
+            if diagonal_offset != 0:
+                if auto:
+                    lower = upper
+                else:
+                    lower = np.zeros(n_ell)
+                    for (spec_1, spec_2), kernel_key, norm in lower_contractions:
+                        lower += (
+                            band(
+                                bands, kernels, n_ell, spec_1, spec_2, kernel_key, True
+                            )
+                            * norm[ell2, ell1]
+                        )
+                flat_cov[-diagonal_offset + dmax - 1, :n_ell] = lower
+
+        # Unflatten and return full matrix (consistent with other strategies)
+        return self._unflatten_cov(flat_cov)
+
+    def _te_contractions(
+        self,
+        cov_key: CovKey,
+        cl: dict[str, dict[str, np.ndarray]],
+        names: dict[int, str],
+    ) -> list[tuple[tuple[np.ndarray, np.ndarray], tuple[str, str], np.ndarray]]:
+        """
+        The two Wick contractions of a T/E ``cov_key``, in its own
+        orientation: ``((spectrum_1, spectrum_2), kernel_key, norm_Xi)``
+        each, with the spectra looked up through
+        :meth:`~cmbcov.keys.CovKey.key_to_cross` and the kernel pair through
+        :meth:`~cmbcov.keys.CovKey.key_to_cross_kernel`. ``names`` collects a
+        label per spectrum array for the length check's message.
+        """
+        combination_1, combination_2 = cov_key.key_to_cross()
+        kernel_1, kernel_2 = cov_key.key_to_cross_kernel()
+        contractions = []
         for combination, kernel in (
             (combination_1, kernel_1),
             (combination_2, kernel_2),
@@ -1345,65 +1504,7 @@ class ACCStrategy(CovarianceStrategy):
                     self.cov.norm_Xi[spectra_key],
                 )
             )
-
-        lmax = self.cov.lmax
-        auto = cov_key.auto()
-        padded: dict[tuple[int, int], np.ndarray] = {}
-
-        for diagonal_offset in range(dmax):
-            coupling_kernels = self.get_covariance_coupling(
-                centralell, centralell + diagonal_offset, pairs=needed_pairs
-            )
-            n_ell = lmax - diagonal_offset
-            if n_ell <= 0:
-                continue
-            ell1 = np.arange(n_ell)
-            ell2 = ell1 + diagonal_offset
-
-            # Normalise each distinct kernel once per diagonal, not per element.
-            kernels = {}
-            for _, kernel_key, _ in contractions:
-                if kernel_key not in kernels:
-                    kernels[kernel_key] = _unit_sum_kernel(coupling_kernels[kernel_key])
-
-            # One band of ACC values per contraction; identical contractions
-            # (same spectra arrays, same kernel) are evaluated once.
-            bands = {}
-            upper = np.zeros(n_ell)
-            lower = np.zeros(n_ell)
-            for (spec_1, spec_2), kernel_key, norm in contractions:
-                matrix = kernels[kernel_key]
-                size = matrix.shape[0]
-                memo = (id(spec_1), id(spec_2), kernel_key)
-                if memo not in bands:
-                    n_read = acc_internal_lmax(lmax, size, centralell)
-                    for spectrum in (spec_1, spec_2):
-                        if (id(spectrum), size) not in padded:
-                            _check_spectrum_length(
-                                spectrum, names[id(spectrum)], lmax, size, centralell
-                            )
-                            padded[id(spectrum), size] = _padded_spectrum(
-                                spectrum, centralell, n_read, size
-                            )
-                    chunk = max(1, _ASSEMBLY_CHUNK_BYTES // (24 * size))
-                    bands[memo] = _acc_band(
-                        matrix,
-                        padded[id(spec_1), size],
-                        padded[id(spec_2), size],
-                        n_ell,
-                        chunk,
-                    )
-                band = bands[memo]
-                upper += band * norm[ell1, ell2]
-                if diagonal_offset != 0 and not auto:
-                    lower += band * norm[ell2, ell1]
-
-            flat_cov[diagonal_offset + dmax - 1, :n_ell] = upper
-            if diagonal_offset != 0:
-                flat_cov[-diagonal_offset + dmax - 1, :n_ell] = upper if auto else lower
-
-        # Unflatten and return full matrix (consistent with other strategies)
-        return self._unflatten_cov(flat_cov)
+        return contractions
 
     def raw_block_inputs(
         self, cov_key: CovKey, cl: dict[str, dict[str, np.ndarray]]
@@ -1414,9 +1515,10 @@ class ACCStrategy(CovarianceStrategy):
         them (``[:lmax_int]``), plus ``lmax_int``, ``dmax``, ``centralell`` and the identity
         of the kernel cache -- the resolved ``acc_kernel_dir`` and a digest
         of, for every diagonal, the pair's manifest and the size and
-        modification time of the two kernel files this key loads. A
-        recomputed or replaced kernel set therefore invalidates the block,
-        including a legacy cache without manifests.
+        modification time of the kernel files this key loads (those of both
+        orientations for a non-auto block). A recomputed or replaced kernel
+        set therefore invalidates the block, including a legacy cache
+        without manifests.
 
         In a run with a B observable (:meth:`_wick_mode`) the spectra are
         every true spectrum the block's expanded Wick terms read, the pairs
@@ -1457,13 +1559,14 @@ class ACCStrategy(CovarianceStrategy):
             )
             return spectra, identity
 
-        kernel_1, kernel_2 = cov_key.key_to_cross_kernel()
-        pairs = sorted(
-            {
-                (kernel_1[0].kernel_stokekey(), kernel_1[1].kernel_stokekey()),
-                (kernel_2[0].kernel_stokekey(), kernel_2[1].kernel_stokekey()),
-            }
-        )
+        # The kernel pairs of both orientations: the lower triangle of a
+        # non-auto block is computed from the transposed key's contractions
+        # (compute_covariance_term). Its spectra are the same four.
+        pairs = set()
+        for key in (cov_key,) if cov_key.auto() else (cov_key, cov_key.transpose()):
+            for kernel in key.key_to_cross_kernel():
+                pairs.add((kernel[0].kernel_stokekey(), kernel[1].kernel_stokekey()))
+        pairs = sorted(pairs)
         size = acc_cached_kernel_size(
             kernel_dir, config.centralell, config.dmax, pairs=pairs
         )

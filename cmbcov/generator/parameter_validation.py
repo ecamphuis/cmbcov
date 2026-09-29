@@ -798,6 +798,41 @@ class ParameterValidator:
                     "Relative mask_name provided but no mask_path specified"
                 )
 
+        # dmax vs the binning: a bandpower variance sums multipole-pair
+        # separations 0..w-1 (w = widest bin width), and the covariance of
+        # two adjacent bandpowers sums separations 1..2w-1. ACC computes
+        # only |l - l'| < dmax and zeroes the rest, so a too-small dmax
+        # silently drops pairs instead of raising -- warn instead of erroring,
+        # since a smaller dmax is a legitimate precompute-cost trade-off.
+        approximation = params.get("covariance_approximation")
+        dmax = params.get("dmax")
+        bins = params.get("bins")
+        if (
+            str(approximation).lower() == CovarianceMethod.ACC.value
+            and dmax is not None
+            and isinstance(bins, list)
+            and bins
+            and all(isinstance(b, list) and len(b) == 3 for b in bins)
+        ):
+            w = max(b[2] for b in bins)
+            if dmax < w:
+                self.warnings.append(
+                    f"dmax ({dmax}) is below the widest bin width ({w}): "
+                    f"multipole pairs separated by {dmax}..{w - 1} within a "
+                    "bin are dropped, so every bandpower variance is "
+                    f"underestimated. Use dmax >= {w} for the error bars, "
+                    f"dmax >= {2 * w} for adjacent-bandpower correlations."
+                )
+            elif dmax < 2 * w:
+                self.warnings.append(
+                    f"dmax ({dmax}) is at least the widest bin width ({w}), "
+                    "so bandpower variances are complete, but the "
+                    "correlation between adjacent bandpowers is "
+                    f"underestimated: pairs separated by {dmax}..{2 * w - 1} "
+                    f"across neighbouring bins are dropped. Use dmax >= "
+                    f"{2 * w} to capture them."
+                )
+
     def _check_observables(self, params: dict[str, Any]) -> None:
         """
         Validate ``stokes``/``observables`` and ``parity_mixed_blocks``:

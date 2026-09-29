@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.3.0 — 2026-09-29
+
+### Fixed
+
+- **Band-power window functions** (`--save-windows`) were wrong whenever a
+  beam, pixel window or transfer function was set, which includes every run
+  using the default `pixwin`. They left the beam and pixel window off the
+  input side, so applied to a theory spectrum they were off by the binned
+  inverse of those factors: about 1.3% at ℓ = 3000 from the default pixel
+  window alone, and up to a factor of 2 near ℓ = 3500 with a 90 GHz beam.
+  They also no longer include `post_process_correction` or the
+  transfer-function uncertainty inflation, which apply to the covariance
+  only. **Regenerate any saved windows.** Covariance matrices were never
+  affected.
+- **Multi-frequency T/E ACC covariances could fail to be positive-definite.**
+  In blocks between two different spectra (e.g. TE × EE), the lower triangle
+  took an orientation that depended on the order in which the run listed
+  its spectra. The CMB then no longer cancelled exactly in differences
+  between frequency pairs, and a few near-null directions went negative.
+  Each element is now computed in its own orientation, so the result no
+  longer depends on spectrum order. Variances are unchanged and correlations
+  move by at most ~1e-4; T-only and E-only runs are bit-identical. The T/E
+  assembly does 37–61% more kernel products. Runs with a B observable are
+  not yet covered.
+
+### Changed
+
+- **`term_selection`**: the default pair threshold is now `tolerance / 40`
+  (was `tolerance / 4`), about 5× more accurate kernels for 1.5–1.8× the
+  pairs kept. The feature is opt-in; the default `term_selection=None` is
+  unchanged.
+
+### Added
+
+- **Validator warning for `dmax` against the binning.** ACC drops multipole
+  pairs further apart than `dmax`. Correct bandpower error bars need
+  `dmax` ≥ the widest bin width w; correct correlations between adjacent
+  bandpowers need `dmax` ≥ 2w. The validator warns below either.
+
+### Documented
+
+- How to choose `dmax` for binned output (`docs/theory/acc.md` §4), with the
+  measured effect on a 4% footprint.
+- Where `term_selection`'s tolerance holds (kernels near the diagonal) and
+  what it costs on the assembled covariance: a small low bias on TT
+  variances at the default (`docs/theory/term_selection.md` §6).
+
+### Development
+
+- pytest collects only `tests/`.
+  `tests/reference/criterion_validate.py` reproduces the term-selection
+  numbers (`--mask` for your own footprint).
+
 ## 0.2.0 — 2026-09-23
 
 ### Breaking changes

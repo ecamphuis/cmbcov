@@ -99,11 +99,15 @@ Frobenius norm,
 It sets the three thresholds
 
 ```math
-\epsilon_m = \mathrm{tol}/10, \qquad \epsilon_{\mathrm{pair}} = \mathrm{tol}/4, \qquad \delta_{\mathrm{band}} = \mathrm{tol}/10,
+\epsilon_m = \mathrm{tol}/10, \qquad \epsilon_{\mathrm{pair}} = \mathrm{tol}/40, \qquad \delta_{\mathrm{band}} = \mathrm{tol}/10,
 ```
 
-which were calibrated on a survey footprint (Sect. 5). It is a target, not
-a guarantee (Sect. 6). The tolerance and the fractions of $m$, pairs and
+calibrated on a survey footprint (Sect. 5). It is a target, not a
+guarantee, and it is met only for $\ell'$ close to $\ell$: Sect. 6 has the
+measured errors and the separation at which they leave the tolerance. It is
+also not the error of the covariance: dropping terms always lowers the
+covariance, and at the default thresholds the binned TT variance comes out
+about $0.6\%$ low (Sect. 6, "What it costs on the covariance"). The tolerance and the fractions of $m$, pairs and
 $M$ kept are recorded in the cache manifest, and a run must ask for the same
 value through `CovarianceConfig.acc_term_selection`; a cache built with a
 different value, or with `None` against a tolerance, is refused. Term
@@ -148,25 +152,103 @@ has not been timed. The speed-up applies to the
 one-off precompute; the recompute of a covariance from cached kernels is
 unchanged.
 
-## 6. Known limitation: asymmetric masks
+## 6. The pair rule, and how far it is validated
 
-The default thresholds were calibrated on a single compact footprint. On a
-mask with no dominant centre, the pair rule under-selects. Measured on a
-two-blob mask, a large cap plus a smaller cap 50° away, at tolerance
-$10^{-3}$: the selected kernel is off by $1.4\times10^{-3}$ at
-$\ell' = \ell$ and $3.0\times10^{-3}$ at $\ell' = \ell + 3$, above the
-tolerance. The $m$ rule alone leaves $3\times10^{-7}$ and the band rule
-alone about $10^{-5}$, so the pair rule is responsible. A ten times
-tighter $\epsilon_{\mathrm{pair}}$ leaves $2.4\times10^{-4}$ and
-$5.3\times10^{-4}$, within the $10^{-3}$ asked for.
+The three rules are not equally forgiving. The $m$ and band rules are
+comfortably inside the tolerance everywhere measured; the pair rule carries
+essentially the whole error, and it is the only one whose accuracy depends
+on how far apart $\ell$ and $\ell'$ are.
 
-For a mask made of several separated patches, or any mask far from a single
-cap:
+Measured on the survey footprint at $n_{\mathrm{side}} = 64$,
+$\ell = 64$, tolerance $10^{-3}$, decomposing the rules:
 
-- ask for a tolerance ten times tighter than the accuracy you need, which
-  tightens all three thresholds by ten, and
-- check two kernel pairs: compute $(\ell_\ast, \ell_\ast)$ and
-  $(\ell_\ast, \ell_\ast + \mathrm{dmax} - 1)$ once with
-  `term_selection=None` and once with your tolerance, using
-  `precompute_acc_kernels(..., ellprange=[...], dryrun=True)`, which returns
-  the kernels without writing them, and compare them in the Frobenius norm.
+| $\ell' - \ell$ | all three | band only | pair only | $m$ only |
+| --- | --- | --- | --- | --- |
+| 0 | $1.3\times10^{-4}$ | $1.1\times10^{-5}$ | $1.3\times10^{-4}$ | $1.7\times10^{-7}$ |
+| 19 | $6.6\times10^{-3}$ | $9.7\times10^{-5}$ | $6.7\times10^{-3}$ | $4.5\times10^{-6}$ |
+
+The pair criterion $p_m\, p_{m'} A(m - m')\ge\epsilon_{\mathrm{pair}}\max$
+carries no dependence on $\ell' - \ell$, while the kernel itself shrinks as
+the two multipoles separate, so the discarded terms become a larger fraction
+of a smaller kernel.
+
+### What the tolerance actually buys
+
+At $\mathrm{tol} = 10^{-3}$, relative Frobenius error of the selected
+kernel, at the current $\epsilon_{\mathrm{pair}} = \mathrm{tol}/40$ and at
+the $\mathrm{tol}/4$ it replaced:
+
+| mask | $n_{\mathrm{side}}$ | $\ell' - \ell$ | $\mathrm{tol}/4$ | $\mathrm{tol}/40$ |
+| --- | --- | --- | --- | --- |
+| survey | 32 | 0 | $9.6\times10^{-4}$ | $1.1\times10^{-4}$ |
+| survey | 32 | 3 | $1.2\times10^{-3}$ ✗ | $1.4\times10^{-4}$ |
+| survey | 64 | 0 | $7.3\times10^{-4}$ | $1.3\times10^{-4}$ |
+| survey | 64 | 5 | $1.5\times10^{-3}$ ✗ | $2.5\times10^{-4}$ |
+| survey | 64 | 10 | $7.3\times10^{-3}$ ✗ | $1.1\times10^{-3}$ ✗ |
+| survey | 64 | 19 | $3.4\times10^{-2}$ ✗ | $6.6\times10^{-3}$ ✗ |
+| survey | 128 | 0 | $4.3\times10^{-4}$ | $7.7\times10^{-5}$ |
+| survey | 128 | 3 | $6.0\times10^{-4}$ | $9.3\times10^{-5}$ |
+| two blobs | 64 | 0 | $9.6\times10^{-4}$ | $1.4\times10^{-4}$ |
+| two blobs | 64 | 19 | $3.6\times10^{-2}$ ✗ | $2.7\times10^{-2}$ ✗ |
+| two blobs | 128 | 0 | $1.0\times10^{-3}$ ✗ | $1.3\times10^{-4}$ |
+| two blobs | 128 | 3 | $3.1\times10^{-3}$ ✗ | $2.4\times10^{-4}$ |
+
+✗ marks a result outside the requested tolerance. Two things follow.
+
+**The tolerance holds only for small $\ell' - \ell$.** Up to a separation of
+about 5 it is met at $\mathrm{tol}/40$; by a separation of 10 it is missed,
+and by 19 — which a `dmax = 20` cache uses — it is missed by a factor of
+about 7 on the survey footprint and 27 on the two-blob mask. **If you
+precompute with `term_selection` over a wide `dmax`, the far kernels are
+much less accurate than the tolerance you asked for** — relative to
+themselves. They are also small, and on the assembled covariance this does
+not show (next subsection).
+
+**Cost.** The tighter threshold keeps 1.5 to 1.8 times more pairs: on the
+survey footprint 14.8% → 23.1% at $n_{\mathrm{side}} = 64$ and 9.1% → 16.4%
+at 128. The $m$ and band selections are untouched by it.
+
+### What it costs on the covariance
+
+The kernel error above is not what a run sees. Measured end to end — full
+and selected kernel caches on the survey footprint at $n_{\mathrm{side}} = 64$,
+$\ell_\ast = 64$, `dmax = 20`, assembled into the ACC covariance with Planck
+spectra and $10\thinspace\mu\mathrm{K}$-arcmin noise over $10 \le \ell < 128$,
+tolerance $10^{-3}$:
+
+| $\epsilon_{\mathrm{pair}}$ | pairs kept | TT error per element, relative to $\sqrt{C_{\ell\ell}C_{\ell'\ell'}}$ | TT variance of $\Delta\ell = 20$ bandpowers |
+| --- | --- | --- | --- |
+| $\mathrm{tol}/40$ (default) | 22% | $2$ to $4\times10^{-3}$ | $-0.6\%$ |
+| $\mathrm{tol}/10$ | 17% | $5$ to $7\times10^{-3}$ | $-1.3\%$ |
+| $\mathrm{tol}/4$ | 13% | $6$ to $10\times10^{-3}$ | $-2.0\%$ |
+| $\mathrm{tol}$ | 9% | $0.9$ to $1.6\times10^{-2}$ | $-3.0\%$ |
+
+In short: **the fewer pairs kept, the lower the covariance.** Three things
+to know:
+
+- **It is a bias, not scatter.** Every dropped term is a positive
+  semi-definite contribution, so the TT covariance is underestimated at every
+  $\ell$. EE and TE errors are of the same size with mixed sign (EE binned
+  variance $-0.3\%$ at the default).
+- **Relative to the diagonal, it does not grow with $\ell' - \ell$.** The
+  far kernels are less accurate relative to themselves (above) but they are
+  small, so the far-diagonal elements are no worse than the near ones.
+- **It is larger than the kernel's Frobenius error**, because the dropped
+  pairs sit in the kernel's wings, $L$ far from $\ell_\ast$, where the
+  Frobenius norm hardly looks but a red spectrum, translated to
+  $\ell < \ell_\ast$, weights heavily. The TT diagonal error peaks near
+  $\ell_\ast/2$ ($-2.3\times10^{-3}$ at $\ell = 30$, against
+  $-3.9\times10^{-4}$ at $\ell_\ast$). The $m$ and band rules contribute
+  nothing noticeable; it is the pair rule.
+
+For scale, the ACC translation error itself is of the same order
+($-5.6\times10^{-3}$ at $\ell = 500$ on the survey footprint). The default
+was kept for that reason. The production configuration ($\ell_\ast = 250$,
+$n_{\mathrm{side}} = 256$) has not been measured this way.
+
+### Checking your own mask
+
+What matters is the covariance, so compare covariances: precompute a small
+cache (low $n_{\mathrm{side}}$ and $\ell_\ast$, a few seconds to a minute)
+once with `term_selection=None` and once with your tolerance, assemble the
+covariance from each with your spectra, and compare the binned variances.

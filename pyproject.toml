@@ -167,6 +167,9 @@ exclude = [
 ]
 
 [tool.pytest.ini_options]
+# Collect only the suite: a checkout also holds untracked working trees
+# (survey runs, research scripts) whose *_test.py files are not tests.
+testpaths = ["tests"]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
 ]

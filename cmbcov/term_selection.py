@@ -33,16 +33,39 @@ symmetry axis) sits at ``+z``, the mask's azimuthal spectrum
    \ge 1 - \delta_{band}`
    (:func:`~cmbcov.grid.banded_integrals_gl`).
 
-The defaults ``eps_m = tol/10``, ``eps_pair = tol/4``, ``delta_band =
-tol/10`` were validated on the survey mask (nside 64 and 128, ``ell`` 64 and
-128): the kernel built from the selected terms is within a Frobenius error
-``tol`` of the full one, with 3-25% of the pairs and 5-15% of the ``M``
-orders (``criterion_validate.py``).  The selection is only worth it in the
+The defaults are ``eps_m = tol/10``, ``eps_pair = tol/40``, ``delta_band =
+tol/10``.
+
+The pair rule is the binding one, and **the tolerance is only met for
+``ellp`` close to ``ell``**.  Measured on the survey footprint at nside 64,
+``ell = 64``, ``tol = 1e-3``, the relative Frobenius error of the selected
+kernel is 1.3e-4 at ``ellp - ell = 0``, 2.5e-4 at 5, 1.1e-3 at 10 and 6.6e-3
+at 19 -- so a cache precomputed over a wide ``dmax`` has far kernels well
+outside the tolerance asked for.  The other two rules are not involved: at
+separation 19 the band rule alone leaves 9.7e-5 and the ``m`` rule alone
+4.5e-6, against 6.7e-3 for the pair rule.  The criterion
+``p_m p_mp A(m - mp) >= eps_pair max`` carries no dependence on
+``ellp - ell`` while the kernel shrinks with separation, which is the
+missing ingredient.
+
+``eps_pair`` was ``tol/4`` until it was retuned; that was worse by about 5x
+at every separation, and missed the tolerance even at ``ellp = ell`` on a
+mask with no dominant centre (1.0e-3 at nside 128).  The tighter value costs
+1.5-1.8x more pairs (survey footprint 14.8% to 23.1% at nside 64, 9.1% to
+16.4% at nside 128).  See ``docs/theory/term_selection.md`` Sect. 6 for the
+full table, and ``tests/reference/criterion_validate.py`` to reproduce it.
+
+On the assembled covariance the dropped terms show up as a bias, not
+scatter: the TT covariance is underestimated, by about 0.6% on the variance
+of Delta ell = 20 bandpowers at the defaults (1.3% at ``tol/10``, 2.0% at
+``tol/4``; survey footprint, nside 64, same Sect. 6).
+
+The selection is only worth it in the
 pole frame -- in an arbitrary frame :math:`P(m_3)` is broad and all three
 rules keep almost everything -- so :func:`select_terms` expects a mask alm
 that has already been rotated with :func:`pole_rotation` /
 :func:`rotate_alm`; ``K`` itself does not depend on the frame (verified to
-6e-15 in ``sparsity.py``).
+6e-15 in the exploratory notes, which are not in this repository).
 """
 
 from __future__ import annotations
@@ -337,7 +360,7 @@ def select_terms(
         Mask band-limit and the two multipoles of the kernel.
     tolerance : float
         Target relative Frobenius error of the kernel; sets the defaults
-        ``eps_m = tolerance / 10``, ``eps_pair = tolerance / 4``,
+        ``eps_m = tolerance / 10``, ``eps_pair = tolerance / 40``,
         ``delta_band = tolerance / 10``.
     eps_m, eps_pair, delta_band : float, optional
         Override the individual thresholds.
@@ -353,7 +376,7 @@ def select_terms(
     if tolerance <= 0:
         raise ValueError("tolerance must be positive")
     eps_m = tolerance / 10 if eps_m is None else eps_m
-    eps_pair = tolerance / 4 if eps_pair is None else eps_pair
+    eps_pair = tolerance / 40 if eps_pair is None else eps_pair
     delta_band = tolerance / 10 if delta_band is None else delta_band
 
     P = azimuthal_spectrum(mask_alm, lw)  # index m3 + lw

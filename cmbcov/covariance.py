@@ -27,7 +27,9 @@ __all__ = ["Cov", "CovarianceConfig", "CovarianceMethod", "RAW_BLOCK_CACHE_VERSI
 #: Bump whenever a change alters the values of a raw (pseudo-C_l, unbinned)
 #: covariance block for the same recorded inputs, so that blocks cached with
 #: ``save_raw_blocks`` by older code are recomputed rather than reused.
-RAW_BLOCK_CACHE_VERSION = 1
+#: 2: the lower triangle of a non-auto T/E-only ACC block is computed in its
+#: own orientation (``ACCStrategy.compute_covariance_term``).
+RAW_BLOCK_CACHE_VERSION = 2
 
 
 #: ``centralell`` values already warned about in this process, see

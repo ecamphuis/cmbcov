@@ -3,15 +3,22 @@ The batched ACC assembly in ``ACCStrategy.compute_covariance_term`` against
 the scalar element loop over ``ACCStrategy.compute_acc_term``.
 
 The reference below is the element loop ``compute_covariance_term`` ran before
-it was batched, verbatim apart from formatting: one ``compute_acc_term`` call
-per element and Wick contraction, the ``norm_Xi[ell1, ell2]`` /
-``norm_Xi[ell2, ell1]`` prefactors, and the auto/non-auto lower band.
+it was batched, apart from formatting and the orientation of the lower
+triangle: one ``compute_acc_term`` call per element and Wick contraction, the
+``norm_Xi[ell1, ell2]`` / ``norm_Xi[ell2, ell1]`` prefactors (the element's
+own row and column), and the auto/non-auto lower band. The lower triangle
+``(ell1 + Delta, ell1)`` of a non-auto block comes from the Wick contractions
+of the transposed key, the orientation that is exact at ``l*``
+(docs/theory/acc.md, Sect. 3); an auto block's is its upper band.
 
 Everything is chosen so that an index-order bug cannot hide:
 
 - kernels are random and non-symmetric, distinct per offset and per ordered
   Stokes pair (so ``TExET`` != ``ETxTE`` != ``TExTE``), and not unit-sum (so
-  the Eq. 23 normalisation runs), except one that is;
+  the Eq. 23 normalisation runs), except one that is. They obey the one
+  identity of the definition that the assembly relies on,
+  ``Theta^{qp} = (Theta^{pq})^T`` (so ``Theta^{pp}`` is symmetric), which the
+  real cache stores exactly;
 - ``norm_Xi`` is random and non-symmetric (the real one is symmetric, which
   would hide an ``[ell1, ell2]`` / ``[ell2, ell1]`` swap);
 - the ``ET`` spectrum is a different array from ``TE`` and the two frequency
@@ -63,6 +70,12 @@ KEYS = [
     CovKey(("T", "E", "E", "T"), (F0, F1, F1, F0)),
     # non-auto, TT x EE spectra; both contractions use the TExTE kernel
     CovKey(("T", "T", "E", "E"), (F0, F1, F0, F1)),
+    # non-auto, same letters: the transposed key has the same contractions
+    # up to C1 . K^{pq} . C2 = C2 . K^{qp} . C1 (one orientation)
+    CovKey(("T", "T", "T", "T"), (F0, F0, F0, F1)),
+    # non-auto, same letters TE: one transposed contraction is new (TDxDT
+    # with its spectra swapped), the other is a reversed direct one
+    CovKey(("T", "E", "T", "E"), (F0, F1, F1, F1)),
 ]
 
 # (lmax, centralell, size, dmax)
@@ -103,6 +116,13 @@ def _make_inputs(seed, lmax, centralell, size, dmax, signed=False):
             # break any accidental near-symmetry
             kernel += np.triu(rng.random((size, size)), 1)
             table[s1, s2] = kernel
+        # Theta^{qp} = (Theta^{pq})^T, by definition (the precompute writes
+        # s2xs1 as the transpose of s1xs2, and Theta^{pp} is a Gram matrix)
+        for s1, s2 in itertools.combinations_with_replacement(COUPLING_SPECTRA, 2):
+            if s1 == s2:
+                table[s1, s1] = 0.5 * (table[s1, s1] + table[s1, s1].T)
+            else:
+                table[s2, s1] = table[s1, s2].T
         kernels[offset] = table
     # one kernel that is already unit-sum, so the normalisation is skipped
     kernels[0]["TT", "TT"] = kernels[0]["TT", "TT"] / kernels[0]["TT", "TT"].sum()
@@ -132,9 +152,12 @@ def _scalar_reference(strategy, cov_key, cl):
     flat_cov = strategy._empty_flatten_cov(dmax)
     combination_1, combination_2 = cov_key.key_to_cross()
     kernel_1, kernel_2 = cov_key.key_to_cross_kernel()
+    # the lower triangle's contractions: those of the transposed key
+    t_combination_1, t_combination_2 = cov_key.transpose().key_to_cross()
+    t_kernel_1, t_kernel_2 = cov_key.transpose().key_to_cross_kernel()
     needed_pairs = {
-        (kernel_1[0].kernel_stokekey(), kernel_1[1].kernel_stokekey()),
-        (kernel_2[0].kernel_stokekey(), kernel_2[1].kernel_stokekey()),
+        (kernel[0].kernel_stokekey(), kernel[1].kernel_stokekey())
+        for kernel in (kernel_1, kernel_2, t_kernel_1, t_kernel_2)
     }
 
     def term(combination, kernel, coupling, e1, e2):
@@ -170,8 +193,8 @@ def _scalar_reference(strategy, cov_key, cl):
                     ]
                 else:
                     flat_cov[-diagonal_offset + dmax - 1, ell1] = term(
-                        combination_1, kernel_1, coupling, ell2, ell1
-                    ) + term(combination_2, kernel_2, coupling, ell2, ell1)
+                        t_combination_1, t_kernel_1, coupling, ell2, ell1
+                    ) + term(t_combination_2, t_kernel_2, coupling, ell2, ell1)
     return strategy._unflatten_cov(flat_cov)
 
 
@@ -245,6 +268,8 @@ def test_batched_matches_scalar_loop_sign_indefinite_kernels(key_index):
     # would renormalise |K| to unit sum).
     scale = np.zeros((lmax, lmax))
     wick = list(zip(cov_key.key_to_cross(), cov_key.key_to_cross_kernel()))
+    lower_key = cov_key if cov_key.auto() else cov_key.transpose()
+    wick_lower = list(zip(lower_key.key_to_cross(), lower_key.key_to_cross_kernel()))
     for d in range(dmax):
         for ell1 in range(lmax - d):
             ell2 = ell1 + d
@@ -253,9 +278,9 @@ def test_batched_matches_scalar_loop_sign_indefinite_kernels(key_index):
                 multipoles < acc_internal_lmax(lmax, size, centralell)
             )
             kept = multipoles[keep]
-            for e1, e2 in ((ell1, ell2), (ell2, ell1)):
+            for e1, e2, contractions in ((ell1, ell2, wick), (ell2, ell1, wick_lower)):
                 total = 0.0
-                for combination, kernel_pair in wick:
+                for combination, kernel_pair in contractions:
                     spectra_key = (combination[0].stokekey(), combination[1].stokekey())
                     k = kernels[d][
                         kernel_pair[0].kernel_stokekey(),

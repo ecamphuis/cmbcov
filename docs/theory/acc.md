@@ -161,15 +161,65 @@ to
 so that no reported element loses kernel weight (`acc_window_pad`,
 `acc_internal_lmax`); the covariance is still returned up to $\ell_{\max}$.
 
-Because an ACC element depends on $(\ell, \ell')$ only through
-$\min(\ell, \ell')$ and $\Delta$, every assembled block is symmetric under
-$\ell \leftrightarrow \ell'$. That is right for the blocks of one spectrum
-with itself (TT×TT, EE×EE, TE×TE). A block between two different spectra,
-such as TT×EE, is not symmetric in the exact covariance, and ACC returns one
-value for both elements. The best a symmetric approximation can do is their
-mean, so ACC carries half the exact asymmetry as an error; it grows with
-$\vert\ell - \ell'\vert$ and was smaller than the other error terms on the
-masks tested.
+An ACC element depends on $(\ell, \ell')$ only through
+$\min(\ell, \ell')$, $\Delta$ and the orientation of its kernel. A block of
+one spectrum with itself (TT×TT, EE×EE, TE×TE) is symmetric under
+$\ell \leftrightarrow \ell'$, exactly and in ACC. A block between two
+different spectra, such as TT×EE, is not:
+$\mathrm{Cov}(\tilde C_{\ell}^{a}, \tilde C_{\ell'}^{b}) \ne \mathrm{Cov}(\tilde C_{\ell'}^{a}, \tilde C_{\ell}^{b})$,
+and the kernel of the block $(a, b)$ at $(\ell_\ast, \ell_\ast+\Delta)$ is
+the right one only with $a$ on the lower multipole. A T/E-only run therefore
+computes the upper triangle ($\ell \le \ell'$) of the block $(a, b)$ from
+the Wick contractions of $(a, b)$, and the lower triangle from those of
+$(b, a)$, since
+$\mathrm{Cov}(\tilde C_{\ell+\Delta}^{a}, \tilde C_{\ell}^{b}) = \mathrm{Cov}(\tilde C_{\ell}^{b}, \tilde C_{\ell+\Delta}^{a})$:
+the lower triangle of $(a, b)$ is the transposed upper triangle of $(b, a)$.
+An element then depends on its two spectra and on which of its multipoles is
+the smaller, never on the order in which the run lists its spectra. Blocks
+between two TT spectra or two EE spectra have the same contractions in both
+orientations and are unchanged, so T-only and E-only runs are too, bit for
+bit. The other blocks cost up to twice the kernel products; over a whole
+T/E run the assembly does 37%, 54% and 61% more of them with 1, 2 and 3
+frequencies.
+
+Up to cmbcov 0.2.0 both triangles took the upper value, and which element of
+a block had the right kernel depended on the order of the spectra: in a
+two-frequency run, Cov(TE 90×90, EE 90×150) put TE on the lower multipole
+and Cov(EE 90×90, TE 90×150) put EE there. In a multi-frequency T/E run the
+CMB then no longer cancelled in the differences between frequency pairs,
+whose true variance is set by noise and foregrounds alone, and the matrix was
+not positive definite. On a 4% apodised survey footprint at $\ell_{\max} = 3500$
+($\ell_\ast = 250$, $\mathrm{dmax} = 100$, bins of 50 from $\ell = 200$) the
+binned correlation matrix had 20 negative eigenvalues down to
+$-1.3\times10^{-4}$ with 2 frequencies, and 47 down to $-1.8\times10^{-4}$
+with 3; with both orientations it has none, its lowest eigenvalues being
+$+7.6\times10^{-9}$ and $+1.5\times10^{-10}$. With the same spectra at every
+frequency the two maps are one map and the exact covariance vanishes on the
+frequency differences; the raw matrix restricted to them (2 frequencies,
+$\ell_{\max} = 800$) had eigenvalues of $\pm3\times10^{-2}$ in correlation
+units with the old assembly, and has $3\times10^{-15}$ with the new one.
+Against NKA, which has no orientation to choose (3 frequencies, same run),
+the new matrix's variance in NKA's 50 weakest directions is 1.000 to 1.023
+times NKA's, and its lowest eigenvalue $+1.48\times10^{-10}$ against NKA's
+$+1.48\times10^{-10}$; the old one ranged from $-24$ to $+27$ times NKA's.
+The normalisation of Sect. 5 played no part: with the old orientation,
+replacing the per-contraction $\Xi$ by the field-factorised ladder
+$\Xi^{00}(\Xi^{20}/\Xi^{00})^{w}$ moved the lowest eigenvalue by 2% and did
+not remove a single negative one.
+
+The orientation does not remove the asymmetry error itself. The Eq. 23
+amplitude of every element comes from the symmetric $\Xi_{\ell\ell'}$, and
+the exact asymmetry is mostly one of amplitude, so the two orientations give
+nearly the same value: on the rippled cap of the test suite at
+$\ell_\ast = 8$, where the exact asymmetry of TT×TE, TT×EE and TE×EE at
+$\ell_\ast$ is 0.7 to 5% of the element for $\Delta = 1$ to 5, the two
+orientations differ by less than 9% of it, with either sign. ACC thus
+carries nearly the whole exact asymmetry on the lower triangle (the upper
+one is exact at $\ell_\ast$ up to the normalisation of Sect. 5). It grows
+with $\vert\ell - \ell'\vert$ and was smaller than the other error terms on
+the masks tested; on that survey footprint the two orientation rules
+differ by at most $1.3\times10^{-4}$ in correlation and not at all in
+$\sigma$.
 
 The choice of $\ell_\ast$ is a trade-off. A larger $\ell_\ast$ makes the
 translation more accurate, because the kernel shape converges as $\ell$
@@ -184,17 +234,55 @@ ACC computes the $\mathrm{dmax}$ diagonals $\vert\ell - \ell'\vert < \mathrm{dma
 and sets every other element to zero. Each diagonal $\Delta$ needs its own
 kernels at $(\ell_\ast, \ell_\ast + \Delta)$, so the precompute builds the
 pairs $\ell' = \ell_\ast, \ldots, \ell_\ast + \mathrm{dmax} - 1$
-(`coupling_ellprange`), and its cost is proportional to $\mathrm{dmax}$.
+(`coupling_ellprange`), and its cost is proportional to $\mathrm{dmax}$. The
+recompute step that follows (spectra, noise, beams, binning) also grows with
+$\mathrm{dmax}$, since it touches $\mathrm{dmax}$ diagonals, but stays cheap:
+a few seconds at $\mathrm{dmax} = 20$ to $100$ on a 66-bandpower T/E run.
 
-The right $\mathrm{dmax}$ is set by how fast the true covariance decays away
-from the diagonal, which depends on the mask: a smaller or more structured
-footprint couples more multipoles. On the 4% apodised footprint of Sect. 7,
-the exact ratio $\tilde\Sigma_{\ell'+d, \ell'}/\tilde\Sigma_{\ell'\ell'}$ is
-0.84 to 0.94 at $d = 1$, about 0.04 at $d = 10$ and about $10^{-3}$ at
-$d = 50$, stable over $20 \le \ell' \le 400$; $\mathrm{dmax} = 20$ keeps
-every element above about 1% of the diagonal. For another mask, compute one
-exact row (`exact_covariance_row`) and read off where it drops below your
-target.
+For binned output, the right $\mathrm{dmax}$ is set by the bin width $w$, not
+by how far the true correlation reaches: $\mathrm{dmax} \ge w$ for correct
+bandpower error bars, $\mathrm{dmax} \ge 2w$ for correct correlations between
+adjacent bandpowers. A bandpower's variance sums every multipole pair inside
+one bin of width $w$, i.e. separations $0$ to $w - 1$; a value of
+$\mathrm{dmax}$ below $w$ drops the pairs at separations $\mathrm{dmax}$ to
+$w - 1$ and biases every $\sigma$ low. The covariance of two adjacent
+bandpowers sums pairs straddling the two bins, separations $1$ to $2w - 1$,
+and the number of such pairs keeps growing with separation up to $w$, so the
+many small terms at intermediate separation matter as much as the few large
+ones near the diagonal -- hence the stricter $\mathrm{dmax} \ge 2w$.
+
+Measured on a 4% survey footprint, bins of width $w = 50$, one frequency
+T/E, $\ell_{\max} = 3500$, against 500 simulations: at $\mathrm{dmax} = 20$
+every $\sigma$ is 0.7% low, uniformly across multipole and TT/TE/EE, and the
+diagonal has converged by $\mathrm{dmax} = 50$; the mean adjacent-bandpower
+correlation is 0.010 at $\mathrm{dmax} = 20$ rising to 0.023 at
+$\mathrm{dmax} = 60$. At $\mathrm{dmax} = 100 = 2w$ it reaches 0.024 and
+stops rising -- the diagonal itself has not moved since $\mathrm{dmax} = 60$
+(a $1.4\times10^{-4}$ change), so the truncation is by then fully accounted
+for. The remaining gap to the simulations' $0.030 \pm 0.003$, i.e. 0.006,
+is $1.8\sigma$: consistent with Monte Carlo noise from 500 realisations, not
+with further truncation.
+
+On this footprint with three frequencies, the smallest eigenvalue of the
+correlation matrix was $-1.6\times10^{-5}$ at $\mathrm{dmax} = 20$ and
+$-1.8\times10^{-4}$ at $\mathrm{dmax} = 100$ up to cmbcov 0.2.0. Neither
+came from $\mathrm{dmax}$: both were the orientation of the lower triangle
+of the blocks between different spectra (Sect. 3), and with each element in
+its own orientation the smallest eigenvalue is $+1.5\times10^{-10}$ at both
+$\mathrm{dmax} = 20$ and $100$, as in NKA. A larger $\mathrm{dmax}$ still
+brings in more ACC-approximated off-diagonal elements, so check the
+eigenvalues of whatever $\mathrm{dmax}$ you settle on.
+
+For an *unbinned*, per-multipole covariance there is no bin width to size
+$\mathrm{dmax}$ against, so instead it is set by how fast the true
+covariance decays away from the diagonal, which depends on the mask -- a
+smaller or more structured footprint couples more multipoles. On the 4%
+apodised footprint of Sect. 7, the exact ratio
+$\tilde\Sigma_{\ell'+d, \ell'}/\tilde\Sigma_{\ell'\ell'}$ is 0.84 to 0.94 at
+$d = 1$, about 0.04 at $d = 10$ and about $10^{-3}$ at $d = 50$, stable over
+$20 \le \ell' \le 400$; $\mathrm{dmax} = 20$ keeps every element above about
+1% of the diagonal. For another mask, compute one exact row
+(`exact_covariance_row`) and read off where it drops below your target.
 
 ## 5. The T/E blocks and the spin-weight ladder
 
@@ -277,8 +365,9 @@ the mask has negligible power above $L_w$. That is the case for the apodised
 footprint of Sect. 7 at $L_w = 512$; hard edges and point-source holes need a
 larger $L_w$.
 
-**Symmetry.** Blocks between two different spectra carry half their exact
-$\ell\leftrightarrow\ell'$ asymmetry (Sect. 3).
+**Symmetry.** Blocks between two different spectra carry nearly their whole
+exact $\ell\leftrightarrow\ell'$ asymmetry on the lower triangle, since the
+Eq. 23 amplitude comes from the symmetric $\Xi$ (Sect. 3).
 
 **B modes.** Blocks with a B observable are dominated by leaked E power and
 have their own limits, larger than the ones above

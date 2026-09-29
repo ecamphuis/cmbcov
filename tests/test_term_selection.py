@@ -202,18 +202,17 @@ def two_blob_alm(nside, lw):
     return rotate_alm(healpy.map2alm(mask, lmax=lw, iter=10), lw, pole_rotation(mask))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the default thresholds (eps_m = tol/10, eps_pair = tol/4, delta_band = tol/10) were "
-        "validated on the survey mask only; on this asymmetric two-blob mask the kernel error "
-        "at tol 1e-3 is 1.36e-3 (ell = ell') and 3.03e-3 (ell' = ell + 3), entirely from the "
-        "pair rule (band-only 9e-6 / 1.4e-5, m-only 3e-7); eps_pair = tol/40 still leaves "
-        "2.4e-4 / 5.3e-4.  Kept strict so a change of defaults that fixes it shows up here."
-    ),
-)
 @pytest.mark.parametrize("ellp_offset", [0, 3])
 def test_default_thresholds_on_asymmetric_mask(ellp_offset):
+    """The defaults honour the tolerance on a mask with no dominant centre.
+
+    This is the case the pair threshold was retuned for: at the old
+    ``eps_pair = tol/4`` the error here was 1.36e-3 (ell' = ell) and 3.03e-3
+    (ell' = ell + 3) against a tolerance of 1e-3, entirely from the pair rule
+    (band-only 9e-6 / 1.4e-5, m-only 3e-7).  At ``tol/40`` it is 2.4e-4 and
+    5.3e-4.  A compact footprint was never affected either way, so this mask
+    is the one that pins the threshold.
+    """
     nside = 16
     lw, lmax_out = 3 * nside - 1, 2 * nside - 1
     ell, ellp = nside, nside + ellp_offset
@@ -248,7 +247,9 @@ def test_default_thresholds_on_asymmetric_mask(ellp_offset):
     )
     Ks = kernel_from_integrals(X * band_x, Y * band_y, sel.keep_pair)
     err = frob(K - Ks) / frob(K)
-    assert (
-        0.2 < sel.frac_pairs < 0.35 and 20 <= sel.m_band <= 28
-    )  # the selection is real
+    # The selection is real: it still drops half the pairs and most of the M
+    # orders.  The band is untouched by the pair threshold; the fractions are
+    # the measured tol/40 values (0.493 at ell' = ell, 0.475 at ell' = ell+3,
+    # against 0.297 / 0.279 at the old tol/4, which missed the tolerance).
+    assert 0.4 < sel.frac_pairs < 0.6 and 20 <= sel.m_band <= 28
     assert err <= tolerance, (sel.summary(), err)

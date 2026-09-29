@@ -83,8 +83,10 @@ Dl: true
 ```
 
 `centralell: 16` and `dmax: 4` are toy values for this small mask, chosen so
-the example runs in seconds; see [`acc_precomputation.md`](acc_precomputation.md)
-for sizing them on a real footprint. See [`parameters.md`](parameters.md) for
+the example runs in seconds; `dmax` here is below the bin width (6), which
+`validate-parameters` will warn about -- see
+[`acc_precomputation.md`](acc_precomputation.md) for sizing `dmax` and
+`centralell` on a real footprint. See [`parameters.md`](parameters.md) for
 every key.
 
 ## Running from the Python API
@@ -179,9 +181,9 @@ multipole pair), so they are shared by every version directory of the file.
 
 ## Bandpower window functions
 
-`cmbcov-cov --save-windows` writes the linear map from the fiducial
-theory spectrum (`cmb_spectrum`) to the *expected* value of each reported
-bandpower,
+`cmbcov-cov --save-windows` writes the linear map from the fiducial sky
+spectrum (`cmb_spectrum`: no beam, no pixel window, no transfer function) to
+the *expected* value of each reported, debiased bandpower,
 
 ```math
 \langle \hat C^X_b \rangle = \sum_\ell W^X_{b\ell}\, C^X_\ell ,
@@ -216,13 +218,35 @@ instead of writing anything; enable `polspice_postprocess`, or drop
 `--save-windows`, for that run.
 
 $D_\ell$ scaling (`Dl: true`) is folded into `W`'s output axis, matching the
-covariance's own convention; the input axis stays $C_\ell$. Each file also
-includes that frequency pair's beam, pixel window, transfer function and
-calibration debiasing — the same per-leg factor
-`CovariancePostProcessor.apply_debiasing` applies to the covariance
-(`SpectraLoader.data_model`/`debiasing_dict`) — so `W` maps the fiducial
-theory spectrum straight to the reported bandpower, every multiplicative
-factor included.
+covariance's own convention; the input axis stays $C_\ell$. The instrument
+enters on both axes, as it does in the covariance. The covariance is
+computed for the beamed spectrum $\mathcal{D}_\ell C_\ell$, with the data
+model $\mathcal{D}_\ell = B^A_\ell B^B_\ell\, p_\ell\, F_\ell$ of the pair
+$A \times B$ (`SpectraLoader.data_model`: the beams of both frequencies, the
+pixel window of the Stokes pair, $p_T^2$, $p_T p_P$ or $p_P^2$, and the
+transfer function), and the data bandpower is debiased by
+$d_\ell = 1/\mathcal{D}_\ell$. Each file is therefore
+
+```math
+W = P\, \mathrm{diag}(\delta_\ell\, d_\ell)\, K\, \mathrm{diag}(\mathcal{D}_\ell),
+```
+
+with $P$ the binning, $\delta_\ell = \ell(\ell+1)/2\pi$ under `Dl: true`
+(1 otherwise) and $K$ the mean kernel above (the MASTER coupling under
+`polspice_postprocess: false`), and $W C$, for the
+unbeamed $C$, is the mean of the debiased data bandpower whose covariance
+the run writes. The covariance's own leg factor (`debiasing_dict`,
+`CovariancePostProcessor.apply_debiasing`) is $d_\ell$ times
+`post_process_correction` and, when that option is on, the
+`add_tf_uncertainty` inflation $1 + \sqrt{(1 - F_\ell)/3999}$. Both
+multiply the covariance only and are never applied to the data, so the
+windows leave them out.
+Windows written before 2026-09-28 lacked the factor $\mathrm{diag}(\mathcal{D}_\ell)$: with a beam or
+pixel window on (the pixel window defaults to nside 8192), $W C$ was off
+by about the binned $1/\mathcal{D}_\ell$: 1.003 to 1.30 per bin on the
+package's test baseline (nside-32 pixel window, $\ell < 60$), and 0.94 to
+1.40 across $\ell$ = 425 to 2975 for the SPT-3G D1 150 GHz beam normalised
+near $\ell$ = 800.
 
 ## Caching and reusing results
 

@@ -266,17 +266,21 @@ def test_fix_changes_the_assembled_eete_block_and_moves_it_toward_exact(gl_preco
 
     Note on what "closer" can mean here: ``compute_acc_term``'s Eq. 33
     translation window depends on ``(ell1, ell2)`` only through
-    ``min(ell1, ell2)`` and a FIXED kernel/spectrum key, so for any
-    ``CovKey`` — fixed or not — the assembled ACC block is symmetric under
-    ``l <-> l'`` BY CONSTRUCTION (verified directly below); this is a
-    structural property of the translation-invariance approximation itself,
-    not something the TE/ET kernel fix changes or could change. The exact
-    ``Cov(EE, TE)`` block is not symmetric, so the best an ACC block can do
-    is approximate its symmetric part, ``0.5 * (ref[l, l'] + ref[l', l])``.
-    What the fix does is replace the wrong kernel (``TE`` aliased from
-    ``ET``) with the true ``ET``/``EE`` pair in that approximation; this
-    checks that the result is both measurably different from the pre-fix
-    value and a better approximation of that symmetric target.
+    ``min(ell1, ell2)`` and a FIXED kernel/spectrum key. The aliased
+    assembly below uses one key for both triangles, so its block is
+    symmetric under ``l <-> l'`` by construction (verified below). The exact
+    ``Cov(EE, TE)`` block is not symmetric; a symmetric ACC block can at best
+    approximate its symmetric part, ``0.5 * (ref[l, l'] + ref[l', l])``.
+    What the kernel fix does is replace the wrong kernel (``TE`` aliased
+    from ``ET``) with the true ``ET``/``EE`` pair; this checks, on the upper
+    triangle, that the result is both measurably different from the
+    pre-fix value and a better approximation of that symmetric target.
+
+    Since then the lower triangle of a non-auto block is computed in its
+    own orientation, from the transposed key (docs/theory/acc.md, Sect. 3),
+    so the production block is no longer symmetric: its lower triangle is
+    the transposed block's upper triangle (checked below), and the upper
+    triangle, the one this fix is about, is unchanged by that rule.
     """
     cov, strategy, cls, exact = gl_precompute
     key = CovKey(("E", "E", "T", "E"), (FREQ,) * 4)
@@ -285,6 +289,7 @@ def test_fix_changes_the_assembled_eete_block_and_moves_it_toward_exact(gl_preco
         warnings.simplefilter("ignore")
         new = strategy.compute_covariance_term(key, cl)
         old = _old_aliased_covariance_term(strategy, key, cl)
+        transposed = strategy.compute_covariance_term(key.transpose(), cl)
 
     ref = exact[("EE", "TE")]
 
@@ -293,9 +298,12 @@ def test_fix_changes_the_assembled_eete_block_and_moves_it_toward_exact(gl_preco
         for ell in ROWS:
             if ell == ellp:
                 continue
-            # structural symmetry, unaffected by the fix (see docstring)
-            assert new[ell, ellp] == pytest.approx(new[ellp, ell], rel=1e-12)
+            # the aliased assembly is symmetric by construction (docstring)
             assert old[ell, ellp] == pytest.approx(old[ellp, ell], rel=1e-12)
+            if ell > ellp:
+                # lower triangle: its own orientation, Cov(TE, EE) transposed
+                assert new[ell, ellp] == pytest.approx(transposed[ellp, ell], rel=1e-12)
+                continue
 
             sym_exact = 0.5 * (ref[ell, ellp] + ref[ellp, ell])
             if sym_exact == 0:

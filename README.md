@@ -69,7 +69,8 @@ cmbcov-cov parameters.yml           # every run: spectra, noise, beams, binning
 ```
 
 `centralell` and `dmax` above are toy values for a quick run against the
-small nside-16 mask shipped in `tests/data/`; see
+small nside-16 mask shipped in `tests/data/` (small enough that `dmax` is
+below the bin width and `validate-parameters` warns about it); see
 [`docs/acc_precomputation.md`](docs/acc_precomputation.md) for how to size
 them for a real survey mask. Full walkthrough, including the Python API:
 [`docs/getting_started.md`](docs/getting_started.md).

@@ -375,6 +375,7 @@ class CovarianceMatrixGenerator:
             "spectra": settings.spectra,
             "pairs": pairs,
             "max_memory_gb": settings.max_memory_gb,
+            "scratch_dir": settings.scratch_dir,
         }
         self.logger.info(f"ACC precompute plan: {plan}")
         if dryrun:
@@ -392,6 +393,7 @@ class CovarianceMatrixGenerator:
             spectra=settings.spectra,
             pairs=pairs,
             max_memory_gb=settings.max_memory_gb,
+            scratch_dir=settings.scratch_dir,
             verbose=self.verbose_mode,
         )
         return plan

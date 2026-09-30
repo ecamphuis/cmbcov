@@ -394,7 +394,11 @@ def select_terms(
 
     ms = np.arange(-ell, ell + 1)
     mps = np.arange(-ellp, ellp + 1)
-    est = np.outer(pm, pmp) * A[(ms[:, None] - mps[None, :]) + 2 * lw]
+    d = ms[:, None] - mps[None, :]
+    # P is supported on |m3| <= lw, so A(d) = 0 for |d| > 2 lw (exactly); an
+    # unguarded index would raise for d > 2 lw and wrap around for d < -2 lw.
+    a_d = np.where(np.abs(d) <= 2 * lw, A[np.clip(d, -2 * lw, 2 * lw) + 2 * lw], 0.0)
+    est = np.outer(pm, pmp) * a_d
     keep_pair = (est >= eps_pair * est.max()) & keep_m[:, None] & keep_mp[None, :]
 
     # M band: smallest k with sum_{|m3| <= k} P(m3) >= 1 - delta_band.

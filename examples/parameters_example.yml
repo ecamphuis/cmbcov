@@ -114,6 +114,10 @@ covariance_approximation: nka
 #                     # `spectra` here is an advanced override and is left
 #                     # exactly as given.
 #   max_memory_gb: 6  # contraction memory budget in GiB; default 2
+#   scratch_dir: /fast/scratch  # temporary on-disk store of the central
+#                     # coefficients when they exceed half of max_memory_gb
+#                     # (11.7 GiB at centralell 250, nside 256); default: the
+#                     # kernel directory. Deleted when the precompute ends.
 
 # ============================================================
 # OPTIONAL PARAMETERS

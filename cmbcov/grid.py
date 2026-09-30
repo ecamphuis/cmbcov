@@ -69,13 +69,19 @@ band-limit slowly, apodised masks quickly.
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 
 import ducc0
 import numpy as np
 
-from .utils.threading_utils import _env_nthreads, get_optimal_nthreads
+from .utils.threading_utils import (
+    _env_nthreads,
+    get_optimal_nthreads,
+    row_block_workers,
+    run_row_blocks,
+)
 
 __all__ = [
     "gl_minimal_lmax",
@@ -362,7 +368,13 @@ def _gl_geometry(lmax_grid: int) -> dict:
             "nphi_arr": np.full(ntheta, nphi, dtype=np.uint64),
             "phi0": np.zeros(ntheta),
             "ringstart": (np.arange(ntheta) * nphi).astype(np.uint64),
+            # 2 pi w_GL per ring (GL_weights includes 2 pi / nphi), the ring
+            # weight of banded_integrals_gl.
+            "wbar": ducc0.misc.GL_weights(ntheta, nphi) * nphi,
         }
+        for array in geom.values():
+            if isinstance(array, np.ndarray):
+                array.setflags(write=False)
         _GL_GEOMETRY[lmax_grid] = geom
     return geom
 
@@ -448,16 +460,59 @@ def gl_synthesis_single_m(
 # --------------------------------------------------------------------------- #
 # Full-M <-> real-map-pair conversions (any spin; leading dims preserved)
 # --------------------------------------------------------------------------- #
-def _lm_index(lmax: int):
-    """(l, m) arrays for healpy's alm ordering and the (-1)^m signs."""
+@functools.lru_cache(maxsize=16)
+def _lm_tables(lmax: int) -> dict:
+    """
+    Index tables of :func:`full_from_pair` / :func:`pair_from_full` for one
+    ``lmax``, computed once per process (they depend on nothing else; the
+    ACC precompute used to rebuild them with ``healpy.Alm.getlm`` on every
+    call, thousands of times per kernel pair).  All arrays are read-only.
+
+    ``ell``, ``m``, ``sign``
+        healpy's alm ordering and ``(-1)^m`` (:func:`_lm_index`).
+    ``pos``
+        indices (into the healpy ordering) of the ``m > 0`` entries.
+    ``flat_p``, ``flat_m``
+        flat index into a C-ordered ``(lmax+1, 2lmax+1)`` full-``M`` array
+        of ``(L, +M)`` and ``(L, -M)``.
+    ``col_p``, ``col_m_pos``, ``ell_pos``, ``sign_pos``
+        the same as ``(row, column)`` pairs (for strided destinations), the
+        ``-M`` ones restricted to ``pos``.
+    """
     import healpy as hp  # lazy, see utils/healpy_utils.py
 
     ell, m = hp.Alm.getlm(lmax)
     sign = np.where(m % 2 == 0, 1.0, -1.0)
-    return ell, m, sign
+    pos = np.flatnonzero(m > 0)
+    ncol = 2 * lmax + 1
+    tables = {
+        "ell": ell,
+        "m": m,
+        "sign": sign,
+        "pos": pos,
+        "flat_p": ell * ncol + lmax + m,
+        "flat_m": ell * ncol + lmax - m,
+        "col_p": lmax + m,
+        "col_m_pos": lmax - m[pos],
+        "ell_pos": ell[pos],
+        "sign_pos": sign[pos],
+    }
+    tables["flat_m_pos"] = tables["flat_m"][pos]
+    for array in tables.values():
+        array.setflags(write=False)
+    return tables
 
 
-def full_from_pair(r: np.ndarray, s: np.ndarray, lmax: int) -> np.ndarray:
+def _lm_index(lmax: int):
+    """(l, m) arrays for healpy's alm ordering and the (-1)^m signs (cached,
+    read-only; see :func:`_lm_tables`)."""
+    tables = _lm_tables(lmax)
+    return tables["ell"], tables["m"], tables["sign"]
+
+
+def full_from_pair(
+    r: np.ndarray, s: np.ndarray, lmax: int, out: np.ndarray | None = None
+) -> np.ndarray:
     r"""
     Full-``M`` coefficients of the complex map ``Re + i Im`` from the healpy
     alms ``r`` (of ``Re``) and ``s`` (of ``Im``).
@@ -468,26 +523,49 @@ def full_from_pair(r: np.ndarray, s: np.ndarray, lmax: int) -> np.ndarray:
     ``r`` and ``s`` may carry leading dimensions (e.g. ``(2, nalm)`` for an
     (E, B) pair), which are preserved.  Returns an array of shape
     ``(..., lmax+1, 2*lmax+1)`` indexed ``[..., L, M+lmax]``.
+
+    ``out``, if given, is a complex128 array (or a strided view, e.g. one
+    ``m`` of a packed block) of exactly that shape; it is overwritten --
+    zeros where ``L < |M|`` -- and returned, so a caller that needs the
+    coefficients inside a larger array pays no intermediate copy.  The
+    values are the same either way.
     """
     r = np.asarray(r)
     s = np.asarray(s)
-    ell, m, sign = _lm_index(lmax)
-    full = np.zeros(r.shape[:-1] + (lmax + 1, 2 * lmax + 1), dtype=complex)
-    full[..., ell, lmax + m] = r + 1j * s
-    pos = m > 0
-    full[..., ell[pos], lmax - m[pos]] = sign[pos] * (
-        np.conj(r[..., pos]) + 1j * np.conj(s[..., pos])
+    t = _lm_tables(lmax)
+    shape = r.shape[:-1] + (lmax + 1, 2 * lmax + 1)
+    upper = r + 1j * s
+    lower = t["sign_pos"] * (
+        np.conj(np.take(r, t["pos"], axis=-1))
+        + 1j * np.conj(np.take(s, t["pos"], axis=-1))
     )
-    return full
+    if out is None:
+        full = np.zeros(shape, dtype=complex)
+        flat = full.reshape(r.shape[:-1] + (-1,))
+        flat[..., t["flat_p"]] = upper
+        flat[..., t["flat_m_pos"]] = lower
+        return full
+    if out.shape != shape:
+        raise ValueError(f"out must have shape {shape}; got {out.shape}")
+    out[...] = 0
+    out[..., t["ell"], t["col_p"]] = upper
+    out[..., t["ell_pos"], t["col_m_pos"]] = lower
+    return out
 
 
 def pair_from_full(full: np.ndarray, lmax: int):
     """Inverse of :func:`full_from_pair`: healpy alms of ``Re`` and ``Im``
     (leading dimensions preserved)."""
     full = np.asarray(full)
-    ell, m, sign = _lm_index(lmax)
-    xp = full[..., ell, lmax + m]
-    xm = sign * np.conj(full[..., ell, lmax - m])
+    t = _lm_tables(lmax)
+    if full.flags.c_contiguous and full.shape[-2:] == (lmax + 1, 2 * lmax + 1):
+        flat = full.reshape(full.shape[:-2] + (-1,))
+        xp = np.take(flat, t["flat_p"], axis=-1)
+        xm = t["sign"] * np.conj(np.take(flat, t["flat_m"], axis=-1))
+    else:
+        ell, m = t["ell"], t["m"]
+        xp = full[..., ell, lmax + m]
+        xm = t["sign"] * np.conj(full[..., ell, lmax - m])
     r = 0.5 * (xp + xm)
     s = -0.5j * (xp - xm)
     return r, s
@@ -616,6 +694,15 @@ def spin_weighted_integrals_gl(
     and analysing the product.  In operator language this is one column of
     the pseudo-alm operator ``K = S^dagger W S``: the result is ``K e`` for
     the unit vector ``e`` at ``(ell, m)``.
+
+    This is the *two-SHT reference route*: about five real transforms per
+    call (mask synthesis, two for the complex single mode, two analyses),
+    the mask re-synthesised every time.  The ACC precompute produces the
+    same numbers (to rounding, same grid and same quadrature) with
+    :func:`banded_integrals_gl` at full band and mask modes shared per grid
+    (:data:`cmbcov.approximations.acc._GL_PRODUCER`); this function is kept
+    as the reference that route is tested against, and for callers that
+    need a single integral.
 
     For ``spin=2`` the unit vector is an **E-mode** unit vector (``B = 0``) and
     ``K_2 = S_2^dagger W S_2`` acts on (E, B) pairs: the result holds both the
@@ -749,7 +836,9 @@ def gl_mask_modes(
     by mode either way).
 
     This is the input :func:`banded_integrals_gl` needs from the mask: one
-    synthesis and one FFT per grid, to be shared by every ``(ell, m)`` on it.
+    synthesis and one FFT per grid, to be shared by every ``(ell, m)`` on it
+    (the ACC precompute keeps one per grid for the whole run, for the
+    central and the primed side alike).
 
     Parameters
     ----------
@@ -816,6 +905,50 @@ def _unit_mode_legs(
     return leg
 
 
+def _fill_legs(
+    legs: np.ndarray,
+    wu: np.ndarray,
+    mask_modes: np.ndarray,
+    first: int,
+    phase: np.ndarray | None,
+    nthreads: int,
+) -> None:
+    r"""
+    ``legs[c, j, i] = wu[c, j] * mask_modes[j, (first + i) mod nphi]``, then
+    for the ``M < 0`` block (``phase`` given) ``legs[0] *= phase`` and, for
+    spin 2, ``legs[1] *= -phase``: the legs of :func:`banded_integrals_gl`.
+
+    The mask columns of a run of consecutive orders are at most two slices
+    (``nphi > 2 lmax_out``), multiplied straight into place without a
+    gather.  The rows (rings) are split into contiguous blocks over up to
+    ``nthreads`` workers (:func:`~.utils.threading_utils.run_row_blocks`);
+    every entry is the same one or two products as on one thread, so the
+    result is bit-identical for any thread count.
+    """
+    ncomp, ntheta, size = legs.shape
+    nphi = mask_modes.shape[1]
+    neg_phase = None if phase is None or ncomp == 1 else -phase
+
+    def rows(r0: int, r1: int) -> None:
+        j = 0
+        while j < size:
+            k = (first + j) % nphi
+            n = min(size - j, nphi - k)
+            for c in range(ncomp):
+                np.multiply(
+                    wu[c, r0:r1, None],
+                    mask_modes[r0:r1, k : k + n],
+                    out=legs[c, r0:r1, j : j + n],
+                )
+            j += n
+        if phase is not None:
+            legs[0, r0:r1] *= phase
+            if neg_phase is not None:
+                legs[1, r0:r1] *= neg_phase
+
+    run_row_blocks(rows, ntheta, row_block_workers(legs.size, nthreads))
+
+
 def banded_integrals_gl(
     mask_alm: np.ndarray,
     lw: int,
@@ -870,6 +1003,20 @@ def banded_integrals_gl(
     order at a time; verified numerically against
     :func:`spin_weighted_integrals_gl` to 2e-16 for both spins.
 
+    **Layout.**  Each ``leg2alm`` call (one for ``M >= 0``, one for
+    ``M < 0``) writes its orders straight into their columns of the
+    full-``M`` output (``mstart = M + lmax_out``, ``lstride = 2 lmax_out +
+    1``), the common sign :math:`(-1)^{|M|}` applied to the legs; no
+    intermediate ``(M, L)`` array, transpose or :func:`full_from_pair` is
+    involved.  The legs themselves are multiplied into place from at most two
+    column slices of ``mask_modes`` per sign (no gather).  Bit-identical to
+    the earlier gather-and-transpose form of this function.
+
+    **Default ACC producer.**  At full band this is how
+    :mod:`cmbcov.approximations.acc` produces every GL coefficient when no
+    term selection is asked for; :func:`spin_weighted_integrals_gl` is the
+    reference it is tested against (``tests/test_acc_gl_producer.py``).
+
     Parameters
     ----------
     mask_alm, lw, ell, m, lmax_out, lmax_grid, nthreads, spin
@@ -897,9 +1044,17 @@ def banded_integrals_gl(
     **Cost.**  ``leg2alm`` over ``n_M`` orders is
     :math:`O(n_M\, n_\theta\, \ell_{max})`, against
     :math:`O(n_\theta \ell_{max}^2 + n_\theta n_\phi \log n_\phi)` for
-    each of the two SHTs, so the saving is roughly
-    ``(2 m_band + 1) / (2 lmax_out + 1)`` (measured 5x at ``nside`` 256 for
-    the compiled full band, more in proportion for narrow bands).  The mask
+    each transform of the two-SHT route (about five per call: mask, the
+    complex single mode, the complex product), and the band restricts
+    ``n_M`` to ``2 m_band + 1``.  At full band, ``nside`` 256
+    (``lmax_out = 511``, ``lw = 875``, grid 818), measured on a 14-core
+    laptop inside the ACC precompute: 11.9 ms per call (spin 0 and 2
+    averaged) against 49.7 ms for :func:`spin_weighted_integrals_gl`, 4.2x;
+    single-threaded 3.3x (80-87 ms against 267-286 ms per ``m``, both
+    spins).  About 60% of it was ``leg2alm`` (threaded), the rest the
+    then single-threaded construction of the legs, which
+    :func:`_fill_legs` now splits over rings on the same ``nthreads``
+    (3-4x faster, bit-identical).  The mask
     synthesis is hoisted out through ``mask_modes``; without it, it is
     repeated per call as in the two-SHT route.
     """
@@ -936,43 +1091,47 @@ def banded_integrals_gl(
             f"mask_modes must have shape {(ntheta, nphi)} for lmax_grid "
             f"{lmax_grid}; got {mask_modes.shape}"
         )
-    wbar = ducc0.misc.GL_weights(ntheta, nphi) * nphi  # 2 pi w_GL per ring
+    # wbar(theta) unit_c(theta): the ring profile of the weighted single mode.
+    wu = geom["wbar"] * _unit_mode_legs(ell, m, spin, geom["theta"], nt)
+    m_lo, m_hi = max(-lmax_out, m - m_band), min(lmax_out, m + m_band)
+    ncol = 2 * lmax_out + 1
+    flat = out.reshape(ncomp, (lmax_out + 1) * ncol)  # a view: out is contiguous
 
-    unit = _unit_mode_legs(ell, m, spin, geom["theta"], nt)  # (ncomp, ntheta)
-    Ms = np.arange(max(-lmax_out, m - m_band), min(lmax_out, m + m_band) + 1)
-    if Ms.size == 0:
-        return out.reshape(_full_shape(lmax_out, spin))
-    # G[c, theta, M] = wbar W_{M-m} unit_c  -- the mode-M ring profile of the
-    # weighted product map W * y.
-    G = (wbar * unit)[:, :, None] * mask_modes[:, (Ms - m) % nphi][None, :, :]
-
-    for negative in (False, True):
-        sel = Ms < 0 if negative else Ms >= 0
-        if not sel.any():
+    for lo, hi, negative in ((max(m_lo, 0), m_hi, False), (m_lo, min(m_hi, -1), True)):
+        if lo > hi:
             continue
-        Mabs = np.abs(Ms[sel]).astype(np.int64)
-        n_m = Mabs.size
-        legs = np.ascontiguousarray(G[:, :, sel])
-        if negative and spin == 2:
-            legs[1] *= -1.0
-        alm = np.zeros((ncomp, n_m * (lmax_out + 1)), dtype=np.complex128)
+        Ms = np.arange(lo, hi + 1)
+        # legs[c, theta, M] = wbar W_{M-m} unit_c -- the mode-M ring profile of
+        # the weighted product map W * y (_fill_legs, threaded over rings).
+        # The M < 0 rule (docstring): legs (G_Q, -G_U) at |M|, E output times
+        # (-1)^|M|, B output times -(-1)^|M|.  The common (-1)^|M| is applied
+        # to the legs (leg2alm is linear in them, and a sign is exact), the B
+        # sign to the output below.
+        legs = np.empty((ncomp, ntheta, Ms.size), dtype=np.complex128)
+        _fill_legs(
+            legs,
+            wu,
+            mask_modes,
+            lo - m,
+            (-1.0) ** np.abs(Ms) if negative else None,
+            nt,
+        )
+        # leg2alm writes each order straight into its full-M column
+        # (index mstart + L * lstride = L * ncol + M + lmax_out); entries with
+        # L < |M| are not touched and stay zero.
         ducc0.sht.leg2alm(
             leg=legs,
             lmax=lmax_out,
             theta=geom["theta"],
             spin=spin,
-            mval=Mabs,
-            mstart=(np.arange(n_m) * (lmax_out + 1)).astype(np.int64),
-            lstride=1,
+            mval=np.abs(Ms).astype(np.int64),
+            mstart=(Ms + lmax_out).astype(np.int64),
+            lstride=ncol,
             nthreads=nt,
-            alm=alm,
+            alm=flat,
         )
-        alm = alm.reshape(ncomp, n_m, lmax_out + 1)  # [c, M, L]
-        phase = (-1.0) ** Mabs if negative else np.ones(n_m)
-        cols = Ms[sel] + lmax_out
-        out[0][:, cols] = (alm[0] * phase[:, None]).T
-        if spin == 2:
-            out[1][:, cols] = (alm[1] * (-phase if negative else phase)[:, None]).T
+        if negative and spin == 2:
+            out[1][:, lo + lmax_out : hi + lmax_out + 1] *= -1.0
     return out.reshape(_full_shape(lmax_out, spin))
 
 

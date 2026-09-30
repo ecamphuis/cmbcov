@@ -12,8 +12,11 @@ import hashlib
 import json
 import math
 import os
+import shutil
+import tempfile
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -29,8 +32,21 @@ from ..mask import MaskWlm
 from ..sht import DEFAULT_MAP2ALM_ITER, ducc0_map2alm
 from ..term_selection import TermSelection, pole_rotation, rotate_alm, select_terms
 from ..utils.healpy_utils import get_nside_from_ell
+from ..utils.threading_utils import (
+    get_optimal_nthreads,
+    row_block_workers,
+    run_row_blocks,
+)
 from . import acc_cache
 from .base import CovarianceStrategy
+
+try:  # uncached I/O for the central store (_CentralStore); POSIX-only
+    import fcntl
+
+    _F_NOCACHE = getattr(fcntl, "F_NOCACHE", None)  # macOS
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+    _F_NOCACHE = None
 
 __all__ = [
     "ACCStrategy",
@@ -157,8 +173,9 @@ def _resolve_spectra(
         Whether every kernel the caller asked for needs only the spin-0 (T)
         field on both the central and primed side -- i.e. ``spectra`` is
         ``("TT",)``.  When true, the GL branch can skip the spin-2 (D, L)
-        integrals entirely; that synthesis is ~92% of the precompute wall
-        time at ``centralell=250``, ``nside=256``.
+        integrals entirely (two Legendre components against one for T; on
+        the earlier two-SHT producer they were ~92% of the precompute wall
+        time at ``centralell=250``, ``nside=256``).
     """
     if spectra is None:
         spectra_tuple = COUPLING_SPECTRA
@@ -176,17 +193,20 @@ def _resolve_spectra(
     return spectra_tuple, spec_indices, t_only
 
 
-#: Default peak-memory budget for the coupling contraction, in GiB.  It caps
-#: the blocked working set of :func:`_accumulate_coupling_kernels` (see
+#: Default memory budget of the ACC precompute, in GiB: everything it holds
+#: that scales with the problem -- coefficient sets held in RAM and the
+#: blocked working set of :func:`_accumulate_coupling_kernels`
+#: (:func:`_coupling_working_set`) -- on top of a fixed baseline (see
 #: :func:`precompute_acc_kernels`, ``max_memory_gb``).
 DEFAULT_COUPLING_MEMORY_GB = 2.0
 
-#: Primed-block width aimed at when the whole primed set does not fit in the
-#: budget.  The primed block is the *inner* loop, so it is rebuilt once per
-#: central block; spending the budget on the central block instead keeps the
-#: number of rebuilds down, while this floor keeps the per-``L`` GEMMs wide
-#: enough to run near BLAS peak.
-_PRIME_BLOCK_TARGET = 32
+#: Inner-block width aimed at when the whole inner set does not fit in the
+#: budget (:func:`_coupling_block_sizes`).  The inner side is re-visited once
+#: per outer block -- re-synthesised on the streamed path, re-read from RAM or
+#: from the disk store otherwise -- so the budget is spent on the outer block
+#: to keep the number of passes down, while this floor keeps the per-``L``
+#: GEMMs wide enough to run near BLAS peak.
+_INNER_BLOCK_TARGET = 32
 
 
 def _gl_banded_grid(lw: int, ell: int, lmax_out: int) -> int:
@@ -198,6 +218,21 @@ def _gl_banded_grid(lw: int, ell: int, lmax_out: int) -> int:
     can be computed once per ``ell`` on exactly that grid and handed in.
     """
     return max(math.ceil((lw + ell + lmax_out - 1) / 2), ell, lmax_out)
+
+
+#: Producer of the GL coefficients on the default path (no term selection).
+#: ``"legendre"``: :func:`~cmbcov.grid.banded_integrals_gl` at full band
+#: (``m_band = lmax_out + |m|``), the azimuthal sum done analytically from
+#: the mask's ring Fourier modes (:func:`~cmbcov.grid.gl_mask_modes`,
+#: computed once per grid and shared by every ``m``) and one
+#: ``ducc0.sht.leg2alm`` per sign of ``M`` and spin.  ``"two_sht"``: the
+#: reference route :func:`~cmbcov.grid.spin_weighted_integrals_gl`
+#: (synthesise the mask and ``Y_lm``, multiply, analyse: about five
+#: transforms per ``m`` and spin).  Both evaluate the same product with the
+#: same Gauss-Legendre rule on the same grid and agree to rounding
+#: (``tests/test_acc_gl_producer.py``); the switch exists for those tests
+#: and is not a user option.
+_GL_PRODUCER = "legendre"
 
 
 def _gl_integrals_m(
@@ -215,20 +250,28 @@ def _gl_integrals_m(
     the spin-0 full-M array and ``u_EB`` the ``(2, lmax, 2*lmax-1)`` (E, B)
     response to the E-mode unit vector, or ``(u_T, None)`` with ``t_only``.
 
-    ``m_band=None`` (the default path) uses the two-SHT
-    :func:`~cmbcov.grid.spin_weighted_integrals_gl`.  With
-    an ``m_band`` (term selection) the integrals come from
-    :func:`~cmbcov.grid.banded_integrals_gl` restricted to
-    ``|M - m| <= m_band`` on the grid :func:`_gl_banded_grid`, with the mask
-    modes ``mask_modes`` precomputed on that grid by the caller.
+    The integrals come from :func:`~cmbcov.grid.banded_integrals_gl` on the
+    grid :func:`_gl_banded_grid`, with the mask modes ``mask_modes``
+    (:func:`~cmbcov.grid.gl_mask_modes` on that grid, computed here when
+    ``None``; callers share one per grid across ``m``).  ``m_band=None``
+    (the default path) is the full band ``lmax_out + |m|``, i.e. every
+    ``M``: the same numbers as the two-SHT
+    :func:`~cmbcov.grid.spin_weighted_integrals_gl` to rounding, which is
+    what runs instead when :data:`_GL_PRODUCER` is ``"two_sht"``.  With an
+    ``m_band`` (term selection) the integrals are restricted to
+    ``|M - m| <= m_band``.
     """
     lmax_out = lmax - 1
-    if m_band is None:
+    if m_band is None and _GL_PRODUCER == "two_sht":
         u_t = spin_weighted_integrals_gl(mask_alm, lw, ell, m, lmax_out)
         if t_only:
             return u_t, None
         return u_t, spin_weighted_integrals_gl(mask_alm, lw, ell, m, lmax_out, spin=2)
+    if m_band is None:
+        m_band = lmax_out + abs(m)
     lg = _gl_banded_grid(lw, ell, lmax_out)
+    if mask_modes is None:
+        mask_modes = gl_mask_modes(mask_alm, lw, lg)
     u_t = banded_integrals_gl(
         mask_alm, lw, ell, m, lmax_out, m_band, lmax_grid=lg, mask_modes=mask_modes
     )
@@ -246,6 +289,43 @@ def _gl_integrals_m(
         mask_modes=mask_modes,
     )
     return u_t, u_eb
+
+
+def _reflect_into(
+    src: np.ndarray, m: int, out: np.ndarray, conjugate: bool = False
+) -> None:
+    r"""
+    Write the coefficients of order ``m < 0`` from those of ``|m|`` (one
+    field, full-``M`` layout ``[..., L, M + lmax_out]``) into ``out``:
+
+        ``I_{l,m,LM} = (-1)^(m+M) conj(I_{l,|m|,L,-M})``
+
+    (the reflection of :func:`_coefficient_provider`), or its complex
+    conjugate with ``conjugate=True``.  The one implementation of the
+    identity, so a set built with it (:func:`_gl_integrals`) and a provider
+    reflecting on the fly give the same bits.
+    """
+    lmax_out = (src.shape[-1] - 1) // 2
+    factor = ((-1.0) ** m) * (-1.0) ** np.arange(-lmax_out, lmax_out + 1)
+    if conjugate:
+        np.multiply(src[..., ::-1], factor, out=out)
+    else:
+        np.conjugate(src[..., ::-1], out=out)
+        out *= factor
+
+
+def _reflected_item(item: tuple, m: int) -> tuple:
+    """The ``(u_T, u_EB)`` item of order ``m < 0`` from the item of ``|m|``
+    (:func:`_reflect_into`, field by field)."""
+    reflected = []
+    for part in item:
+        if part is None:
+            reflected.append(None)
+            continue
+        out = np.empty_like(part)
+        _reflect_into(part, m, out)
+        reflected.append(out)
+    return tuple(reflected)
 
 
 def _gl_integrals(
@@ -267,31 +347,111 @@ def _gl_integrals(
 
     ``t_only=True`` skips the spin-2 synthesis and returns ``(u_T, None)``
     tuples instead -- the coefficient provider (:func:`_gl_full_m`) then never
-    touches the second element.  This is the dominant cost of the precompute
-    (~92% of the wall time at ``centralell=250``, ``nside=256``), so a caller
-    that only needs T-field kernels (``spectra=("TT",)``) skips it entirely.
+    touches the second element.  Spin 2 has two Legendre components against
+    one for T (on the two-SHT route it was ~92% of the precompute wall time
+    at ``centralell=250``, ``nside=256``), so a caller that only needs
+    T-field kernels (``spectra=("TT",)``) skips it entirely.
+
+    Default path (no ``keep_m``, no ``m_band``): the mask modes are computed
+    once for the grid of ``ell`` (unless given) and shared by every ``m``,
+    and only ``m >= 0`` is transformed -- the ``m < 0`` half is the
+    reflection :func:`_reflected_item`, exactly as a reflecting
+    :func:`_coefficient_provider` serves it, so a set held in RAM and one
+    synthesised on demand hold the same bits.
 
     ``keep_m`` (term selection, index ``m + ell``) leaves ``None`` at the
     orders that are not kept; the contraction never asks for them.
-    ``m_band`` / ``mask_modes`` are forwarded to :func:`_gl_integrals_m`.
+    ``m_band`` / ``mask_modes`` are forwarded to :func:`_gl_integrals_m`;
+    with a selection every kept ``m`` is transformed directly, as before.
     """
-    return [
-        (
-            _gl_integrals_m(
-                mask_alm,
-                lw,
-                ell,
-                m,
-                lmax,
-                t_only=t_only,
-                m_band=m_band,
-                mask_modes=mask_modes,
+    if keep_m is not None or m_band is not None:
+        return [
+            (
+                _gl_integrals_m(
+                    mask_alm,
+                    lw,
+                    ell,
+                    m,
+                    lmax,
+                    t_only=t_only,
+                    m_band=m_band,
+                    mask_modes=mask_modes,
+                )
+                if keep_m is None or keep_m[m + ell]
+                else None
             )
-            if keep_m is None or keep_m[m + ell]
-            else None
+            for m in range(-ell, ell + 1)
+        ]
+    if mask_modes is None and _GL_PRODUCER != "two_sht":
+        mask_modes = gl_mask_modes(mask_alm, lw, _gl_banded_grid(lw, ell, lmax - 1))
+    items: list[tuple | None] = [None] * (2 * ell + 1)
+    for m in range(ell + 1):
+        item = _gl_integrals_m(
+            mask_alm, lw, ell, m, lmax, t_only=t_only, mask_modes=mask_modes
         )
-        for m in range(-ell, ell + 1)
-    ]
+        items[ell + m] = item
+        if m > 0:
+            items[ell - m] = _reflected_item(item, -m)
+    return items
+
+
+#: Mask-mode grids a GL precompute keeps at once (:class:`_GLMaskModes`, and
+#: the term-selection plan's own cache): the central grid and the current
+#: primed one.
+_GL_MODE_GRIDS = 2
+
+
+class _GLMaskModes:
+    """
+    :func:`~cmbcov.grid.gl_mask_modes` of one mask alm, per GL grid, for the
+    default GL producer (:func:`_gl_integrals_m`).
+
+    ``modes(ell)`` returns the modes on the grid :func:`_gl_banded_grid`
+    ``(lw, ell, lmax_out)``, computing them on first use.  Grids depend on
+    ``ell`` only through ``ceil((lw + ell + lmax_out - 1) / 2)``, so the
+    central and a neighbouring primed multipole often share one; the cache
+    keeps the ``max_grids`` (default :data:`_GL_MODE_GRIDS`) most recently
+    used grids -- the central one and the current primed one on the
+    streamed path -- rather than one per ``ellp`` of a long ``ellprange``.
+    One grid is a complex ``(Lg + 1, 2 Lg + 2)`` array: 21.5 MB at ``Lg =
+    818`` (``nside = 256``, ``lw = 875``, ``ell = 250``), about 0.3 GB at
+    ``Lg = 3060``; the memory budget charges :data:`_GL_MODE_GRIDS` of the
+    largest (:func:`_gl_producer_bytes`).
+
+    The term-selection path keeps its own instance
+    (:meth:`_TermSelectionPlan.mask_modes`, pole-frame mask).
+    """
+
+    def __init__(
+        self,
+        mask_alm: np.ndarray,
+        lw: int,
+        lmax_out: int,
+        max_grids: int | None = None,
+    ) -> None:
+        self.mask_alm = mask_alm
+        self.lw = int(lw)
+        self.lmax_out = int(lmax_out)
+        self.max_grids = _GL_MODE_GRIDS if max_grids is None else int(max_grids)
+        self._modes: dict[int, np.ndarray] = {}
+
+    def matches(self, mask_alm: np.ndarray, lw: int, lmax_out: int) -> bool:
+        return (
+            self.mask_alm is mask_alm
+            and self.lw == int(lw)
+            and self.lmax_out == int(lmax_out)
+        )
+
+    def __call__(self, ell: int) -> np.ndarray:
+        lg = _gl_banded_grid(self.lw, ell, self.lmax_out)
+        modes = self._modes.pop(lg, None)
+        if modes is None:
+            modes = gl_mask_modes(self.mask_alm, self.lw, lg)
+            modes.setflags(write=False)
+        self._modes[lg] = modes  # most recently used last
+        while len(self._modes) > self.max_grids:
+            del self._modes[next(iter(self._modes))]
+        return modes
 
 
 def _union_selection(selections: Sequence[TermSelection]) -> TermSelection:
@@ -339,7 +499,9 @@ class _TermSelectionPlan:
     * ``m_band``: the ``|M - m|`` band, which depends only on the mask's
       azimuthal spectrum and is therefore one number for the whole run.
     * ``mask_modes(l)``: :func:`~cmbcov.grid.gl_mask_modes`
-      on the grid :func:`_gl_banded_grid` of ``l``, computed once per grid.
+      on the grid :func:`_gl_banded_grid` of ``l`` (a :class:`_GLMaskModes`
+      of the pole-frame alm: the :data:`_GL_MODE_GRIDS` most recently used
+      grids are kept, as on the default path, instead of one per ``ellp``).
     """
 
     def __init__(
@@ -359,7 +521,9 @@ class _TermSelectionPlan:
         self.tolerance = float(tolerance)
         self.spins: tuple[int, ...] = (0,) if t_only else (0, 2)
         self._selections: dict[tuple[int, int], TermSelection] = {}
-        self._modes: dict[int, np.ndarray] = {}
+        self._modes = _GLMaskModes(
+            self.mask_alm, self.lw, self.lmax_out, max_grids=_GL_MODE_GRIDS
+        )
         self.m_band = self.selection(ell, ell).m_band
 
     def selection(self, ell: int, ellp: int) -> TermSelection:
@@ -381,12 +545,7 @@ class _TermSelectionPlan:
         return self.selection(l_val, l_val).keep_m
 
     def mask_modes(self, l_val: int) -> np.ndarray:
-        lg = _gl_banded_grid(self.lw, l_val, self.lmax_out)
-        modes = self._modes.get(lg)
-        if modes is None:
-            modes = gl_mask_modes(self.mask_alm, self.lw, lg)
-            self._modes[lg] = modes
-        return modes
+        return self._modes(l_val)
 
     def stats(self, ell: int, ellp: int) -> dict:
         """The fractions kept at ``(ell, ellp)``, for the cache manifest."""
@@ -451,13 +610,106 @@ def _healpix_full_m(cma: np.ndarray, lmax: int, nfields: int = 3) -> np.ndarray:
     return full_from_pair(cma[0, :nfields], cma[1, :nfields], lmax - 1)
 
 
+class _CoefficientProvider:
+    """
+    Per-``m`` full-``M`` coefficients of one ``ell``; see
+    :func:`_coefficient_provider`, which builds it.
+
+    ``provider(i)`` returns the complex128 ``(nfields, lmax, 2*lmax-1)``
+    stack of ``m = i - ell`` as a new array; ``provider.into(i, out,
+    conjugate)`` writes it (or its complex conjugate) straight into ``out``
+    -- typically one ``m`` of a packed block (:func:`_pack_block`), a strided
+    view -- so the block is filled without an intermediate full-``M`` copy.
+    """
+
+    def __init__(self, held, synthesise, to_full_m, ell, reflect, fields, into):
+        self.held = held
+        self.synthesise = synthesise
+        self.to_full_m = to_full_m
+        self.ell = ell
+        self.reflect = reflect and held is None
+        self.fields = fields
+        self.into_fn = into
+        # One-entry cache of the +|m| fields, for the reflection (see
+        # _coefficient_provider).
+        self._cache: dict[int, Sequence[np.ndarray]] = {}
+
+    def _item(self, m: int):
+        if self.held is not None:
+            return self.held[m + self.ell]
+        return self.synthesise(m)
+
+    def _fields_of(self, item) -> Sequence[np.ndarray]:
+        """The per-field 2-D full-``M`` arrays of ``item``, without a copy
+        when the grid provides ``fields`` (GL); else ``to_full_m(item)``."""
+        if self.fields is not None:
+            return self.fields(item)
+        return self.to_full_m(item)
+
+    def _reflected_source(self, m: int) -> Sequence[np.ndarray]:
+        am = abs(m)
+        fields = self._cache.get(am)
+        if fields is None:
+            fields = self._fields_of(self.synthesise(am))
+            self._cache.clear()
+            self._cache[am] = fields
+        return fields
+
+    def into(self, i: int, out: np.ndarray, conjugate: bool = False) -> None:
+        """Write the coefficients of ``m = i - ell`` (conjugated if
+        ``conjugate``) into ``out``, shape ``(nfields, lmax, 2*lmax-1)``."""
+        m = i - self.ell
+        if not self.reflect:
+            item = self._item(m)
+            if self.into_fn is not None:
+                self.into_fn(item, out)
+                if conjugate:
+                    np.conjugate(out, out=out)
+                return
+            fields = self._fields_of(item)
+        else:
+            fields = self._reflected_source(m)
+        reflected = self.reflect and m < 0
+
+        def rows(r0: int, r1: int) -> None:
+            for f, src in enumerate(fields):
+                if reflected:
+                    # I_{l,-m,LM} = (-1)^(m+M) conj(I_{l,m,L,-M}), factor +-1.
+                    _reflect_into(src[r0:r1], m, out[f, r0:r1], conjugate)
+                elif conjugate:
+                    np.conjugate(src[r0:r1], out=out[f, r0:r1])
+                else:
+                    np.copyto(out[f, r0:r1], src[r0:r1])
+
+        # Memory-bound copies, split over L on the package's threads; the
+        # same elementwise operations, so the same bits as one thread.
+        run_row_blocks(
+            rows,
+            out.shape[1],
+            row_block_workers(out[0].size * len(fields), get_optimal_nthreads()),
+        )
+
+    def __call__(self, i: int) -> np.ndarray:
+        if not self.reflect:
+            item = self._item(i - self.ell)
+            if self.fields is None:
+                return self.to_full_m(item)
+            return np.stack(self._fields_of(item))
+        source = self._reflected_source(i - self.ell)
+        out = np.empty((len(source),) + source[0].shape, dtype=np.complex128)
+        self.into(i, out)
+        return out
+
+
 def _coefficient_provider(
     held: Sequence | None,
     synthesise: Callable[[int], object],
     to_full_m: Callable[[object], np.ndarray],
     ell: int,
     reflect: bool,
-) -> Callable[[int], np.ndarray]:
+    fields: Callable[[object], Sequence[np.ndarray]] | None = None,
+    into: Callable[[object, np.ndarray], object] | None = None,
+) -> _CoefficientProvider:
     """
     Per-``m`` coefficient provider shared by both grids.
 
@@ -475,42 +727,30 @@ def _coefficient_provider(
     ============  ==========================  ===========================
 
     so a held HEALPix set stays compact and is expanded (indexing only) when
-    an ``m`` is asked for.
+    an ``m`` is asked for.  Its ``into(i, out, conjugate)`` method writes the
+    same numbers straight into a destination (:func:`_pack_block`); the
+    optional ``fields`` (``item`` -> the ``nfields`` 2-D full-``M`` arrays it
+    already holds, GL) and ``into`` (``(item, out)`` -> fill ``out``,
+    HEALPix) let it do so without the intermediate stack ``to_full_m``
+    builds.  Neither changes a value.
 
     ``reflect=True`` (GL only) lets the synthesised case pay one transform per
     ``|m|``.  For a real mask
 
         ``I_{l,-m,LM} = (-1)^(m+M) conj(I_{l,m,L,-M})``
 
-    (both spins; verified bit-for-bit on the GL grid in
-    ``tests/test_acc_vectorised.py``), so the ``m < 0`` half is an index
-    reflection of the ``m > 0`` half.  Paired with the ``+m, -m`` iteration
-    order of :func:`_paired_m_order`, a one-entry cache turns that into half
-    the spherical-harmonic transforms.  The identity has not been verified on
+    (both spins; bit-for-bit on the two-SHT route,
+    ``tests/test_acc_vectorised.py``, and to rounding on the default
+    Legendre route, ``tests/test_acc_gl_producer.py``), so the ``m < 0`` half
+    is an index reflection of the ``m > 0`` half (:func:`_reflect_into`).
+    Paired with the ``+m, -m`` iteration order of :func:`_paired_m_order`, a
+    one-entry cache turns that into half the transforms; a held GL set
+    (:func:`_gl_integrals`) is built with the same reflection, so held and
+    synthesised coefficients are the same bits.  The identity has not been verified on
     the HEALPix grid (pixel quadrature, iterated ``map2alm``), so the HEALPix
     branch passes ``reflect=False`` and synthesises every ``m``.
     """
-    if held is not None:
-        return lambda i: to_full_m(held[i])
-    if not reflect:
-        return lambda i: to_full_m(synthesise(i - ell))
-
-    cache: dict[int, np.ndarray] = {}
-
-    def from_mask(i: int) -> np.ndarray:
-        m = i - ell
-        full = cache.get(abs(m))
-        if full is None:
-            full = to_full_m(synthesise(abs(m)))
-            cache.clear()
-            cache[abs(m)] = full
-        if m >= 0:
-            return full
-        lmax_out = (full.shape[-1] - 1) // 2
-        phase = (-1.0) ** np.arange(-lmax_out, lmax_out + 1)  # (-1)^M
-        return ((-1.0) ** m) * phase * np.conj(full[:, :, ::-1])
-
-    return from_mask
+    return _CoefficientProvider(held, synthesise, to_full_m, ell, reflect, fields, into)
 
 
 def _paired_m_order(n: int) -> list[int]:
@@ -529,43 +769,179 @@ def _paired_m_order(n: int) -> list[int]:
     return order
 
 
+def _block_array(
+    buffer: np.ndarray | None, nfields: int, lmax: int, n: int
+) -> np.ndarray:
+    """A C-contiguous complex128 ``(nfields, lmax, n, 2 lmax - 1)`` block:
+    new, or the leading entries of the flat ``buffer`` (reused for every
+    block of a contraction, :func:`_accumulate_coupling_kernels`)."""
+    shape = (nfields, lmax, n, 2 * lmax - 1)
+    if buffer is None:
+        return np.empty(shape, dtype=np.complex128)
+    size = math.prod(shape)
+    if buffer.dtype != np.complex128 or buffer.ndim != 1 or buffer.size < size:
+        raise ValueError(
+            f"block buffer must be flat complex128 with at least {size} entries"
+        )
+    return buffer[:size].reshape(shape)
+
+
 def _pack_block(
     coeff_fn: Callable[[int], np.ndarray],
     m_values: Sequence[int],
     lmax: int,
     conjugate: bool,
     nfields: int = 3,
+    out: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Gather the complex full-``M`` coefficients of a block of ``m`` into one
-    contiguous complex128 array, ``ncoef = 2 * lmax - 1``.
+    complex128 array, ``ncoef = 2 * lmax - 1``.
 
-    ``conjugate=False`` gives ``(nfields, lmax, len(m_values), ncoef)`` -- the
-    left operand of the per-``L`` GEMM.  ``conjugate=True`` gives the
-    conjugated transpose layout ``(nfields, lmax, ncoef, len(m_values))``, the
-    right operand.  Writing the conjugate straight into that layout avoids
-    ever holding two copies of a block.  ``nfields`` is 3 (T, E, B) except on
+    ``conjugate=False`` gives the C-contiguous ``(nfields, lmax,
+    len(m_values), ncoef)`` -- the left operand of the per-``L`` GEMM.
+    ``conjugate=True`` gives the right operand, the conjugated coefficients
+    with shape ``(nfields, lmax, ncoef, len(m_values))``, as the transposed
+    view of a C-contiguous ``(nfields, lmax, len(m_values), ncoef)`` array.
+    Either way every ``m`` is written as ``nfields * lmax`` contiguous rows:
+    filling the transposed layout directly scattered each ``m`` over the
+    whole block with a stride of ``len(m_values)`` elements, which on a
+    wide block (the primed side is the wide outer block once the central
+    set is held or stored) touched every page of it per ``m``.  ``np.matmul``
+    passes the transposed operand to BLAS as such, without a copy (measured
+    bit-identical to the contiguous layout on Accelerate).
+
+    A :class:`_CoefficientProvider` writes each ``m`` straight into its slot
+    of the block (:meth:`_CoefficientProvider.into`); a plain callable is
+    copied from.  ``nfields`` is 3 (T, E, B) except on
     the T-only path (``spectra=("TT",)``, providers built with
-    ``t_only=True``), where it is 1.
+    ``t_only=True``), where it is 1.  ``out``, a flat complex128 buffer,
+    receives the block in its leading entries instead of a new array
+    (:func:`_block_array`).
     """
     n = len(m_values)
-    ncoef = 2 * lmax - 1
-    shape = (nfields, lmax, ncoef, n) if conjugate else (nfields, lmax, n, ncoef)
-    block = np.empty(shape, dtype=np.complex128)
+    block = _block_array(out, nfields, lmax, n)
+    into = getattr(coeff_fn, "into", None)
     for i, m in enumerate(m_values):
+        if into is not None:
+            into(m, block[:, :, i, :], conjugate)
+            continue
         fields = coeff_fn(m)
         for f in range(nfields):
             if conjugate:
-                block[f, :, :, i] = np.conj(fields[f])
+                np.conjugate(fields[f], out=block[f, :, i, :])
             else:
                 block[f, :, i, :] = fields[f]
-    return block
+    return block.transpose(0, 1, 3, 2) if conjugate else block
 
 
 #: ``(max_bytes, floor)`` pairs already warned about by
 #: :func:`_coupling_block_sizes`: the precompute asks once per ``(ell, ellp)``
 #: pair, always with the same numbers.
 _WARNED_MEMORY_FLOORS: set = set()
+
+#: Transient bytes per ``nside`` pixel of one HEALPix integral set
+#: (:meth:`~cmbcov.mask.MaskWlm.compute_spin_weighted_integrals`: the
+#: spin-weighted ``Y_lm`` maps, their product with the mask, the real and
+#: imaginary parts and the ``map2alm`` residuals).  Measured 186 B per pixel
+#: with ``tracemalloc`` at ``nside`` 16 and 32; rounded up for the ``ducc0``
+#: scratch that ``tracemalloc`` does not see.
+_HEALPIX_PRODUCER_BYTES_PER_PIXEL = 256
+
+
+def _gl_producer_bytes(lw: int, lmax: int, ells: Iterable[int], nfields: int) -> int:
+    """
+    What the GL coefficient producer holds while it builds a block, beyond
+    the block itself (:func:`_coupling_working_set`, ``producer``):
+
+    * three per-``m`` coefficient sets, ``per_m`` each -- the order being
+      synthesised (:func:`_gl_integrals_m`), the one-entry ``+|m|`` cache of
+      the provider building the block, and the cache of the other side's
+      provider on the streamed path (:func:`_coefficient_provider`);
+    * the legs of one :func:`~cmbcov.grid.banded_integrals_gl` call,
+      ``ncomp * ntheta * lmax`` complex (``ncomp`` 2 for spin 2);
+    * the mask modes of :data:`_GL_MODE_GRIDS` grids, ``ntheta * nphi``
+      complex each.
+
+    ``ells`` are the multipoles whose grids may be resident (``ell`` and
+    ``ellp``); the largest grid is charged.
+    """
+    lmax_out = lmax - 1
+    lg = max(_gl_banded_grid(lw, int(l_val), lmax_out) for l_val in ells)
+    ntheta, nphi = lg + 1, 2 * lg + 2  # grid.gl_shape
+    itemsize = np.dtype(np.complex128).itemsize
+    per_m = nfields * lmax * (2 * lmax - 1) * itemsize
+    legs = (1 if nfields == 1 else 2) * ntheta * lmax * itemsize
+    modes = _GL_MODE_GRIDS * ntheta * nphi * itemsize
+    return 3 * per_m + legs + modes
+
+
+def _healpix_producer_bytes(nside: int, lmax: int, nfields: int) -> int:
+    """The HEALPix counterpart of :func:`_gl_producer_bytes`: the transients
+    of one :meth:`~cmbcov.mask.MaskWlm.compute_spin_weighted_integrals`
+    call (:data:`_HEALPIX_PRODUCER_BYTES_PER_PIXEL`) plus one full-``M``
+    stack (the provider reflects nothing on this grid, so keeps no cache)."""
+    per_m = nfields * lmax * (2 * lmax - 1) * np.dtype(np.complex128).itemsize
+    return _HEALPIX_PRODUCER_BYTES_PER_PIXEL * 12 * nside**2 + per_m
+
+
+def _coupling_working_set(
+    n_outer: int,
+    n_inner: int,
+    lmax: int,
+    per_m: int,
+    per_pair: int,
+    nspec: int,
+    inner_copies: int = 1,
+    producer_bytes: int | None = None,
+) -> dict[str, int]:
+    """
+    The peak resident bytes the blocked contraction
+    (:func:`_accumulate_coupling_kernels`) is charged for, term by term, with
+    outer blocks of ``n_outer`` orders and inner blocks of ``n_inner``:
+
+    ``kernels``
+        the ``(nspec, nspec, lmax, lmax)`` float64 accumulator, plus the one
+        ``lmax x lmax`` gram being added into it
+        (:func:`contract_coupling_block` with ``out``).
+    ``outer``
+        the outer coefficient block, ``n_outer * per_m``.
+    ``inner``
+        ``inner_copies`` inner blocks (2 when the next one is read ahead),
+        ``inner_copies * n_inner * per_m``.
+    ``theta``
+        ``n_outer * n_inner * per_pair``: ``per_pair`` is the ``Theta`` bytes
+        of one ``(m, m')`` pair, i.e. ``(nchannels + 1) * lmax * 16`` -- the
+        float ``(Re, Im)`` slab of every channel plus the complex channel
+        being converted into it.
+    ``producer``
+        what the coefficient producer holds beyond the block it fills
+        (:func:`_gl_producer_bytes`, :func:`_healpix_producer_bytes`);
+        ``None`` charges three per-``m`` sets, the GL figure without its
+        legs and mask modes.
+    ``total``
+        the sum.  An upper bound: the producer only runs between
+        contractions, and while an outer block is built at most one inner
+        block is resident, but every term is charged as if all were
+        resident at once.
+
+    Not charged here, because the caller charges or excludes them: a central
+    set held in RAM, and primed sets kept for a later ``ellp`` (subtracted
+    from the budget before the contraction is planned,
+    :meth:`_CouplingPrecompute._compute_ellp_coupling`), and the fixed
+    baseline of :func:`precompute_acc_kernels` (``max_memory_gb``).
+    """
+    if producer_bytes is None:
+        producer_bytes = 3 * per_m
+    terms = {
+        "kernels": (nspec * nspec + 1) * lmax * lmax * 8,
+        "outer": n_outer * per_m,
+        "inner": inner_copies * n_inner * per_m,
+        "theta": n_outer * n_inner * per_pair,
+        "producer": int(producer_bytes),
+    }
+    terms["total"] = sum(terms.values())
+    return terms
 
 
 def _coupling_block_sizes(
@@ -576,44 +952,48 @@ def _coupling_block_sizes(
     per_pair: int,
     max_bytes: int,
     nspec: int | None = None,
-    npairs: int | None = None,
+    inner_copies: int = 1,
+    producer_bytes: int | None = None,
 ) -> tuple[int, int]:
     """
-    Block widths ``(nb, nbp)`` over ``m`` and ``m'`` for the contraction.
+    Block widths ``(nb, nbp)`` over the outer and the inner side of the
+    contraction, ``n_m`` and ``n_mp`` orders long: the blocking with the
+    fewest passes whose :func:`_coupling_working_set` fits ``max_bytes``.
 
-    The working set of one ``(m, m')`` block pair is
+    ``inner_copies`` is how many inner blocks are resident at once: 1, or 2
+    when the next inner block is read ahead while the current one is
+    contracted (:func:`_accumulate_coupling_kernels`, primed-outer order).
+    ``per_pair`` and ``producer_bytes`` are as in
+    :func:`_coupling_working_set`; ``nspec`` (the side of the output
+    accumulator) defaults to all of :data:`COUPLING_SPECTRA`, i.e. 5.
 
-        ``(nb + nbp) * per_m``    the two coefficient blocks
-        ``+ nb * nbp * per_pair`` the Theta slab and its real/imaginary copies
+    The function is symmetric in what the two sides hold; which one is
+    outer is the caller's choice (:func:`_accumulate_coupling_kernels`): the
+    central ``m`` on the streamed path, the primed ``m'`` when the central
+    set can be re-read (held in RAM or in the disk store).  Below, "central"
+    means outer and "primed" inner.
 
-    on top of the ``npairs`` output kernels that are always resident
-    (``npairs`` defaults to ``nspec**2``, the full square; a caller that
-    restricts the precompute to an explicit list of ordered pairs
-    (:func:`precompute_acc_kernels`, ``pairs=``) passes the smaller actual
-    count -- what is resident is the requested *pairs*, not ``nspec**2``).
-    ``nspec`` defaults to all of :data:`COUPLING_SPECTRA`, i.e. 5; a caller
-    that requested a subset via ``spectra`` passes the smaller count. The
-    primed block is the inner loop and is rebuilt once per central block, so
-    the budget is spent on ``nb`` first and ``nbp`` is held at
-    :data:`_PRIME_BLOCK_TARGET` (halved only if even that will not fit, or if
-    the halving buys enough central width to cut the number of block passes;
-    choosing by passes keeps the blocking monotonic in the budget).  When
-    everything fits, both blocks cover the whole range and the contraction is a
-    single pass.
+    The primed block is the inner loop and is revisited (rebuilt or re-read)
+    once per central block, so the budget is spent on ``nb`` first and
+    ``nbp`` is held at :data:`_INNER_BLOCK_TARGET` (halved only if even that
+    will not fit, or if the halving buys enough central width to cut the
+    number of block passes; choosing by passes keeps the blocking monotonic
+    in the budget).  When everything fits, both blocks cover the whole range
+    and the contraction is a single pass.
 
-    There is a hard floor -- the output kernels plus one ``m`` on each side.
+    There is a hard floor -- the working set with one ``m`` on each side.
     A budget below it cannot be honoured; the smallest blocking is used anyway
     and a :class:`UserWarning` reports what the run will actually need.
     """
     if nspec is None:
         nspec = len(COUPLING_SPECTRA)
-    if npairs is None:
-        npairs = nspec**2
-    # The output kernels, plus the one-entry +m cache each side's provider
-    # may keep (see _coefficient_provider), are resident for the whole
-    # contraction.
-    reserve = npairs * lmax * lmax * 8 + 2 * per_m
-    floor = reserve + 2 * per_m + per_pair
+
+    def working_set(nb, nbp):
+        return _coupling_working_set(
+            nb, nbp, lmax, per_m, per_pair, nspec, inner_copies, producer_bytes
+        )
+
+    floor = working_set(1, 1)["total"]
     if max_bytes < floor:
         if (max_bytes, floor) in _WARNED_MEMORY_FLOORS:
             return 1, 1
@@ -621,16 +1001,20 @@ def _coupling_block_sizes(
         warnings.warn(
             f"coupling memory budget of {max_bytes / 1024**2:.1f} MiB is below "
             f"the {floor / 1024**2:.1f} MiB this (ell, ellp, lmax) needs for "
-            "the output kernels and one m on each side; proceeding with "
-            "single-m blocks (warned once per process for this budget)",
+            "the output kernels, the coefficient producer and one m on each "
+            "side; proceeding with single-m blocks (warned once per process "
+            "for this budget)",
             UserWarning,
             stacklevel=2,
         )
         return 1, 1
-    avail = max_bytes - reserve
+    # Everything that does not scale with the block widths.
+    avail = max_bytes - working_set(0, 0)["total"]
 
     def widest_nb(nbp):
-        rest = avail - nbp * per_m
+        # The largest nb with working_set(nb, nbp) <= max_bytes: the terms
+        # are linear in nb at fixed nbp.
+        rest = avail - inner_copies * nbp * per_m
         return min(n_m, int(rest // (per_m + nbp * per_pair))) if rest > 0 else 0
 
     # Candidate primed widths: the target and its halvings, plus -- only with
@@ -639,7 +1023,7 @@ def _coupling_block_sizes(
     # with the fewest passes (ties: fewest central blocks, then the widest
     # nbp) is monotonic in the budget; keeping only the first nbp that fits
     # was not.
-    nbp = min(n_mp, _PRIME_BLOCK_TARGET)
+    nbp = min(n_mp, _INNER_BLOCK_TARGET)
     candidates = []
     trial = nbp
     while True:
@@ -650,7 +1034,7 @@ def _coupling_block_sizes(
     trial = nbp
     while trial < n_mp:
         trial = min(n_mp, 2 * trial)
-        if (n_m + trial) * per_m + n_m * trial * per_pair > avail:
+        if working_set(n_m, trial)["total"] > max_bytes:
             break
         candidates.append((trial, n_m))
 
@@ -676,6 +1060,7 @@ def contract_coupling_block(
     pair_mask=None,
     xp=np,
     output_pairs: Sequence[tuple[int, int]] | None = None,
+    out=None,
 ):
     r"""
     The contraction of one ``(m, m')`` block of the ACC precompute: the
@@ -696,7 +1081,8 @@ def contract_coupling_block(
         the block (:func:`_pack_block` with ``conjugate=False``).
     right : array
         ``(nfields, lmax, ncoef, nbj)`` complex, the **conjugated** primed
-        coefficients (:func:`_pack_block` with ``conjugate=True``).
+        coefficients (:func:`_pack_block` with ``conjugate=True``, a
+        transposed view; any strides ``matmul`` accepts).
     central_field, prime_field : sequence of int
         Field index ``(T, E, B) = (0, 1, 2)`` of the central and primed leg
         of every output channel (:data:`_CENTRAL_FIELD` / :data:`_PRIME_FIELD`
@@ -722,12 +1108,20 @@ def contract_coupling_block(
         intended GPU path; the producers of the coefficients (the SHTs and
         banded Legendre transforms of :mod:`cmbcov.grid`)
         stay on the CPU and the blocks are moved over one at a time.
+    out : ndarray, optional
+        numpy only: a ``(nspec, nspec, lmax, lmax)`` float64 accumulator the
+        increment is added into, one gram at a time, instead of being
+        returned as a new array -- what :func:`_accumulate_coupling_kernels`
+        uses, so that the only kernel-sized transient is one ``lmax x lmax``
+        gram rather than the stacked increment and its rows.  ``out +=
+        increment`` elementwise either way, so the result is bit-identical.
 
     Returns
     -------
     array
         ``(nspec, nspec, lmax, lmax)`` float64 kernel increment, ``[s1, s2]``
-        for ``s2 < s1`` the transpose of ``[s2, s1]``.
+        for ``s2 < s1`` the transpose of ``[s2, s1]``; with ``out``, ``out``
+        after the increment has been added.
 
     Notes
     -----
@@ -762,6 +1156,24 @@ def contract_coupling_block(
         # (Re, Im) interleaved along the flattened (m, m') axis.
         return xp.stack((theta.real, theta.imag), axis=-1).reshape(lmax, 2 * npair)
 
+    if out is not None:
+        # numpy accumulation: the same grams, added into out as they come.
+        if output_pairs is None:
+            flats = [theta_flat(k) for k in range(nspec)]
+            for k1 in range(nspec):
+                for k2 in range(k1, nspec):
+                    gram = xp.matmul(flats[k1], flats[k2].T)
+                    out[k1, k2] += gram
+                    if k2 != k1:
+                        out[k2, k1] += gram.T
+                    del gram
+            return out
+        needed = sorted({k for pair in output_pairs for k in pair})
+        flat_of = {k: theta_flat(k) for k in needed}
+        for k1, k2 in dict.fromkeys(output_pairs):
+            out[k1, k2] += xp.matmul(flat_of[k1], flat_of[k2].T)
+        return out
+
     if output_pairs is None:
         flats = [theta_flat(k) for k in range(nspec)]
         blocks: list[list] = [[None] * nspec for _ in range(nspec)]
@@ -784,6 +1196,166 @@ def contract_coupling_block(
     return out
 
 
+def _contiguous_runs(positions: Sequence[int]) -> Iterator[tuple[int, int, int]]:
+    """``(source start, destination start, length)`` of the maximal runs of
+    consecutive ascending values in ``positions``."""
+    start = 0
+    for k in range(1, len(positions) + 1):
+        if k == len(positions) or positions[k] != positions[k - 1] + 1:
+            yield positions[start], start, k - start
+            start = k
+
+
+class _CentralStore:
+    r"""
+    The central (``ell``) full-``M`` coefficient set of one precompute,
+    built once and kept in a file on disk, for a set that does not fit the
+    memory budget (:meth:`_CouplingPrecompute.compute`).
+
+    The file holds a complex128 ``(nfields, lmax, n, ncoef)`` array -- the
+    left-operand layout of :func:`_pack_block` -- whose third axis runs over
+    ``order``, the kept orders in the paired ``+m, -m`` order the contraction
+    iterates in, so that reading a block of consecutive orders is
+    ``nfields * lmax`` contiguous reads of ``len(block) * ncoef`` values each,
+    straight into the destination.  Plain ``pread``/``pwrite`` rather than a
+    ``np.memmap``, so what the process holds is only the blocks it reads, and
+    the file is kept out of the OS file cache (``F_NOCACHE`` on macOS,
+    ``POSIX_FADV_DONTNEED`` after each fill and read elsewhere): every
+    ``ellp`` reads it whole, once per outer block, so caching it buys little
+    and, at 11.7 GiB next to a working set of the same size, pushed the
+    machine into memory compression (survey mask, ``centralell = 250``,
+    ``nside = 256``, 12 GiB budget, one run each on a shared 36 GB laptop:
+    cached, 147 s of system time and ``Theta`` GEMMs at 0.56 s per call;
+    uncached, with the read-ahead of :func:`_accumulate_coupling_kernels`,
+    37 s and 0.13 s).
+
+    ``directory`` is created by the caller (a fresh temporary directory) and
+    is removed, with the file, by :meth:`close`.
+    """
+
+    FILENAME = "central_full_m.bin"
+
+    def __init__(
+        self,
+        directory: str,
+        order: Sequence[int],
+        nfields: int,
+        lmax: int,
+    ) -> None:
+        self.directory = directory
+        self.path = os.path.join(directory, self.FILENAME)
+        self.order = list(order)
+        self.position = {i: p for p, i in enumerate(self.order)}
+        self.n = len(self.order)
+        self.nfields = int(nfields)
+        self.lmax = int(lmax)
+        self.ncoef = 2 * self.lmax - 1
+        self.itemsize = np.dtype(np.complex128).itemsize
+        self.nbytes = self.nfields * self.lmax * self.n * self.ncoef * self.itemsize
+        self._fd: int | None = os.open(
+            self.path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600
+        )
+        os.ftruncate(self._fd, self.nbytes)
+        if _F_NOCACHE is not None:
+            fcntl.fcntl(self._fd, _F_NOCACHE, 1)
+
+    def _drop_cache(self) -> None:
+        """Advise the OS to drop the file's cached pages (not macOS, where
+        ``F_NOCACHE`` keeps them out in the first place)."""
+        if _F_NOCACHE is None and hasattr(os, "posix_fadvise"):
+            os.posix_fadvise(self._fd, 0, 0, os.POSIX_FADV_DONTNEED)
+
+    def _offset(self, f: int, L: int, p: int) -> int:
+        return ((f * self.lmax + L) * self.n + p) * self.ncoef * self.itemsize
+
+    def _write(self, buf: np.ndarray, offset: int) -> None:
+        view = memoryview(buf.reshape(-1).view(np.uint8))
+        while len(view):
+            done = os.pwrite(self._fd, view, offset)
+            view = view[done:]
+            offset += done
+
+    def _read_into(self, buf: np.ndarray, offset: int) -> None:
+        if not buf.flags.c_contiguous:  # reshape would read into a copy
+            raise ValueError("the central store reads into contiguous buffers only")
+        view = memoryview(buf.reshape(-1).view(np.uint8))
+        while len(view):
+            if hasattr(os, "preadv"):
+                done = os.preadv(self._fd, [view], offset)
+            else:  # pragma: no cover - platforms without preadv
+                data = os.pread(self._fd, len(view), offset)
+                done = len(data)
+                view[:done] = data
+            if done == 0:
+                raise OSError(f"short read from the central store {self.path}")
+            view = view[done:]
+            offset += done
+
+    def fill(self, provider: Callable[[int], np.ndarray], chunk: int) -> None:
+        """Synthesise every order once, ``chunk`` at a time
+        (:func:`_pack_block`, into one buffer reused for every chunk), and
+        write it to the file."""
+        chunk = max(1, min(int(chunk), self.n))
+        buffer = np.empty(
+            chunk * self.nfields * self.lmax * self.ncoef, dtype=np.complex128
+        )
+        for p0 in range(0, self.n, chunk):
+            block = _pack_block(
+                provider,
+                self.order[p0 : p0 + chunk],
+                self.lmax,
+                conjugate=False,
+                nfields=self.nfields,
+                out=buffer,
+            )
+            for f in range(self.nfields):
+                for L in range(self.lmax):
+                    self._write(block[f, L], self._offset(f, L, p0))
+            del block
+        if _F_NOCACHE is None and hasattr(os, "posix_fadvise"):
+            os.fsync(self._fd)  # dirty pages are not dropped
+            self._drop_cache()
+
+    def left(self, rows: Sequence[int], out: np.ndarray | None = None) -> np.ndarray:
+        """The ``(nfields, lmax, len(rows), ncoef)`` block of the orders
+        ``rows`` (indices ``m + ell``) -- :func:`_pack_block`'s
+        ``conjugate=False`` layout -- read from the file, into the leading
+        entries of the flat buffer ``out`` when given."""
+        positions = [self.position[i] for i in rows]
+        out = _block_array(out, self.nfields, self.lmax, len(rows))
+        for p0, q0, k in _contiguous_runs(positions):
+            for f in range(self.nfields):
+                for L in range(self.lmax):
+                    self._read_into(out[f, L, q0 : q0 + k], self._offset(f, L, p0))
+        self._drop_cache()
+        return out
+
+    def right(self, cols: Sequence[int], out: np.ndarray | None = None) -> np.ndarray:
+        """The conjugated ``(nfields, lmax, ncoef, len(cols))`` block of the
+        orders ``cols`` -- :func:`_pack_block`'s ``conjugate=True`` form, a
+        transposed view -- for ``ell == ellp``: :meth:`left`, conjugated in
+        place."""
+        out = self.left(cols, out)
+        rows = out.reshape(self.nfields * self.lmax, -1)  # a view
+
+        def conjugate(r0: int, r1: int) -> None:
+            np.conjugate(rows[r0:r1], out=rows[r0:r1])
+
+        run_row_blocks(
+            conjugate,
+            rows.shape[0],
+            row_block_workers(out.size, get_optimal_nthreads()),
+        )
+        return out.transpose(0, 1, 3, 2)
+
+    def close(self) -> None:
+        """Close and delete the file and its directory (idempotent)."""
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+
 def _accumulate_coupling_kernels(
     central_fn: Callable[[int], np.ndarray],
     n_m: int,
@@ -798,6 +1370,9 @@ def _accumulate_coupling_kernels(
     keep_mp: np.ndarray | None = None,
     pair_mask: np.ndarray | None = None,
     output_pairs: Sequence[tuple[int, int]] | None = None,
+    central_reader: Callable[[Sequence[int], np.ndarray], np.ndarray] | None = None,
+    prime_reader: Callable[[Sequence[int], np.ndarray], np.ndarray] | None = None,
+    producer_bytes: int | None = None,
 ) -> np.ndarray:
     r"""
     The whole ACC precompute for one ``(ell, ellp)`` pair, as blocked BLAS.
@@ -864,8 +1439,32 @@ def _accumulate_coupling_kernels(
     accumulated to an explicit list of ordered channel pairs -- see
     :func:`contract_coupling_block`.  ``None`` (default) is the full square,
     bit-identical to before this argument existed; it also narrows the
-    memory-budget accounting (:func:`_coupling_block_sizes`) to the channels
-    and pairs actually resident, instead of ``nspec`` and ``nspec**2``.
+    ``Theta`` term of the memory-budget accounting
+    (:func:`_coupling_block_sizes`) to the channels actually built (the
+    accumulator is the full ``nspec x nspec`` square either way).
+
+    **Memory.**  ``max_bytes`` bounds :func:`_coupling_working_set` of the
+    chosen blocking: the accumulator and one gram, the resident coefficient
+    blocks, the ``Theta`` slab and ``producer_bytes`` (what the coefficient
+    producer holds beyond the block it fills; ``None`` charges three
+    per-``m`` sets).  Each block's increment is added into the accumulator
+    gram by gram (:func:`contract_coupling_block`, ``out``).
+
+    **Loop order.**  With ``central_reader=None`` (the streamed path: every
+    coefficient comes from a provider that synthesises it) the central
+    blocks are the outer loop and every primed block is rebuilt once per
+    central block.  A ``central_reader`` -- ``(rows, out) -> left block``
+    (:func:`_pack_block`'s ``conjugate=False`` layout, written into the flat
+    buffer ``out``), for a central set
+    that is cheap to re-read (held in RAM, or :class:`_CentralStore` on
+    disk) -- swaps the loops: the primed blocks are the outer loop, so every
+    primed coefficient is synthesised exactly once, and the central blocks
+    are re-read inside, alternately forwards and backwards, one block read
+    ahead in a helper thread (the budget is charged for two central blocks,
+    :func:`_coupling_block_sizes` ``inner_copies=2``).  ``prime_reader`` (``(cols, out) -> right block``,
+    ``conjugate=True`` layout) likewise serves the primed side, for
+    ``ell == ellp`` from the store.  Only the summation order of the
+    kernels changes, i.e. the result agrees to rounding.
 
     Returns
     -------
@@ -899,71 +1498,172 @@ def _accumulate_coupling_kernels(
                 f"pair_mask must have shape {(n_m, n_mp)}; got {pair_mask.shape}"
             )
 
-    # What is actually resident: with an explicit pair list, only the
-    # channels it references (Theta) and the pairs themselves (output
-    # kernels); the full square otherwise (unchanged behaviour).
+    # Theta is built only for the channels an explicit pair list references
+    # (all of them otherwise); the accumulator is always the full square.
     if output_pairs is not None:
         n_channels_used = len({k for pair in output_pairs for k in pair})
-        n_pairs_used = len(output_pairs)
     else:
         n_channels_used = nspec
-        n_pairs_used = nspec * nspec
 
     per_m = nfields * lmax * ncoef * itemsize
     # The float (Re, Im) slab of Theta, (n_channels_used, lmax, 2 nb nbp)
-    # float64 -- the same bytes as the complex slab -- plus, transiently, one
-    # complex channel of Theta while it is being built
-    # (contract_coupling_block).
-    per_pair = n_channels_used * lmax * itemsize
-    nb, nbp = _coupling_block_sizes(
-        n_kept,
-        n_kept_p,
+    # float64 -- the same bytes as the complex slab -- plus the one complex
+    # channel of Theta being converted into it (contract_coupling_block).
+    per_pair = (n_channels_used + 1) * lmax * itemsize
+    primed_outer = central_reader is not None
+    # _coupling_block_sizes returns (outer width, inner width).  Primed
+    # outer, the next central block is read ahead: two resident at once.
+    inner_copies = 2 if primed_outer else 1
+    outer, inner = _coupling_block_sizes(
+        n_kept_p if primed_outer else n_kept,
+        n_kept if primed_outer else n_kept_p,
         lmax,
         per_m,
         per_pair,
         max_bytes,
-        nspec=n_channels_used,
-        npairs=n_pairs_used,
+        nspec=nspec,
+        inner_copies=inner_copies,
+        producer_bytes=producer_bytes,
     )
+    nb, nbp = (inner, outer) if primed_outer else (outer, inner)
 
     if verbose:
-        peak = (nb + nbp + 2) * per_m + nb * nbp * per_pair + n_pairs_used * lmax**2 * 8
+        plan = _coupling_working_set(
+            outer, inner, lmax, per_m, per_pair, nspec, inner_copies, producer_bytes
+        )
+        detail = ", ".join(
+            f"{name} {plan[name] / 1024**3:.2f}"
+            for name in ("outer", "inner", "theta", "kernels", "producer")
+        )
+        if primed_outer:
+            print(
+                f"  contraction blocking: m' in {nbp}-blocks "
+                f"({-(-n_kept_p // nbp)} of them, outer, built once), "
+                f"m in {nb}-blocks ({-(-n_kept // nb)} of them, re-read)"
+            )
+        else:
+            print(
+                f"  contraction blocking: m in {nb}-blocks "
+                f"({-(-n_kept // nb)} of them), "
+                f"m' in {nbp}-blocks ({-(-n_kept_p // nbp)} of them)"
+            )
         print(
-            f"  contraction blocking: m in {nb}-blocks ({-(-n_kept // nb)} of them), "
-            f"m' in {nbp}-blocks ({-(-n_kept_p // nbp)} of them); "
-            f"estimated peak {peak / 1024**3:.2f} GiB"
+            f"  planned working set {plan['total'] / 1024**3:.2f} of "
+            f"{max_bytes / 1024**3:.2f} GiB ({detail} GiB)"
         )
 
     central_fields = [_CENTRAL_FIELD[k] for k in spec_indices]
     prime_fields = [_PRIME_FIELD[k] for k in spec_indices]
 
+    # Every block is written into one of these buffers, allocated once here
+    # (the plan's "outer" and "inner" terms) rather than per block: freeing
+    # a multi-GiB block per pass and allocating the next let the system
+    # allocator keep the freed ones (macOS caches large blocks), which
+    # pushed the footprint to about twice a 6 GiB budget on the survey mask.
+    entries_per_m = nfields * lmax * ncoef
+    outer_buffer = np.empty(outer * entries_per_m, dtype=np.complex128)
+    inner_buffers = [
+        np.empty(inner * entries_per_m, dtype=np.complex128)
+        for _ in range(inner_copies)
+    ]
+    right_buffer = outer_buffer if primed_outer else inner_buffers[0]
+
+    def pack_right(cols):
+        if prime_reader is not None:
+            return prime_reader(cols, right_buffer)
+        return _pack_block(
+            prime_fn, cols, lmax, conjugate=True, nfields=nfields, out=right_buffer
+        )
+
+    def block_mask_of(rows, cols):
+        """``(skip, mask)`` of one block pair under term selection."""
+        if pair_mask is None:
+            return False, None
+        mask = pair_mask[np.ix_(rows, cols)]
+        if not mask.any():
+            return True, None
+        return False, (None if mask.all() else mask)
+
     out = np.zeros((nspec, nspec, lmax, lmax))
     skipped = 0
-    for i0 in range(0, n_kept, nb):
-        rows = m_order[i0 : i0 + nb]
-        left = _pack_block(central_fn, rows, lmax, conjugate=False, nfields=nfields)
+    if not primed_outer:
+        for i0 in range(0, n_kept, nb):
+            rows = m_order[i0 : i0 + nb]
+            left = _pack_block(
+                central_fn,
+                rows,
+                lmax,
+                conjugate=False,
+                nfields=nfields,
+                out=outer_buffer,
+            )
 
-        for j0 in range(0, n_kept_p, nbp):
-            cols = mp_order[j0 : j0 + nbp]
-            block_mask = None
-            if pair_mask is not None:
-                block_mask = pair_mask[np.ix_(rows, cols)]
-                if not block_mask.any():
+            for j0 in range(0, n_kept_p, nbp):
+                cols = mp_order[j0 : j0 + nbp]
+                skip, block_mask = block_mask_of(rows, cols)
+                if skip:
                     skipped += 1
                     continue
-                if block_mask.all():
-                    block_mask = None
-            right = _pack_block(prime_fn, cols, lmax, conjugate=True, nfields=nfields)
-            out += contract_coupling_block(
-                left,
-                right,
-                central_fields,
-                prime_fields,
-                block_mask,
-                output_pairs=output_pairs,
-            )
-            del right
-        del left
+                right = pack_right(cols)
+                contract_coupling_block(
+                    left,
+                    right,
+                    central_fields,
+                    prime_fields,
+                    block_mask,
+                    output_pairs=output_pairs,
+                    out=out,
+                )
+                del right
+            del left
+    else:
+        inner_starts = list(range(0, n_kept, nb))
+        reads = 0  # central blocks read so far: they alternate between buffers
+
+        def read_next(rows):
+            nonlocal reads
+            buffer = inner_buffers[reads % inner_copies]
+            reads += 1
+            return reader.submit(central_reader, rows, buffer)
+
+        # One reader thread keeps the next central block coming while the
+        # current one is contracted (preadv, the copies and the BLAS calls
+        # all release the GIL); the first read of each pass also overlaps
+        # the synthesis of the primed block.
+        with ThreadPoolExecutor(max_workers=1) as reader:
+            for jb, j0 in enumerate(range(0, n_kept_p, nbp)):
+                cols = mp_order[j0 : j0 + nbp]
+                # Serpentine over the central blocks: the last block read in
+                # one pass is the first of the next.
+                starts = inner_starts[::-1] if jb % 2 else inner_starts
+                tasks = []
+                for i0 in starts:
+                    rows = m_order[i0 : i0 + nb]
+                    skip, block_mask = block_mask_of(rows, cols)
+                    if skip:
+                        skipped += 1
+                    else:
+                        tasks.append((rows, block_mask))
+                if not tasks:
+                    continue  # the primed block is never packed
+                pending = read_next(tasks[0][0])
+                right = pack_right(cols)
+                for k, (_, block_mask) in enumerate(tasks):
+                    left = pending.result()
+                    # Into the other buffer: the one read two blocks ago,
+                    # whose contraction has returned.
+                    pending = read_next(tasks[k + 1][0]) if k + 1 < len(tasks) else None
+                    contract_coupling_block(
+                        left,
+                        right,
+                        central_fields,
+                        prime_fields,
+                        block_mask,
+                        output_pairs=output_pairs,
+                        out=out,
+                    )
+                    del left
+                del right
 
     if verbose and pair_mask is not None:
         n_blocks = -(-n_kept // nb) * -(-n_kept_p // nbp)
@@ -2713,6 +3413,7 @@ class _CouplingPrecompute:
 
     def __init__(self, wlm: MaskWlm) -> None:
         self.wlm = wlm
+        self._gl_modes_cache: _GLMaskModes | None = None
 
     def compute(
         self,
@@ -2730,6 +3431,7 @@ class _CouplingPrecompute:
         spectra: Sequence[str] | None = None,
         pairs: Sequence[tuple[str, str]] | None = None,
         term_selection: float | None = None,
+        scratch_dir: str | None = None,
     ) -> dict | None:
         """
         Compute the coupling kernels of ``(ell, ellp)`` for every ``ellp`` in
@@ -2746,6 +3448,11 @@ class _CouplingPrecompute:
         pair is computed from the terms
         :func:`~cmbcov.term_selection.select_terms`
         keeps, as described in :class:`_TermSelectionPlan`.
+
+        A central set that does not fit in half the memory budget is built
+        once into a :class:`_CentralStore` on disk (:meth:`_central_store`,
+        under ``scratch_dir``) and read back for every ``ellp``; the store
+        is deleted when this returns or raises.
         """
         spectra_tuple, spec_indices, t_only = _resolve_spectra(spectra)
 
@@ -2817,13 +3524,89 @@ class _CouplingPrecompute:
             t_only=t_only,
             selection=selection,
         )
-        if verbose:
-            print(
-                "Central I_lm: "
-                + ("held in RAM" if integral_mask is not None else "streamed per block")
+        store = None
+        if integral_mask is None and len(ellprange) > 0:
+            if scratch_dir is None and save_dir is not None and not dryrun:
+                scratch_dir = save_dir
+            store = self._central_store(
+                ell,
+                grid=grid,
+                wn_for_ell=wn_for_ell,
+                nside=nside,
+                mask_alm=mask_alm,
+                lw=lw,
+                lmax=lmax,
+                t_only=t_only,
+                selection=selection,
+                max_memory_bytes=max_memory_bytes,
+                scratch_dir=scratch_dir,
+                verbose=verbose,
             )
+        if verbose:
+            if integral_mask is not None:
+                print("Central I_lm: held in RAM")
+            elif store is not None:
+                print(
+                    f"Central I_lm: disk store of {store.nbytes / 1024**3:.2f} GiB "
+                    f"at {store.path}"
+                )
+            else:
+                print("Central I_lm: streamed per block")
+        try:
+            return self._compute_ellp_loop(
+                ell,
+                ellprange,
+                integral_mask if store is None else store,
+                save_dir=save_dir,
+                centralell=centralell,
+                dryrun=dryrun,
+                verbose=verbose,
+                wn_for_ell=wn_for_ell,
+                nside=nside,
+                lmax=lmax,
+                grid=grid,
+                mask_alm=mask_alm,
+                lw=lw,
+                max_memory_bytes=max_memory_bytes,
+                spec_indices=spec_indices,
+                t_only=t_only,
+                selection=selection,
+                pairs_tuple=pairs_tuple,
+                spectra_tuple=spectra_tuple,
+                term_selection=term_selection,
+            )
+        finally:
+            if store is not None:
+                store.close()
+                if verbose:
+                    print(f"Removed the central store {store.directory}")
 
-        # Process each ellp value
+    def _compute_ellp_loop(
+        self,
+        ell: int,
+        ellprange,
+        integral_mask,
+        *,
+        save_dir,
+        centralell,
+        dryrun,
+        verbose,
+        wn_for_ell,
+        nside,
+        lmax,
+        grid,
+        mask_alm,
+        lw,
+        max_memory_bytes,
+        spec_indices,
+        t_only,
+        selection,
+        pairs_tuple,
+        spectra_tuple,
+        term_selection,
+    ) -> dict | None:
+        """The loop over ``ellp`` of :meth:`compute`: one
+        :meth:`_compute_ellp_coupling` per value, saved or collected."""
         all_results = {} if dryrun else None
         integral_mask_cache = {}
 
@@ -2926,6 +3709,20 @@ class _CouplingPrecompute:
 
         return nside, wn_for_ell, lmax, mask_alm, lw
 
+    def _gl_mask_modes(
+        self, mask_alm: np.ndarray, lw: int, lmax_out: int
+    ) -> "_GLMaskModes":
+        """The per-grid mask-mode cache of this precompute (:class:`_GLMaskModes`),
+        kept on the instance so that every :meth:`_integral_source` of one
+        run -- central set, store, each ``ellp`` -- shares it; rebuilt when
+        called with a different mask alm (by identity), ``lw`` or
+        ``lmax_out``."""
+        cache = getattr(self, "_gl_modes_cache", None)
+        if cache is None or not cache.matches(mask_alm, lw, lmax_out):
+            cache = _GLMaskModes(mask_alm, lw, lmax_out)
+            self._gl_modes_cache = cache
+        return cache
+
     def _integral_source(
         self,
         grid: str,
@@ -2951,6 +3748,9 @@ class _CouplingPrecompute:
             the size of that whole set, for the memory-budget rule.
         ``to_full_m(item)``
             complex128 ``(nfields, lmax, 2*lmax-1)`` full-``M`` stack.
+        ``fields(item)`` (GL) / ``to_full_m_into(item, out)`` (HEALPix)
+            optional shortcuts to the same numbers without the intermediate
+            stack (:func:`_coefficient_provider`).
         ``reflect``
             whether the ``+-m`` reflection shortcut may be used (GL only).
 
@@ -2976,15 +3776,34 @@ class _CouplingPrecompute:
                 ),
                 "nbytes": lambda ell: (2 * ell + 1) * 2 * 3 * nalm * 16,
                 "to_full_m": lambda cma: _healpix_full_m(cma, lmax, nfields),
+                "to_full_m_into": lambda cma, out: full_from_pair(
+                    cma[0, :nfields], cma[1, :nfields], lmax - 1, out=out
+                ),
                 "reflect": False,
             }
+
+        def gl_fields(item):
+            u_t, u_eb = item
+            return (u_t,) if t_only else (u_t, u_eb[0], u_eb[1])
+
         if selection is None:
+            # Default producer (_GL_PRODUCER): the mask modes of each grid are
+            # computed once per precompute and shared by every m, both sides
+            # and every ellp on that grid (_GLMaskModes); the two-SHT
+            # reference route does not use them.
+            if _GL_PRODUCER == "two_sht":
+
+                def modes(ell):
+                    return None
+
+            else:
+                modes = self._gl_mask_modes(mask_alm, lw, lmax - 1)
             return {
                 "synthesise": lambda ell, m: _gl_integrals_m(
-                    mask_alm, lw, ell, m, lmax, t_only=t_only
+                    mask_alm, lw, ell, m, lmax, t_only=t_only, mask_modes=modes(ell)
                 ),
                 "materialise": lambda ell: _gl_integrals(
-                    mask_alm, lw, ell, lmax, t_only=t_only
+                    mask_alm, lw, ell, lmax, t_only=t_only, mask_modes=modes(ell)
                 ),
                 "nbytes": lambda ell: (2 * ell + 1)
                 * nfields
@@ -2992,6 +3811,7 @@ class _CouplingPrecompute:
                 * (2 * lmax - 1)
                 * 16,
                 "to_full_m": lambda item: _gl_full_m(item, t_only),
+                "fields": gl_fields,
                 "reflect": True,
             }
         plan = selection
@@ -3022,6 +3842,7 @@ class _CouplingPrecompute:
             * (2 * lmax - 1)
             * 16,
             "to_full_m": lambda item: _gl_full_m(item, t_only),
+            "fields": gl_fields,
             "reflect": True,
         }
 
@@ -3055,14 +3876,17 @@ class _CouplingPrecompute:
         fits in half the memory budget -- GL ``(2l+1) * 3 * lmax * (2 lmax -
         1)`` complex128, 12.6 GB at ``ell = 250``, ``lmax = 512``; HEALPix
         ``(2l+1) * 2 * 3 * nalm`` complex128, about half that.  Above it the
-        return value is ``None`` and each block of ``m`` is synthesised on
-        demand inside :meth:`_compute_ellp_coupling`.
+        return value is ``None``; :meth:`compute` then builds the set once
+        into a disk store (:meth:`_central_store`), or -- when no store can
+        be written -- each block of ``m`` is synthesised on demand inside
+        :meth:`_compute_ellp_coupling`.
 
         ``t_only=True`` means the caller has determined via
         :func:`_resolve_spectra` that every kernel it asked for needs only the
-        T field.  On the GL branch it skips the spin-2 (E, B) synthesis
-        entirely (~92% of the precompute wall time at ``centralell=250``,
-        ``nside=256``).  The
+        T field.  On the GL branch it skips the spin-2 (E, B) integrals
+        entirely (two Legendre components against one for T; ~92% of the
+        precompute wall time at ``centralell=250``, ``nside=256`` on the
+        earlier two-SHT producer).  The
         HEALPix branch computes T, E and B in one joint ``map2alm`` per ``m``
         and has no cheaper T-only synthesis; there ``t_only`` only restricts
         the full-``M`` expansion (and the budget of the contraction) to T.
@@ -3077,6 +3901,92 @@ class _CouplingPrecompute:
         if source["nbytes"](ell) > max_memory_bytes // 2:
             return None
         return source["materialise"](ell)
+
+    def _central_store(
+        self,
+        ell: int,
+        *,
+        grid: str,
+        wn_for_ell: np.ndarray | None,
+        nside: int,
+        mask_alm: np.ndarray | None,
+        lw: int | None,
+        lmax: int,
+        t_only: bool,
+        selection: "_TermSelectionPlan | None",
+        max_memory_bytes: int,
+        scratch_dir: str | None,
+        verbose: bool = False,
+    ) -> "_CentralStore | None":
+        """
+        Build the central full-``M`` set of ``ell`` once into a
+        :class:`_CentralStore` -- a file in a fresh temporary directory under
+        ``scratch_dir`` (the system temporary directory when ``None``) --
+        for every ``ellp`` to read back, instead of re-synthesising it per
+        ``ellp``.  The orders stored are those the contraction iterates
+        over: all ``2 ell + 1``, or the kept ones under term selection
+        (:meth:`_TermSelectionPlan.keep_m` depends on ``ell`` alone), in the
+        paired order of :func:`_paired_m_order` so the reflection of
+        :func:`_coefficient_provider` halves the transforms here too.
+
+        Returns ``None``, with a :class:`UserWarning`, when the file system
+        of ``scratch_dir`` has less free space than the store plus 1 GiB;
+        the caller then streams the central set per block as before.  On any
+        exception during the build the directory is removed.
+        """
+        source = self._integral_source(
+            grid, wn_for_ell, nside, mask_alm, lw, lmax, t_only, selection=selection
+        )
+        nfields = 1 if t_only else 3
+        order = _paired_m_order(2 * ell + 1)
+        if selection is not None:
+            keep = selection.keep_m(ell)
+            order = [i for i in order if keep[i]]
+        per_m = nfields * lmax * (2 * lmax - 1) * np.dtype(np.complex128).itemsize
+        nbytes = len(order) * per_m
+
+        if scratch_dir is not None:
+            os.makedirs(scratch_dir, exist_ok=True)
+        parent = scratch_dir if scratch_dir is not None else tempfile.gettempdir()
+        free = shutil.disk_usage(parent).free
+        if free < nbytes + 1024**3:
+            warnings.warn(
+                f"the central coefficient store needs {nbytes / 1024**3:.2f} GiB "
+                f"but {parent} has {free / 1024**3:.2f} GiB free; streaming the "
+                "central set per block instead (slower). Pass scratch_dir to "
+                "put the store elsewhere.",
+                UserWarning,
+                stacklevel=3,
+            )
+            return None
+
+        directory = tempfile.mkdtemp(prefix="acc_central_store_", dir=scratch_dir)
+        store = None
+        try:
+            store = _CentralStore(directory, order, nfields, lmax)
+            provider = _coefficient_provider(
+                None,
+                lambda m: source["synthesise"](ell, m),
+                source["to_full_m"],
+                ell,
+                reflect=source["reflect"],
+                fields=source.get("fields"),
+                into=source.get("to_full_m_into"),
+            )
+            chunk = min(len(order), 64, max(1, (max_memory_bytes // 4) // per_m))
+            if verbose:
+                print(
+                    f"Building the central store: {len(order)} orders, "
+                    f"{nbytes / 1024**3:.2f} GiB, in {store.path}"
+                )
+            store.fill(provider, chunk)
+        except BaseException:
+            if store is not None:
+                store.close()
+            else:
+                shutil.rmtree(directory, ignore_errors=True)
+            raise
+        return store
 
     def _compute_ellp_coupling(
         self,
@@ -3132,16 +4042,30 @@ class _CouplingPrecompute:
         part for a generic mask, and Eq. 20 needs it (it is
         ``|sum_L C_L Theta(L)|^2``, not ``(sum_L C_L Re Theta(L))^2``).
 
-        ``integral_mask`` may be ``None``, meaning "synthesise each ``m`` on
-        demand" -- the mode :meth:`_compute_central_integrals` selects when
-        the whole set would blow the memory budget.  A primed set
+        ``integral_mask`` is the central set held in RAM (as
+        :meth:`_compute_central_integrals` returns it), a
+        :class:`_CentralStore` (the set on disk, built once per precompute
+        by :meth:`compute` when it does not fit the budget), or ``None``,
+        meaning "synthesise each ``m`` on demand" (the streamed path, kept
+        for when no store can be written).  Held or stored, the central
+        blocks are re-read inside the loop over primed blocks, so every
+        primed coefficient is synthesised once; streamed, the central blocks
+        are the outer loop and the primed ones are rebuilt per central
+        block (:func:`_accumulate_coupling_kernels`).  A primed set
         (``ell != ellp``) is materialised only when a later ``ellp`` in
         ``remaining_ellp_values`` reuses it (then kept in
         ``integral_mask_cache``); otherwise it is streamed block by block.  At
-        ``ell == ellp`` the central set serves both sides.
+        ``ell == ellp`` the central set (held, stored or streamed) serves
+        both sides.
 
-        ``max_memory_bytes`` caps the blocked working set; ``None`` uses
-        :data:`DEFAULT_COUPLING_MEMORY_GB`.
+        ``max_memory_bytes`` caps the whole-set caches plus the blocked
+        working set; ``None`` uses :data:`DEFAULT_COUPLING_MEMORY_GB`.  A
+        central set held in RAM and any primed set kept for a later ``ellp``
+        are subtracted from it, and the rest bounds
+        :func:`_coupling_working_set` (with the producer's transients,
+        :func:`_gl_producer_bytes` / :func:`_healpix_producer_bytes`).  A
+        primed set is kept only while the sets held stay within half the
+        budget, and is dropped at its last use.
 
         ``selection`` (a :class:`_TermSelectionPlan`, GL only) restricts the
         contraction to the kept orders and pairs of ``(ell, ellp)``.
@@ -3155,22 +4079,49 @@ class _CouplingPrecompute:
         sel = None if selection is None else selection.selection(ell, ellp)
         if verbose and sel is not None:
             print("  " + sel.summary())
+        store = integral_mask if isinstance(integral_mask, _CentralStore) else None
+        if store is not None:
+            integral_mask = None
+        # Whole coefficient sets held in RAM (the central one, primed ones
+        # kept for a later ellp) come out of the budget before the
+        # contraction is planned.
+        held_bytes = source["nbytes"](ell) if integral_mask is not None else 0
         if ell != ellp:
             integral_mask_prime = integral_mask_cache.get(ellp)
+            if ellp not in remaining_ellp_values:
+                # Last use: dropped from the cache, freed after this pair.
+                integral_mask_cache.pop(ellp, None)
             if integral_mask_prime is not None:
                 if verbose:
                     print(f"  Reusing cached I_lm for ellp={ellp}")
             elif ellp in remaining_ellp_values:
                 # Only materialise the whole primed set when a later ellp
-                # will reuse it; otherwise it is streamed block by block.
-                integral_mask_prime = source["materialise"](ellp)
-                integral_mask_cache[ellp] = integral_mask_prime
-                if verbose:
-                    print(f"  Cached I_lm for ellp={ellp} (appears again later)")
+                # will reuse it and the sets held stay within half the
+                # budget (the rule of the central set); otherwise it is
+                # streamed block by block.
+                kept = sum(source["nbytes"](k) for k in integral_mask_cache)
+                if held_bytes + kept + source["nbytes"](ellp) <= max_memory_bytes // 2:
+                    integral_mask_prime = source["materialise"](ellp)
+                    integral_mask_cache[ellp] = integral_mask_prime
+                    if verbose:
+                        print(f"  Cached I_lm for ellp={ellp} (appears again later)")
+            if integral_mask_prime is not None:
+                held_bytes += source["nbytes"](ellp)
+            held_bytes += sum(
+                source["nbytes"](k) for k in integral_mask_cache if k != ellp
+            )
         else:
             if verbose:
                 print("  Using ell==ellp optimization")
             integral_mask_prime = integral_mask
+
+        nfields = 1 if t_only else 3
+        if grid == "gl":
+            producer_bytes = _gl_producer_bytes(
+                lw if selection is None else selection.lw, lmax, (ell, ellp), nfields
+            )
+        else:
+            producer_bytes = _healpix_producer_bytes(nside, lmax, nfields)
 
         def provider(held, l_val):
             return _coefficient_provider(
@@ -3179,7 +4130,24 @@ class _CouplingPrecompute:
                 source["to_full_m"],
                 l_val,
                 reflect=source["reflect"],
+                fields=source.get("fields"),
+                into=source.get("to_full_m_into"),
             )
+
+        central_fn = provider(integral_mask, ell)
+        # A central set that is cheap to re-read (disk store or held in RAM)
+        # lets the contraction put the primed side in the outer loop, so the
+        # primed coefficients are synthesised once (see
+        # _accumulate_coupling_kernels, "Loop order").
+        central_reader = prime_reader = None
+        if store is not None:
+            central_reader = store.left
+            if ell == ellp:
+                prime_reader = store.right
+        elif integral_mask is not None:
+
+            def central_reader(rows, out=None):
+                return _pack_block(central_fn, rows, lmax, False, nfields, out=out)
 
         active = (
             list(range(len(COUPLING_SPECTRA))) if spec_indices is None else spec_indices
@@ -3192,19 +4160,22 @@ class _CouplingPrecompute:
                 for a, b in pairs
             ]
         kernels = _accumulate_coupling_kernels(
-            provider(integral_mask, ell),
+            central_fn,
             2 * ell + 1,
             provider(integral_mask_prime, ellp),
             2 * ellp + 1,
             lmax,
-            max_memory_bytes,
+            max(0, max_memory_bytes - held_bytes),
             spec_indices=active,
-            nfields=1 if t_only else 3,
+            nfields=nfields,
             verbose=verbose,
             keep_m=None if sel is None else sel.keep_m,
             keep_mp=None if sel is None else sel.keep_mp,
             pair_mask=None if sel is None else sel.keep_pair,
             output_pairs=output_pairs,
+            central_reader=central_reader,
+            prime_reader=prime_reader,
+            producer_bytes=producer_bytes,
         )
 
         if pairs is not None:
@@ -3353,6 +4324,7 @@ def precompute_acc_kernels(
     verbose: bool = False,
     ellprange: Sequence[int] | None = None,
     term_selection: float | None = None,
+    scratch_dir: str | None = None,
 ) -> dict[int, dict[str, np.ndarray]] | None:
     r"""
     Precompute the ACC coupling kernels for one mask -- the one-off step of
@@ -3426,8 +4398,8 @@ def precompute_acc_kernels(
         silently multiply the precompute's cost, so it stays pinned; the
         four new channels (``TL, LT, DL, LD``) are computed only when
         requested explicitly.  ``("TT",)`` on ``grid="gl"`` skips the spin-2
-        integrals entirely (~92% of the wall time at ``centralell=250``,
-        ``nside=256``); on ``grid="healpix"`` the synthesis is joint across
+        integrals entirely (two Legendre components against one for T); on
+        ``grid="healpix"`` the synthesis is joint across
         T/D/L, and only the full-``M`` expansion, the contraction and the
         files written shrink.  A run
         that needs a kernel outside the subset fails on load, naming it.
@@ -3442,15 +4414,53 @@ def precompute_acc_kernels(
         be in it (``ValueError`` otherwise); if ``spectra`` is ``None``, the
         channel set is inferred from ``pairs`` alone.
     max_memory_gb : float, optional
-        Peak-memory budget, in GiB (default :data:`DEFAULT_COUPLING_MEMORY_GB`),
-        of the blocked contraction (:func:`_accumulate_coupling_kernels`).  It
-        sets the ``(m, m')`` block widths and, on both grids, whether the
-        central integral set is held in RAM (when it fits in half the budget)
-        or streamed.  At ``ell = ellp =
-        250``, ``nside = 256``, ``lw = 512`` one ``m`` of integrals is 24 MiB
-        (11.7 GiB for a whole set), so 2 GiB gives 11 central blocks, 12 GiB
-        gives 2 and 24 GiB gives 1.  It bounds the contraction working set,
-        not process RSS (measured 2.85 GiB RSS for a 2 GiB budget).
+        Memory budget, in GiB (default :data:`DEFAULT_COUPLING_MEMORY_GB`),
+        for everything the precompute holds that scales with the problem:
+
+        * the central coefficient set, when it is held in RAM -- only if it
+          fits in half the budget; otherwise it is built once into a
+          temporary file (see ``scratch_dir``) and read back for every
+          ``ellp`` -- and any primed set kept for a later ``ellp`` (under
+          the same half-budget rule);
+        * the working set of the blocked contraction, from what is left
+          (:func:`_coupling_working_set`): the output kernels, the
+          coefficient blocks on both sides including the block read ahead,
+          the ``Theta`` slab, and the coefficient producer's transients and
+          mask-mode caches.  The ``(m, m')`` block widths are chosen to use
+          it.
+
+        Not covered, a fixed baseline on top of it: the Python process and
+        its libraries (about 0.1 GiB); the mask map and its alm as loaded
+        (8 bytes per mask pixel, 0.4 GiB for an ``nside`` 2048 mask; reading
+        and transforming it peaks at about 2 GiB before the contraction
+        starts); memory the system allocator keeps after numpy frees it (on
+        macOS, whose allocator caches large freed blocks, the survey run
+        peaks at 13.1 GiB of footprint (11.4 GiB RSS) at 12 GiB and 8.9
+        (7.0) at 6 GiB; ``MallocLargeCache=0`` disables the cache; glibc,
+        on Linux, unmaps every allocation above 32 MiB when it is freed);
+        and, with
+        ``dryrun=True``, the kernels returned, ``nspec**2 * (2 nside)**2 * 8``
+        bytes per ``ellp``.  Measured on the survey mask (``centralell``
+        250, ``nside`` 256, ``lw`` 875, four spectra, ``MallocLargeCache=0``):
+        peak footprint 12.49 GiB at 12 GiB and 6.50 GiB at 6 GiB, i.e. the
+        budget plus a 0.5 GiB baseline.  One ``m`` of integrals is 24 MiB
+        there (11.7 GiB for the whole central set), and all five channels
+        give ``m'`` blocks of 44 orders (12 outer passes over the stored
+        central set) at 2 GiB, 173 (3) at 6 GiB and 415 (2) at 12 GiB; at
+        24 GiB the central set is held in RAM.  A budget below the floor
+        (the output kernels, the producer and one ``m`` on each side) is
+        warned about and the smallest blocks are used.
+    scratch_dir : str, optional
+        Where the temporary central-coefficient store goes when the central
+        set does not fit in half of ``max_memory_gb``: a fresh
+        ``acc_central_store_*`` subdirectory of it, holding one file of
+        ``(2 centralell + 1) * nfields * 2 nside * (4 nside - 1) * 16`` bytes
+        (11.7 GiB at ``centralell = 250``, ``nside = 256``, three fields),
+        deleted when the precompute returns or raises.  ``None`` (default)
+        uses ``save_dir`` (or the system temporary directory with
+        ``dryrun=True``).  If the file system lacks the space, a
+        :class:`UserWarning` is issued and the set is re-synthesised per
+        block instead, as before the store existed.
     dryrun : bool, default False
         Compute but write nothing; return the kernels instead.
     verbose : bool, default False
@@ -3535,4 +4545,5 @@ def precompute_acc_kernels(
         spectra=spectra,
         pairs=pairs,
         term_selection=term_selection,
+        scratch_dir=scratch_dir,
     )

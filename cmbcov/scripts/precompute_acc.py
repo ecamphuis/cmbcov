@@ -17,6 +17,7 @@ backend settings come from its ``acc_precompute`` block::
       lw: 512           # optional, gl only
       spectra: [TT]     # optional, default all
       max_memory_gb: 6  # optional
+      scratch_dir: /fast/scratch  # optional, default the kernel directory
 
 The kernels are written to ``<cov_path>/covariance_coupling/``
 (:attr:`~cmbcov.generator.parameter_validation.PipelineConfig.acc_kernel_dir`).

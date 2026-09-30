@@ -59,7 +59,8 @@ computes the kernels (see [`acc_precomputation.md`](acc_precomputation.md)).
 | `grid` | `gl` \| `healpix` | `gl` | Quadrature backend. `gl` is exact for a band-limited mask and supports T, E and B; `healpix` is the pixelised alternative. |
 | `lw` | int | `3 * nside - 1` | Mask band-limit, `grid: gl` only. Error if given with `grid: healpix`. |
 | `spectra` | list of str | all five (`TT, DD, LL, TD, DT`) | Kernel channels to compute, a subset of `TT, DD, LL, TD, DT, TL, LT, DL, LD` (old names `TT, EE, BB, TE, ET` accepted). Must cover what `observables` needs — a run that would fail its first kernel load is rejected at validation instead. |
-| `max_memory_gb` | float | 2 | Peak-memory budget of the contraction; must be `> 0`. |
+| `max_memory_gb` | float | 2 | Memory budget of the precompute (held integrals and the contraction), on top of a fixed baseline for the process and the mask; must be `> 0`. See [`acc_precomputation.md`](acc_precomputation.md), "Memory budget". |
+| `scratch_dir` | str | the kernel directory | Where the temporary on-disk store of the central coefficients goes when they do not fit in half of `max_memory_gb` (a file of `(2 centralell + 1) * 3 * 2 nside * (4 nside - 1) * 16` bytes, 11.7 GiB at `centralell` 250, `nside` 256); deleted when the precompute ends. |
 
 `grid: gl` is required (not merely default) with any B-mode observable: the
 per-Wick-term normalisation reads raw kernel sums, which only the GL grid

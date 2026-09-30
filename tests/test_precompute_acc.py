@@ -364,6 +364,7 @@ def _validate(block, **overrides):
         {"grid": "gl", "nside": 100},  # GL does not need a power of two
         {"spectra": ["TT", "EE", "TE", "ET"]},
         {"spectra": list(COUPLING_SPECTRA)},
+        {"scratch_dir": "/tmp/acc_scratch", "max_memory_gb": 1},
     ],
 )
 def test_good_blocks_validate_cleanly(block):
@@ -402,6 +403,8 @@ def test_tt_only_spectra_are_fine_for_a_temperature_only_run():
         ({"max_memory_gb": -2}, "max_memory_gb"),
         ({"max_memory_gb": True}, "max_memory_gb"),
         ({"max_memory_gb": "6"}, "max_memory_gb"),
+        ({"scratch_dir": ""}, "scratch_dir"),
+        ({"scratch_dir": 3}, "scratch_dir"),
     ],
 )
 def test_bad_blocks_are_errors(block, fragment):
@@ -531,3 +534,29 @@ def test_entry_point_is_declared():
     text = open(os.path.join(os.path.dirname(DATA), "..", "pyproject.toml")).read()
     assert 'precompute-acc = "cmbcov.scripts.precompute_acc:main"' in text
     assert callable(precompute_acc.main)
+
+
+def test_yaml_scratch_dir_reaches_the_precompute(tmp_path, monkeypatch):
+    """``acc_precompute.scratch_dir`` is passed through to
+    :func:`precompute_acc_kernels` (and shown in the plan)."""
+    scratch = str(tmp_path / "scratch")
+    block = f"""
+    acc_precompute:
+      nside: 16
+      grid: gl
+      lw: 10
+      scratch_dir: {scratch}
+    """
+    generator = CovarianceMatrixGenerator(_params_file(tmp_path, block=block))
+    assert generator.precompute_acc_kernels(dryrun=True)["scratch_dir"] == scratch
+
+    seen = {}
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(
+        "cmbcov.generator.generator.precompute_acc_kernels", spy, raising=True
+    )
+    generator.precompute_acc_kernels()
+    assert seen["scratch_dir"] == scratch

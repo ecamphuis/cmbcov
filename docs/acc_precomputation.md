@@ -40,6 +40,7 @@ acc_precompute:     # optional: how the kernels are computed
   lw: 512           # optional, gl only
   spectra: [TT]     # optional, default all; must cover what `observables` needs
   max_memory_gb: 6  # optional
+  scratch_dir: /fast/scratch  # optional; default the kernel directory
 ```
 
 ```bash
@@ -72,14 +73,37 @@ or unknown `spectra` raises.
 
 ## Memory budget
 
-`max_memory_gb` (default 2) is the peak-memory budget of the coupling
-contraction, and on both grids also decides whether the central integrals
-are kept in memory or re-synthesised per block. Raising it is the single
-biggest lever on wall time at high `centralell`, at the cost of more RAM;
-lowering it trades time for memory. If memory still forces a split, the
-secondary multipoles can be computed in consecutive chunks (passing
-`ellprange` instead of `dmax`, sharing one loaded mask) — prefer few, large
-chunks, since the central integrals are recomputed once per chunk.
+`max_memory_gb` (default 2) is the memory budget of the precompute: it
+bounds everything that grows with the problem — the central integrals when
+they are kept in memory, the blocks of integrals being contracted, the
+intermediate products and the output kernels. On both grids it decides
+whether the central integrals are kept in memory (when they fit in half of
+it) or computed once into a
+temporary file on disk and read back for every secondary multipole. That
+file is `(2 centralell + 1) * 3 * 2 nside * (4 nside - 1) * 16` bytes
+(11.7 GiB at `centralell` 250, `nside` 256); it goes in a fresh
+subdirectory of `scratch_dir` (default: the kernel directory) and is
+deleted when the precompute ends, also on error. If that file system lacks
+the space, the precompute warns and re-synthesises the central integrals
+per block instead (slower). Raising `max_memory_gb` widens the blocks and
+cuts the number of passes over the central file; lowering it trades time
+for memory.
+
+The budget does not include a fixed baseline: the Python process (about
+0.1 GiB), the mask as loaded (8 bytes per pixel, 0.4 GiB at `nside` 2048;
+reading and transforming it peaks at about 2 GiB before the contraction
+starts), and memory the system allocator keeps after it has been freed. On
+a cluster node with a hard limit, set `max_memory_gb` about 1 GiB below the
+limit for an `nside` 2048 mask (measured on the survey mask at `nside` 256:
+12.5 GiB peak at a 12 GiB budget, 6.5 GiB at 6 GiB). On macOS the
+allocator keeps freed large blocks for reuse, and the footprint of the same
+runs is 13.1 GiB and 8.9 GiB (resident 11.4 and 7.0 GiB);
+`MallocLargeCache=0` in the environment disables that cache.
+
+If memory still forces a split, the secondary multipoles can be
+computed in consecutive chunks (passing `ellprange` instead of `dmax`,
+sharing one loaded mask) — prefer few, large chunks, since the central
+integrals are recomputed once per chunk.
 
 ## The cache and its validation
 

@@ -37,6 +37,7 @@ from conftest import compute_cross_spec_cplxmapalm  # noqa: E402
 from cmbcov.approximations.acc import (  # noqa: E402
     COUPLING_SPECTRA,
     _coupling_block_sizes,
+    _coupling_working_set,
     _CouplingPrecompute,
     _gl_integrals,
     _paired_m_order,
@@ -482,12 +483,15 @@ def test_paired_m_order_is_a_permutation_putting_plus_m_before_minus_m():
 def _target_block_sizes(max_bytes):
     """Blocking at the author's target size: ell = ell' = 250, lmax = 512."""
     lmax, n_m = 512, 501
+    nspec = len(COUPLING_SPECTRA)
     per_m = 3 * lmax * (2 * lmax - 1) * 16
-    per_pair = len(COUPLING_SPECTRA) * lmax * 16  # complex Theta slab
-    # output kernels + the one-entry +m cache each provider keeps
-    kernels = len(COUPLING_SPECTRA) ** 2 * lmax * lmax * 8 + 2 * per_m
+    per_pair = (nspec + 1) * lmax * 16  # Theta slab + the channel in flight
     nb, nbp = _coupling_block_sizes(n_m, n_m, lmax, per_m, per_pair, max_bytes)
-    return nb, nbp, n_m, per_m, per_pair, kernels
+
+    def planned(nb, nbp):
+        return _coupling_working_set(nb, nbp, lmax, per_m, per_pair, nspec)["total"]
+
+    return nb, nbp, n_m, planned
 
 
 @pytest.mark.parametrize("max_bytes", [2 * 1024**3, 8 * 1024**3, 512 * 1024**2])
@@ -497,19 +501,19 @@ def test_block_sizes_respect_the_budget(max_bytes):
     a wider central block (the one that sets how often the primed integrals are
     re-synthesised).
     """
-    nb, nbp, n_m, per_m, per_pair, kernels = _target_block_sizes(max_bytes)
+    nb, nbp, n_m, planned = _target_block_sizes(max_bytes)
 
     assert 1 <= nb <= n_m and 1 <= nbp <= n_m
-    assert (nb + nbp) * per_m + nb * nbp * per_pair + kernels <= max_bytes
+    assert planned(nb, nbp) <= max_bytes
     if nb < n_m:
-        assert (nb + 1 + nbp) * per_m + (nb + 1) * nbp * per_pair + kernels > max_bytes
+        assert planned(nb + 1, nbp) > max_bytes
 
 
 def test_a_budget_below_the_hard_floor_warns_rather_than_lying():
     """
     The 25 output kernels alone are 52 MB at lmax=512 and one m of GL integrals
-    is 25 MB, so no blocking can honour a 64 MB budget.  Say so instead of
-    silently overshooting.
+    is 25 MB (the producer holds three), so no blocking can honour a 64 MB
+    budget.  Say so instead of silently overshooting.
     """
     with pytest.warns(UserWarning, match="below"):
         nb, nbp, *_ = _target_block_sizes(64 * 1024**2)
@@ -528,9 +532,12 @@ def test_block_passes_never_increase_with_the_budget(nspec, ellp):
     """
     lmax, n_m, n_mp = 512, 501, 2 * ellp + 1
     per_m = 3 * lmax * (2 * lmax - 1) * 16
-    per_pair = nspec * lmax * 16
-    kernels = nspec**2 * lmax * lmax * 8 + 2 * per_m
-    floor = kernels + 2 * per_m + per_pair
+    per_pair = (nspec + 1) * lmax * 16
+
+    def planned(nb, nbp):
+        return _coupling_working_set(nb, nbp, lmax, per_m, per_pair, nspec)["total"]
+
+    floor = planned(1, 1)
 
     budgets = np.unique(
         np.concatenate(
@@ -547,7 +554,7 @@ def test_block_passes_never_increase_with_the_budget(nspec, ellp):
             n_m, n_mp, lmax, per_m, per_pair, max_bytes, nspec=nspec
         )
         assert 1 <= nb <= n_m and 1 <= nbp <= n_mp
-        assert (nb + nbp) * per_m + nb * nbp * per_pair + kernels <= max_bytes
+        assert planned(nb, nbp) <= max_bytes
         passes = -(-n_m // nb) * -(-n_mp // nbp)
         if previous is not None:
             assert passes <= previous[0], (

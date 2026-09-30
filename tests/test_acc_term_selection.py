@@ -206,6 +206,124 @@ def test_selection_actually_drops_terms(cap_wlm):
 
 
 # --------------------------------------------------------------------------- #
+# 2b. band-limit small against ell + ell': |m - m'| can exceed 2 lw
+# --------------------------------------------------------------------------- #
+LW_SMALL = 8
+
+
+@pytest.fixture(scope="module")
+def cap_wlm_small(tmp_path_factory):
+    """Same cap as ``cap_wlm`` at nside 16 (used with a small ``lw``)."""
+    path = tmp_path_factory.mktemp("cap16")
+    healpy.write_map(str(path / "cap.fits"), cap_mask(16, 45.0, 30.0, 20.0, 8.0))
+    return MaskWlm("cap.fits", load_path=str(path))
+
+
+def _pole_alm(mask_map, lw):
+    from cmbcov.sht import ducc0_map2alm
+    from cmbcov.term_selection import pole_rotation, rotate_alm
+
+    alm = ducc0_map2alm(mask_map, lmax=lw, pol=False, iter=10)
+    return rotate_alm(alm, lw, pole_rotation(mask_map))
+
+
+def _old_estimate(alm, lw, ell, ellp, wrap):
+    """The estimate of ``select_terms`` with explicit indexing of ``A``.
+
+    ``wrap=False``: zero outside ``|d| <= 2 lw`` (correct);
+    ``wrap=True``: numpy negative-index wrap of the old code (``d >= -2 lw``
+    reference values are identical, ``d < -2 lw`` picks up the tail of ``A``).
+    """
+    from cmbcov.term_selection import azimuthal_spectrum, mode_power
+
+    P = azimuthal_spectrum(alm, lw)
+    A = np.correlate(P, P, mode="full")
+    A /= A.max()
+    pm = mode_power(alm, lw, ell)
+    pmp = mode_power(alm, lw, ellp)
+    est = np.zeros((2 * ell + 1, 2 * ellp + 1))
+    for i, m in enumerate(range(-ell, ell + 1)):
+        for j, mp in enumerate(range(-ellp, ellp + 1)):
+            d = m - mp
+            if abs(d) <= 2 * lw:
+                est[i, j] = pm[i] * pmp[j] * A[d + 2 * lw]
+            elif wrap and d < 0:
+                est[i, j] = pm[i] * pmp[j] * A[d + 2 * lw]  # negative index
+    return est, pm, pmp
+
+
+@pytest.mark.parametrize("ell, ellp", [(12, 12), (10, 14), (14, 10)])
+def test_select_terms_with_2lw_below_ell_plus_ellp(ell, ellp):
+    from cmbcov.term_selection import select_terms
+
+    lw = LW_SMALL
+    assert 2 * lw < ell + ellp
+    mask = cap_mask(16, 45.0, 30.0, 20.0, 8.0)
+    alm = _pole_alm(mask, lw)
+    sel = select_terms(alm, lw, ell, ellp, TOL)  # IndexError before the fix
+
+    d = np.arange(-ell, ell + 1)[:, None] - np.arange(-ellp, ellp + 1)[None, :]
+    far = np.abs(d) > 2 * lw
+    assert far.any()
+    assert not sel.keep_pair[far].any()
+
+    # in range: the same thresholding of the reference estimate
+    est, pm, pmp = _old_estimate(alm, lw, ell, ellp, wrap=False)
+    keep = (
+        (est >= sel.eps_pair * est.max())
+        & (pm >= sel.eps_m * pm.max())[:, None]
+        & (pmp >= sel.eps_m * pmp.max())[None, :]
+    )
+    assert np.array_equal(sel.keep_pair, keep)
+    assert sel.keep_pair[~far].any()
+
+
+def test_select_terms_does_not_wrap_negative_differences():
+    """
+    ``m - m' < -2 lw`` used to index ``A`` from its end (a silently wrong,
+    non-zero estimate); it is exactly zero now.
+    """
+    from cmbcov.term_selection import select_terms
+
+    lw, ell, ellp = LW_SMALL, 10, 14
+    # a broad azimuthal spectrum (random band-limited alm, real m = 0), so the
+    # tail of A that the old negative index landed on is not negligible
+    rng = np.random.default_rng(5)
+    alm = rng.normal(size=healpy.Alm.getsize(lw)) + 1j * rng.normal(
+        size=healpy.Alm.getsize(lw)
+    )
+    alm[: lw + 1] = alm[: lw + 1].real
+    sel = select_terms(alm, lw, ell, ellp, TOL)
+    d = np.arange(-ell, ell + 1)[:, None] - np.arange(-ellp, ellp + 1)[None, :]
+    neg_far = d < -2 * lw
+    assert neg_far.any()
+    # the wrapped estimate of the old code would have kept some of them ...
+    est_wrap, pm, pmp = _old_estimate(alm, lw, ell, ellp, wrap=True)
+    would_keep = (
+        (est_wrap >= sel.eps_pair * est_wrap.max())
+        & (pm >= sel.eps_m * pm.max())[:, None]
+        & (pmp >= sel.eps_m * pmp.max())[None, :]
+    )
+    assert would_keep[neg_far].any()
+    # ... and none are kept now
+    assert not sel.keep_pair[neg_far].any()
+
+
+def test_selected_kernels_within_tolerance_with_small_lw(cap_wlm_small):
+    """End to end with ``2 lw < ell + ell'``: runs, and stays within tolerance."""
+    ell, nside, lw = 16, 16, LW_SMALL
+    assert 2 * lw < 2 * ell
+    kw = {"spectra": ("TT",), "lw": lw}
+    full = _precompute(cap_wlm_small, ell, nside, **kw)
+    selected = _precompute(cap_wlm_small, ell, nside, term_selection=TOL, **kw)
+    for ellp in (ell, ell + 3):
+        assert full[ellp].keys() == selected[ellp].keys()
+        for key in full[ellp]:
+            err = frob(full[ellp][key] - selected[ellp][key]) / frob(full[ellp][key])
+            assert err <= TOL, (ellp, key, err)
+
+
+# --------------------------------------------------------------------------- #
 # 3. the manifest round trip and the loader's refusal
 # --------------------------------------------------------------------------- #
 def _cov(kernel_dir, term_selection):

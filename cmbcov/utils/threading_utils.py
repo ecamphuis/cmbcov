@@ -8,6 +8,8 @@ performance tuning commonly used in numerical computations.
 import multiprocessing
 import os
 import warnings
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 #: Whether an invalid ``OMP_NUM_THREADS`` has already been warned about in
 #: this process (warn once, since threading helpers run on every SHT/grid
@@ -90,3 +92,57 @@ def get_optimal_nthreads(nside: int | None = None) -> int:
     else:
         # Large problems benefit from all available cores
         return min(n_cpu, 16)  # Cap at 16 to avoid diminishing returns
+
+
+#: Complex128 entries per worker below which :func:`run_row_blocks` callers
+#: do not split an elementwise array operation further
+#: (:func:`row_block_workers`).  The operations are memory-bound products and
+#: copies; measured inside the survey ACC precompute (``nside`` 256, 14-core
+#: laptop with a 4-core job alongside), one worker per 128 Ki entries (2 MiB)
+#: ran them 3-4x faster than one thread, while blocks of a few rows (many
+#: small numpy calls contending for the GIL) were slower than serial.
+ROW_BLOCK_ENTRIES_PER_THREAD = 131072
+
+#: The shared worker pool of :func:`run_row_blocks`, created on first use and
+#: dropped in a forked child, whose copy of it would have no threads.
+_ROW_BLOCK_POOL: list = []
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_ROW_BLOCK_POOL.clear)
+
+
+def row_block_workers(entries: int, nthreads: int) -> int:
+    """Workers for an elementwise operation over ``entries`` array entries:
+    at most ``nthreads``, and one per :data:`ROW_BLOCK_ENTRIES_PER_THREAD`."""
+    return max(1, min(int(nthreads), entries // ROW_BLOCK_ENTRIES_PER_THREAD))
+
+
+def run_row_blocks(fn: Callable[[int, int], None], nrows: int, workers: int) -> None:
+    """
+    Call ``fn(r0, r1)`` on ``workers`` contiguous blocks ``[r0, r1)`` that
+    tile ``range(nrows)``, on a shared thread pool, and wait for all of them
+    (re-raising the first exception).  With one worker it is a plain call.
+
+    Meant for numpy array operations split over the leading axis: numpy
+    releases the GIL inside each ufunc loop, and an elementwise operation
+    gives the same bits whatever the blocking, so callers stay
+    bit-identical to the serial form.  ``fn`` must write disjoint rows and
+    must not itself call :func:`run_row_blocks` (a worker waiting on the
+    pool it runs in could deadlock it).
+    """
+    workers = max(1, min(int(workers), int(nrows)))
+    if workers == 1:
+        fn(0, nrows)
+        return
+    if not _ROW_BLOCK_POOL:
+        _ROW_BLOCK_POOL.append(
+            ThreadPoolExecutor(
+                max_workers=os.cpu_count() or 1, thread_name_prefix="cmbcov-rows"
+            )
+        )
+    bounds = [nrows * i // workers for i in range(workers + 1)]
+    futures = [
+        _ROW_BLOCK_POOL[0].submit(fn, bounds[i], bounds[i + 1]) for i in range(workers)
+    ]
+    for future in futures:
+        future.result()

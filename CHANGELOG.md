@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.5.0 — 2026-09-30
+
+### Changed
+
+- **`max_memory_gb` now bounds the precompute's real working set.** It
+  covers everything that grows with the problem: the coefficient blocks,
+  the contraction's intermediate arrays, and any coefficient set held in
+  memory between kernel pairs. Before, some of these were not counted, and
+  a run whose central set fitted in memory could use up to 1.5× the budget.
+  Not covered, and documented: a fixed baseline for the Python process and
+  the mask as loaded (about 0.5 GiB; about 2 GiB briefly while an
+  nside-2048 mask is read). At the same budget the blocks are slightly
+  narrower. On macOS the memory footprint can still exceed the budget,
+  because the system allocator keeps freed memory; set
+  `MallocLargeCache=0` if a tight limit matters.
+
+### Fixed
+
+- **ACC term selection with a low mask band-limit.** When `lw` was below
+  half of ℓ + ℓ′, the pair rule crashed with an `IndexError`, or silently
+  used a wrong coupling estimate for some pairs. Those pairs do not couple
+  (the mask has no azimuthal power beyond `lw`) and are now dropped. Runs
+  with `lw` of at least ℓ + ℓ′ over 2, which includes the usual settings,
+  are unchanged.
+
+### Added
+
+- **`scratch_dir`** (`acc_precompute` block, `precompute_acc_kernels`):
+  where the precompute keeps its temporary on-disk copy of the central
+  coefficients when they do not fit in half of `max_memory_gb`. Default:
+  the kernel directory. The copy is deleted at the end of the run, also on
+  failure.
+
+### Performance
+
+- **The ACC kernel precompute is about 2.5× faster.** Each coefficient set
+  is now computed once instead of once per kernel pair, and the Gauss-Legendre
+  coefficients use Legendre transforms instead of full spherical-harmonic
+  transforms. Measured back to back on a survey mask: about 2.5× per
+  kernel pair. A full `dmax = 100` precompute took 1.5 hours on a busy
+  machine, against about 2.5 hours before. Kernels are identical up to
+  floating-point rounding (2e-14 of the largest element); existing kernel
+  caches remain valid.
+
 ## 0.4.1 — 2026-09-29
 
 ### Fixed

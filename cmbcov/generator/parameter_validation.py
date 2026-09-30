@@ -188,6 +188,10 @@ class AccPrecomputeConfig:
     max_memory_gb : float, optional
         Peak-memory budget of the contraction. ``None`` means the package
         default.
+    scratch_dir : str, optional
+        Directory for the temporary on-disk store of the central
+        coefficients, used when they do not fit in half of
+        ``max_memory_gb``. ``None`` means the kernel directory.
     """
 
     nside: int | None = None
@@ -195,9 +199,10 @@ class AccPrecomputeConfig:
     lw: int | None = None
     spectra: tuple[str, ...] | None = None
     max_memory_gb: float | None = None
+    scratch_dir: str | None = None
 
     #: Keys accepted in the block.
-    KEYS = ("nside", "grid", "lw", "spectra", "max_memory_gb")
+    KEYS = ("nside", "grid", "lw", "spectra", "max_memory_gb", "scratch_dir")
     #: Accepted values of ``grid``.
     GRIDS = ("healpix", "gl")
 
@@ -229,6 +234,7 @@ class AccPrecomputeConfig:
             lw=block.get("lw"),
             spectra=tuple(spectra) if spectra is not None else None,
             max_memory_gb=block.get("max_memory_gb"),
+            scratch_dir=block.get("scratch_dir"),
         )
 
 
@@ -930,7 +936,8 @@ class ParameterValidator:
         silently ignored); ``spectra`` not a non-empty list drawn from
         ``COUPLING_SPECTRA``, or missing a kernel the run's ``stokes`` need
         (the run would stop on its first load, after the precompute had been
-        paid for); ``max_memory_gb`` not a positive number.
+        paid for); ``max_memory_gb`` not a positive number; ``scratch_dir``
+        not a non-empty string.
 
         Warning, not error: the block with a ``covariance_approximation``
         other than ``acc``. Nothing reads it then, so it cannot bias a
@@ -1002,6 +1009,13 @@ class ParameterValidator:
         ):
             self.errors.append(
                 f"'{where}.max_memory_gb' must be a positive number, got {memory!r}"
+            )
+
+        scratch = block.get("scratch_dir")
+        if scratch is not None and (not isinstance(scratch, str) or not scratch):
+            self.errors.append(
+                f"'{where}.scratch_dir' must be a non-empty string (a directory), "
+                f"got {scratch!r}"
             )
 
         spectra = block.get("spectra")

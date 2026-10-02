@@ -9,7 +9,10 @@ path which computes the covariance of the pixelised ``map2alm(iter)``
 estimator.  The tests pin the normalisation (full sky), the two symmetries,
 the Parseval identity behind the ACC precomputation, the measured
 GL-vs-HEALPix difference on the baseline mask, and (slow) agreement with
-Monte Carlo simulations.
+Monte Carlo simulations.  The comparisons between two computations run on
+the baseline cap and on the two-patch mask of ``tests/conftest.py``
+(``any_mask``): on the cap every column couples ``M = m'`` only, so an error
+in how azimuthal orders are mixed would not show there.
 """
 
 import os
@@ -21,7 +24,7 @@ from cmbcov.sht import ducc0_map2alm
 
 healpy = pytest.importorskip("healpy")
 
-from conftest import apodised_cap, power_law_cl  # noqa: E402
+from conftest import apodised_cap, patchy_mask, power_law_cl  # noqa: E402
 
 from cmbcov.exact import (  # noqa: E402
     exact_covariance,
@@ -55,11 +58,24 @@ def red_cl(lmax):
     return 1000.0 / (np.arange(lmax + 1) + 1.0) ** 2
 
 
-@pytest.fixture(scope="module")
-def baseline():
-    mask = healpy.read_map(os.path.join(DATA_DIR, "baseline_mask.fits"))
+def _mask_setup(which):
+    if which == "cap":
+        mask = healpy.read_map(os.path.join(DATA_DIR, "baseline_mask.fits"))
+    else:
+        mask = patchy_mask(NSIDE_BASE)
     mask_alm = ducc0_map2alm(mask, lmax=LW, iter=10)
     return mask, mask_alm, red_cl(LMAX_BASE)
+
+
+@pytest.fixture(scope="module")
+def baseline():
+    return _mask_setup("cap")
+
+
+@pytest.fixture(scope="module", params=["cap", "patchy"])
+def any_mask(request):
+    """The baseline cap and ``patchy_mask`` (every azimuthal order populated)."""
+    return _mask_setup(request.param)
 
 
 @pytest.fixture(scope="module")
@@ -116,15 +132,15 @@ def test_input_validation(baseline):
         exact_covariance_row(mask_alm, cl, 20, LMAX_BASE, grid="gl", lmax_grid=31)
 
 
-def test_row_column_symmetry_without_adjoint_correction(baseline):
+def test_row_column_symmetry_without_adjoint_correction(any_mask):
     """
     On GL the quadrature-weighted analysis is the true adjoint of synthesis,
     so K C K^dagger is symmetric by construction and no Neumann-series adjoint
     (the HEALPix ``exact_adjoint``) is needed.  Measured max|S - S^T| / max|S|
     is 3e-18; element-wise the far off-diagonal (1e-21 of the maximum) is
-    round-off limited at ~3e-13.
+    round-off limited at ~3e-13 (patchy mask: 4e-18 and 7e-16).
     """
-    _, mask_alm, cl = baseline
+    _, mask_alm, cl = any_mask
     rows = (3, 8, 13, 20, 32)
     computed = {
         lp: exact_covariance_row(mask_alm, cl, lp, LMAX_BASE, grid="gl") for lp in rows
@@ -136,9 +152,10 @@ def test_row_column_symmetry_without_adjoint_correction(baseline):
             np.testing.assert_allclose(computed[a][b], computed[b][a], rtol=1e-11)
 
 
-def test_m_prime_symmetry(baseline):
-    """Summing m' >= 0 with weight 2 must reproduce the full m' loop."""
-    _, mask_alm, cl = baseline
+def test_m_prime_symmetry(any_mask):
+    """Summing m' >= 0 with weight 2 must reproduce the full m' loop
+    (measured 1.4e-13 on the cap, 9e-16 on the patchy mask)."""
+    _, mask_alm, cl = any_mask
     for lp in (0, 1, 7, 18):
         fast = exact_covariance_row(
             mask_alm, cl, lp, LMAX_BASE, grid="gl", use_symmetry=True
@@ -149,16 +166,17 @@ def test_m_prime_symmetry(baseline):
         np.testing.assert_allclose(fast, full, rtol=1e-12)
 
 
-def test_minimal_grid_equals_sufficient_grid(baseline):
+def test_minimal_grid_equals_sufficient_grid(any_mask):
     """
     The default grid gl_minimal_lmax(lmax, lw) gives the same row as the
     a-priori sufficient grid lmax + lw, which over-resolves by lw/2.
 
     Row-normalised (max|diff| / max|row|, the spike's metric) the two agree to
     2e-13; the row spans ten decades, so its smallest elements are round-off
-    limited at ~3e-11 relative.
+    limited at ~3e-11 relative.  (Patchy mask: 7e-16 row-normalised, 7e-15
+    element-wise over two decades.)
     """
-    _, mask_alm, cl = baseline
+    _, mask_alm, cl = any_mask
     lp = LMAX_BASE
     assert gl_minimal_lmax(LMAX_BASE, LW) == 56
     minimal = exact_covariance_row(mask_alm, cl, lp, LMAX_BASE, grid="gl")
@@ -169,7 +187,7 @@ def test_minimal_grid_equals_sufficient_grid(baseline):
     np.testing.assert_allclose(minimal, large, rtol=1e-9)
 
 
-def test_gl_matches_healpix_estimator_on_diagonal_band(baseline):
+def test_gl_matches_healpix_estimator_on_diagonal_band(any_mask):
     """
     The two grids compute the covariance of two different estimators: HEALPix
     that of the pixelised map2alm(iter) pseudo-spectrum, GL that of the
@@ -178,8 +196,10 @@ def test_gl_matches_healpix_estimator_on_diagonal_band(baseline):
     (l = 15..22, where Sigma/Sigma_diag ~ 0.7-1.1) and by up to 7e-3 at
     l = 32 where Sigma is 2e-4 of the diagonal.  The 2e-5 bound is that
     measured difference, converging as nside^-2, not a tolerance to loosen.
+    On the patchy mask the same numbers are 7.2e-6 (band), 5.5e-6 (l = 20)
+    and 8.3e-3 (l = 32).
     """
-    mask, mask_alm, cl = baseline
+    mask, mask_alm, cl = any_mask
     lp = 20
     gl = exact_covariance_row(mask_alm, cl, lp, LMAX_BASE, grid="gl")
     hpx = exact_covariance_row(mask, cl, lp, LMAX_BASE, NSIDE_BASE)
@@ -189,7 +209,7 @@ def test_gl_matches_healpix_estimator_on_diagonal_band(baseline):
     assert rel.max() < 1e-2
 
 
-def test_parseval_identity_for_acc_precompute(baseline):
+def test_parseval_identity_for_acc_precompute(any_mask):
     """
     sum_{LM} |I_{lm,LM}|^2 = int W^2 |Y_lm|^2 dOmega  with I = analysis(W Y_lm).
 
@@ -197,7 +217,7 @@ def test_parseval_identity_for_acc_precompute(baseline):
     product's band-limit) the identity holds to 1e-15 for every mode; the
     HEALPix precompute at iter=0 loses up to 1e-2 on m=0 modes at nside=32.
     """
-    _, mask_alm, _ = baseline
+    _, mask_alm, _ = any_mask
     for ell, m in ((2, 0), (10, 0), (10, 7), (15, 15), (30, 12)):
         lg = LW + ell
         w = gl_synthesis(mask_alm, LW, lg)

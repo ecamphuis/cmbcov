@@ -5,8 +5,9 @@ A-priori term selection for the ACC kernel
 Pins: the Parseval identity behind ``mode_power`` (spin 0 and 2), the
 ``pole_rotation`` convention, the sharp selection an azimuthally symmetric
 cap must give once rotated to the pole (pairs only on ``m == m'``, band
-``k <= 1``), and -- on the package's baseline mask -- that the kernel built
-from the selected terms is within ``tolerance`` of the full one.  The kernels
+``k <= 1``), and -- on the package's baseline mask and on a mask that is not
+azimuthally symmetric in its pole frame -- that the kernel built from the
+selected terms is within ``tolerance`` of the full one.  The kernels
 are assembled here from the integrals directly (Theta and K as in Camphuis
 et al. 2022, Sect. 4), independently of the ACC precompute.
 """
@@ -17,6 +18,8 @@ import numpy as np
 import pytest
 
 healpy = pytest.importorskip("healpy")
+
+from conftest import two_blob_mask  # noqa: E402
 
 from cmbcov.grid import (  # noqa: E402
     banded_integrals_gl,
@@ -142,16 +145,26 @@ def test_symmetric_cap_selects_only_diagonal_pairs_in_pole_frame(tolerance):
     assert sel0.m_band > 10 and sel0.frac_pairs > 5 * sel.frac_pairs
 
 
+@pytest.mark.parametrize("which", ["baseline", "two_blob"])
 @pytest.mark.parametrize("ellp_offset", [0, 3])
-def test_selected_terms_reproduce_baseline_kernel_within_tolerance(ellp_offset):
+def test_selected_terms_reproduce_baseline_kernel_within_tolerance(ellp_offset, which):
     """Kernel from the selected (m, m', |M - m| <= k) terms, built with
-    banded_integrals_gl, against the full kernel from spin_weighted_integrals_gl."""
+    banded_integrals_gl, against the full kernel from spin_weighted_integrals_gl.
+    The baseline mask is a polar cap: in its pole frame the band is ``M = m``
+    and the pairs are ``m == m'``, which would hide an error in how
+    ``banded_integrals_gl`` places the orders ``M != m``; the two-blob mask
+    (:func:`two_blob_alm`) does not."""
     nside = 16
     lw, lmax_out = 3 * nside - 1, 2 * nside - 1
     ell, ellp = nside, nside + ellp_offset
     tolerance = 1e-3
-    mask = healpy.read_map(os.path.join(DATA, "baseline_mask.fits"))
-    alm = rotate_alm(healpy.map2alm(mask, lmax=lw, iter=10), lw, pole_rotation(mask))
+    if which == "baseline":
+        mask = healpy.read_map(os.path.join(DATA, "baseline_mask.fits"))
+        alm = rotate_alm(
+            healpy.map2alm(mask, lmax=lw, iter=10), lw, pole_rotation(mask)
+        )
+    else:
+        alm = two_blob_alm(nside, lw)
     sel = select_terms(alm, lw, ell, ellp, tolerance)
 
     def full(ell_):
@@ -192,13 +205,10 @@ def test_selected_terms_reproduce_baseline_kernel_within_tolerance(ellp_offset):
 
 
 def two_blob_alm(nside, lw):
-    """Genuinely asymmetric mask: a large cap plus a smaller one 50 deg away.
-    In the pole frame P(0) = 0.74, P(1) = 0.077, P(2) = 0.025 (nside 16)."""
-    mask = np.clip(
-        cap_mask(nside, 47.0, 23.0, 30, 12) + 0.6 * cap_mask(nside, 95.0, 5.0, 18, 8),
-        0,
-        1,
-    )
+    """Genuinely asymmetric mask (``two_blob_mask`` of ``tests/conftest.py``):
+    a large cap plus a smaller one 50 deg away, in its pole frame.
+    P(0) = 0.74, P(1) = 0.077, P(2) = 0.025 (nside 16)."""
+    mask = two_blob_mask(nside)
     return rotate_alm(healpy.map2alm(mask, lmax=lw, iter=10), lw, pole_rotation(mask))
 
 

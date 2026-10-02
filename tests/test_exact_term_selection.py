@@ -11,6 +11,12 @@ lmax 32, tolerance 1e-3: max relative error on elements above 1e-6 of the
 diagonal 1.5e-5 (l' = 10), 6.3e-8 (20), 1.7e-6 (32); fraction of ``m'``
 skipped 0.48 / 0.54 / 0.59 (the geometric expectation for a cap of radius
 ``r`` is ``1 - sin r`` = 0.66).
+
+A cap rotated to its pole frame is azimuthally symmetric again, so there the
+selected row mixes no azimuthal orders; the comparisons also run on the
+two-blob mask of ``tests/conftest.py``, which stays asymmetric in the pole
+frame.  Measured there: 1.5e-14 / 1.8e-5 / 1.6e-7, fraction of ``m'``
+skipped 0.00 / 0.10 / 0.09.
 """
 
 import warnings
@@ -19,6 +25,8 @@ import numpy as np
 import pytest
 
 healpy = pytest.importorskip("healpy")
+
+from conftest import two_blob_mask  # noqa: E402
 
 from cmbcov import exact  # noqa: E402
 from cmbcov.exact import (  # noqa: E402
@@ -50,14 +58,29 @@ def setup():
     return mask, cl
 
 
+#: Smallest fraction of ``m'`` the selection must skip, per mask and row.
+MIN_SKIPPED = {
+    "cap": {10: 0.3, 20: 0.3, 32: 0.3},
+    "two_blob": {10: 0.0, 20: 0.05, 32: 0.05},
+}
+
+
+@pytest.fixture(scope="module", params=["cap", "two_blob"])
+def any_setup(request, setup):
+    """``setup`` and the two-blob mask (asymmetric in its pole frame)."""
+    if request.param == "cap":
+        return "cap", setup
+    return "two_blob", (two_blob_mask(NSIDE), setup[1])
+
+
 def _rel_err(sel, full):
     big = np.abs(full) > 1e-6 * np.abs(full).max()
     return (np.abs(sel - full)[big] / np.abs(full)[big]).max()
 
 
 @pytest.mark.parametrize("ellp", [10, 20, 32])
-def test_row_with_term_selection_matches_the_full_row(setup, ellp, capsys):
-    mask, cl = setup
+def test_row_with_term_selection_matches_the_full_row(any_setup, ellp, capsys):
+    which, (mask, cl) = any_setup
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # band-limit margin at l' = lmax
         full = exact_covariance_row(mask, cl, ellp, LMAX, grid="gl")
@@ -68,16 +91,16 @@ def test_row_with_term_selection_matches_the_full_row(setup, ellp, capsys):
     skipped = 1.0 - keep.mean()
     with capsys.disabled():
         print(
-            f"\n  exact row l'={ellp}: max rel err {err:.2e}, "
+            f"\n  exact row l'={ellp} ({which}): max rel err {err:.2e}, "
             f"fraction of m' skipped {skipped:.3f} ({keep.size - keep.sum()}/{keep.size})"
         )
     assert err <= TOL, err
-    assert skipped > 0.3, skipped
+    assert skipped >= MIN_SKIPPED[which][ellp], skipped
 
 
-def test_selection_is_correct_in_any_frame_and_symmetric_in_m(setup):
+def test_selection_is_correct_in_any_frame_and_symmetric_in_m(any_setup):
     """The row does not depend on the frame; the kept set is even in m'."""
-    mask, cl = setup
+    _, (mask, cl) = any_setup
     alm, lw = _mask_alm_for_gl(mask, None, None)
     rotated = _pole_frame_alm(mask, alm, lw)
     plain = exact.__dict__["_exact_row_gl"](alm, lw, cl, 20, LMAX)
@@ -109,8 +132,8 @@ def test_matrix_and_worker_plumbing_carry_the_selection(setup):
     assert _rel_err(worker_row, worker_full) <= TOL
 
 
-def test_polarised_row_with_term_selection(setup):
-    mask, cl = setup
+def test_polarised_row_with_term_selection(any_setup):
+    _, (mask, cl) = any_setup
     cls = {"TT": cl, "EE": 0.1 * cl, "BB": 0.01 * cl, "TE": 0.3 * cl}
     spectra = ("TT", "TE", "EE")
     full = exact_covariance_row_pol(mask, cls, 20, LMAX, spectra=spectra)

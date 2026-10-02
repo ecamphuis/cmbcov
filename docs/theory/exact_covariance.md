@@ -133,16 +133,64 @@ it matters:
 Each column costs a fixed number of spherical-harmonic transforms on the
 grid, about $\ell_{\mathrm{int}}^3$ operations each, and a row needs
 $\ell' + 1$ columns, so a row costs of order $\ell'^4$ and the full matrix of
-order $\ell_{\max}^5$. The GL path carries each complex column as two real
-transforms and synthesises the single harmonic of step 1 with one azimuthal
-order only.
+order $\ell_{\max}^5$.
 
-Measured on a 14-core laptop, TT, on the 4% footprint above with
-$L_w = 384$: one row at $\ell' = 500$ takes of order 10 s and the full matrix
-to $\ell_{\max} = 500$ about half an hour; one row at $\ell' = 1000$ takes
-about 2 minutes, and the full matrix to $\ell_{\max} = 1000$ about 16 hours.
+On the GL grid the TT columns of a row are computed together. Every
+transform is a Legendre sum per azimuthal order $M$ followed by an FFT per
+ring, so a chunk of columns goes through the Legendre sums as matrix
+products with a table of $\lambda_{LM}(\theta)$ and through one batched FFT.
+Step 1 needs no transform: the masked single harmonic has the ring profile
+$W_{M-m'}(\theta)\thinspace \lambda_{\ell' m'}(\theta)$ in order $M$, so its analysis
+is one more matrix product. Only the orders that can be non-zero are
+computed, $|M - m'| \le L_w$ after step 1 and $\le 2L_w$ after step 3. The
+number of columns per chunk, and whether the Legendre table is kept for all
+rows, follow from `max_memory_gb` (default 2 GiB); the result depends on
+it only through rounding, and agrees with the column-by-column computation
+to a few $10^{-15}$ of the largest entry.
+
+Measured on a 14-core laptop shared with other jobs (load 10-15), TT,
+mask band-limit $L_w = 384$, a two-patch mask, one row at
+$\ell' = \ell_{\max}$ with the default budget, batched against column by
+column: 3.7-10 s against 25 s at $\ell_{\max} = 500$, and 28-36 s against
+130 s at 1000; at 1500 and 2000 (estimated from sampled columns) 88-90 ms
+and 112-179 ms per column against 245 and 521 ms. So the batched row is
+faster at every size, roughly 2.5-4 times (the ranges reflect the load).
+The rows are identical for any number of threads.
+On a fixed grid every column costs about the same, so a full matrix,
+$\sum_{\ell'} (\ell' + 1)$ columns, costs roughly $\ell_{\max}/2$ times its
+last row.
 A polarised row computes up to three columns per $(\ell', m')$, one per
-field $Z$, with spin-2 transforms for E and B.
+field $Z$, with spin-2 transforms for E and B, and they are batched the
+same way. In the basis $(E, iB)$ on the coefficients and $(Q, iU)$ on the
+rings, the spin-2 transform of order $M$ is the real block
+
+```math
+\begin{pmatrix} \lambda^+_{LM}(\theta) & \lambda^-_{LM}(\theta) \\ \lambda^-_{LM}(\theta) & \lambda^+_{LM}(\theta) \end{pmatrix}
+```
+
+of two spin-weighted Legendre functions (the convention of `ducc0` and
+HEALPix), so every spin-2 Legendre sum is again a matrix product. The B
+column needs no step-1 work of its own (its coefficients are those of the
+E column with E and $iB$ exchanged), and the Wick contraction of the six
+spectra is done on the whole chunk at once. A polarised $m'$ carries up to
+nine ring profiles (three columns, each on T, Q and U) against one for
+TT, and the Legendre tables are up to three times larger, so at the same
+`max_memory_gb` a chunk holds up to nine times fewer $m'$. The result
+agrees with the column-by-column computation to about $10^{-15}$ of the
+largest entry of the row.
+
+Measured on the same laptop, all six spectra, $L_w = 384$, a two-patch
+mask, one row at $\ell' = \ell_{\max}$ with the default budget, batched
+against column by column: 59-122 s against 309 s at $\ell_{\max} = 500$,
+and 591-749 s against 2241 s at 1000; at 1500 and 2000 (estimated from
+sampled columns) 1.4 and 1.6-2.0 s per column against 4.4 and 5.7 s. As for
+TT, the batched row is faster at every size, roughly 2.5-4 times, with no
+need to raise `max_memory_gb`. From $\ell_{\max} \approx 500$ the tables
+no longer fit in half of 2 GiB; the Legendre sums of a chunk are then
+ducc0 transforms on the chunk's own bands rather than products with a
+table, which gives the same row to rounding. The rows are identical for any
+number of threads.
+
 Rows are independent: on the GL grid, `exact_covariance(..., nprocs=N)`
 spreads them over processes, although on a single machine ducc0's own threads are usually the
 better lever. [Term selection](term_selection.md) can skip the orders $m'$

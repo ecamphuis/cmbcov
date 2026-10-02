@@ -21,8 +21,16 @@ literal version kept behind ``_exact_row_gl(..., reference=True)``:
 * the unit-vector pair is bit-identical to ``pair_from_full``;
 * the ``|c|^2`` accumulation is the full-``M`` sum;
 * the row is the reference row to 1e-13 relative, element by element,
-  with and without the ``m' -> -m'`` symmetry;
+  with and without the ``m' -> -m'`` symmetry (the per-column row,
+  ``batched=False``; the batched default is pinned against it in
+  ``tests/test_exact_batched.py``);
 * ``nprocs > 1`` is bit-identical to the serial loop.
+
+The rows are compared on the baseline cap and on the two-patch mask of
+``tests/conftest.py``: on the cap a column has coefficients at ``M = m'``
+only, so the ``-M`` half of the pair bookkeeping (the reflection in
+``_abs2_sum_over_m``, the ``(-1)^M`` of ``pair_from_full``) is never mixed
+with the ``+M`` half.
 """
 
 import os
@@ -31,6 +39,8 @@ import numpy as np
 import pytest
 
 healpy = pytest.importorskip("healpy")
+
+from conftest import patchy_mask  # noqa: E402
 
 from cmbcov.exact import (  # noqa: E402
     _abs2_sum_over_m,
@@ -65,6 +75,14 @@ def red_cl(lmax):
 def baseline():
     mask = healpy.read_map(os.path.join(DATA_DIR, "baseline_mask.fits"))
     return ducc0_map2alm(mask, lmax=LW, iter=10), red_cl(LMAX)
+
+
+@pytest.fixture(scope="module", params=["cap", "patchy"])
+def any_mask(request, baseline):
+    """The baseline cap and ``patchy_mask`` (every azimuthal order populated)."""
+    if request.param == "cap":
+        return baseline
+    return ducc0_map2alm(patchy_mask(NSIDE), lmax=LW, iter=10), red_cl(LMAX)
 
 
 # --------------------------------------------------------------------------- #
@@ -136,25 +154,26 @@ def test_abs2_sum_over_m_matches_full_m_sum():
 # The row itself
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("ellp", [0, 1, 7, 20, 32])
-def test_fast_row_equals_reference_row(baseline, ellp):
+def test_fast_row_equals_reference_row(any_mask, ellp):
     """
     The real-pair row and the literal complex-map row agree element by element
     to 1e-13 relative.  They are not bit-identical: skipping the full-M round
     trip around the ``C_L`` multiply replaces ``(a-b) + (a+b)`` by ``2a``, an
     ulp.  The rows here span up to ten decades, so this is a per-element bound
-    on the smallest entries too, not a row-normalised one.
+    on the smallest entries too, not a row-normalised one.  (Measured 3e-14
+    on the cap, 1e-15 on the patchy mask.)
     """
-    mask_alm, cl = baseline
-    fast = _exact_row_gl(mask_alm, LW, cl, ellp, LMAX, nthreads=2)
+    mask_alm, cl = any_mask
+    fast = _exact_row_gl(mask_alm, LW, cl, ellp, LMAX, nthreads=2, batched=False)
     ref = _exact_row_gl(mask_alm, LW, cl, ellp, LMAX, nthreads=2, reference=True)
     np.testing.assert_allclose(fast, ref, rtol=1e-13)
 
 
-def test_fast_row_equals_reference_without_symmetry(baseline):
+def test_fast_row_equals_reference_without_symmetry(any_mask):
     """The same for the full ``m' = -l'..l'`` loop, which exercises ``m' < 0``."""
-    mask_alm, cl = baseline
+    mask_alm, cl = any_mask
     kw = {"nthreads": 2, "use_symmetry": False}
-    fast = _exact_row_gl(mask_alm, LW, cl, 11, LMAX, **kw)
+    fast = _exact_row_gl(mask_alm, LW, cl, 11, LMAX, batched=False, **kw)
     ref = _exact_row_gl(mask_alm, LW, cl, 11, LMAX, reference=True, **kw)
     np.testing.assert_allclose(fast, ref, rtol=1e-13)
 

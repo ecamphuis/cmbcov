@@ -20,7 +20,8 @@
   contributors.
 - [`theory/acc.md`](theory/acc.md), [`theory/exact_covariance.md`](theory/exact_covariance.md),
   [`theory/bmode_kernels.md`](theory/bmode_kernels.md),
-  [`theory/term_selection.md`](theory/term_selection.md) — the methods
+  [`theory/term_selection.md`](theory/term_selection.md),
+  [`theory/filter_and_bin.md`](theory/filter_and_bin.md) — the methods
   themselves.
 
 See also [`../examples/`](../examples/) for runnable scripts and an

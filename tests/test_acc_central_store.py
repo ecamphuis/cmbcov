@@ -17,6 +17,9 @@ Checked on the rotated test mask (no azimuthal symmetry, so ``Im Theta``
 contributes), with budgets small enough to force several blocks on both
 sides, at ``ell == ellp`` and ``ell != ellp``, with and without term
 selection; and the store is removed after a run and after an exception.
+Term selection works in the mask's pole frame, where the rotated test mask
+(a cap) is azimuthally symmetric again, so the selected runs are also
+checked on the two-blob mask of ``tests/conftest.py``, which is not.
 """
 
 import os
@@ -71,6 +74,15 @@ def rotated_mask_dir(tmp_path_factory):
 @pytest.fixture(scope="module")
 def wlm(rotated_mask_dir):
     return MaskWlm("baseline_mask.fits", load_path=rotated_mask_dir)
+
+
+@pytest.fixture(scope="module", params=["rotated", "two_blob"])
+def ts_wlm(request, wlm, two_blob_mask_dir):
+    """The mask of the term-selection runs: the rotated test mask, and the
+    two-blob mask (asymmetric in its pole frame)."""
+    if request.param == "rotated":
+        return wlm
+    return MaskWlm("two_blob_mask.fits", load_path=two_blob_mask_dir)
 
 
 @pytest.fixture(scope="module")
@@ -250,10 +262,10 @@ def test_held_stored_and_streamed_agree(wlm, rotated_mask_alm, tmp_path, ellp):
 
 
 @pytest.mark.parametrize("ellp", [ELL, ELL + 3], ids=["diagonal", "off-diagonal"])
-def test_held_stored_and_streamed_agree_under_term_selection(wlm, tmp_path, ellp):
-    precompute = _CouplingPrecompute(wlm)
-    alm = hp.map2alm(wlm.mask, lmax=LW_TS, iter=10)
-    alm = rotate_alm(alm, LW_TS, pole_rotation(wlm.mask))
+def test_held_stored_and_streamed_agree_under_term_selection(ts_wlm, tmp_path, ellp):
+    precompute = _CouplingPrecompute(ts_wlm)
+    alm = hp.map2alm(ts_wlm.mask, lmax=LW_TS, iter=10)
+    alm = rotate_alm(alm, LW_TS, pole_rotation(ts_wlm.mask))
     plan = _TermSelectionPlan(alm, LW_TS, LMAX, ELL, TOL_TS, t_only=False)
     sel = plan.selection(ELL, ellp)
     n_m, n_mp = int(sel.keep_m.sum()), int(sel.keep_mp.sum())
@@ -266,8 +278,14 @@ def test_held_stored_and_streamed_agree_under_term_selection(wlm, tmp_path, ellp
         _assert_close(got, reference, name)
 
 
-@pytest.mark.parametrize("term_selection", [None, TOL_TS], ids=["full", "selected"])
-def test_precompute_store_matches_in_ram_end_to_end(wlm, tmp_path, term_selection):
+@pytest.mark.parametrize(
+    "term_selection, mask",
+    [(None, "rotated"), (TOL_TS, "rotated"), (TOL_TS, "two_blob")],
+    ids=["full", "selected", "selected-two_blob"],
+)
+def test_precompute_store_matches_in_ram_end_to_end(
+    wlm, two_blob_mask_dir, tmp_path, term_selection, mask
+):
     """Through :func:`precompute_acc_kernels`: a budget below half the
     central set (so the store is built, and blocks are small on both sides)
     against one that holds everything, over several ``ellp`` including
@@ -280,6 +298,8 @@ def test_precompute_store_matches_in_ram_end_to_end(wlm, tmp_path, term_selectio
         "dryrun": True,
         "term_selection": term_selection,
     }
+    if mask == "two_blob":
+        wlm = MaskWlm("two_blob_mask.fits", load_path=two_blob_mask_dir)
     scratch = tmp_path / "scratch"
     small = precompute_acc_kernels(
         wlm, None, max_memory_gb=2.0 / 1024, scratch_dir=str(scratch), **common

@@ -243,6 +243,131 @@ def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _is_number(value: Any) -> bool:
+    """A YAML number: ``int`` or ``float`` but not ``bool``."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+#: Parameter-file key of the map-filter block, see :class:`MapFilterConfig`.
+MAP_FILTER_KEY = "map_filter"
+
+
+@dataclass(frozen=True)
+class MapFilterConfig:
+    """
+    The ``map_filter`` block of a parameter file: the optional filter-and-bin
+    correction of the T/E covariance blocks
+    (:mod:`cmbcov.filtering`, docs/theory/filter_and_bin.md).
+
+    Each raw T/E pseudo-C_l block with stokes pair ``(s1, s2)`` is
+    multiplied, elementwise, by
+    ``rho^ch(l1, l2) / (fl_left[s1][l1] fl_right[s2][l2])``, where
+    ``rho^ch`` is the filtered sum-rule ratio of the mask for the filter
+    described here, in the block's sum-rule channel ``ch`` (``00``, ``20``
+    or ``EE``). Blocks with a B leg are left uncorrected.
+
+    Attributes
+    ----------
+    type : {"fourier_highpass"}
+        Kind of filter. Only the scan-direction Fourier high-pass exists.
+    lx : float
+        Cut of the filter, ``m_c = lx sin(theta)`` (``m`` the azimuthal
+        Fourier index around the map's polar axis, which must be the scan
+        axis).
+    shape : {"sharp", "exp"}, default "sharp"
+        Filter profile around the cut.
+    power : float, default 6
+        Steepness of the ``exp`` profile (unused by ``sharp``).
+    nprobe : int, default 32
+        Number of random probes of the stochastic sum-rule estimate.
+    seed : int, default 0
+        Seed of those probes.
+    node_min : int, default 32
+        Smallest multipole of the interpolation nodes.
+    node_ratio : float, default 1.25
+        Geometric spacing of the nodes, ``> 1``.
+    dmax : int, optional
+        Largest ``|l1 - l2|`` the sum-rule ratio is probed to. ``None``
+        means the run's ACC ``dmax - 1`` for ACC and 64 otherwise, capped at
+        ``lmax - 1`` (:meth:`resolved_dmax`).
+    lw : int, optional
+        Mask band-limit of the probes. ``None`` means
+        ``min(3 nside - 1, 2 lmax)`` (:meth:`resolved_lw`).
+    """
+
+    type: str
+    lx: float
+    shape: str = "sharp"
+    power: float = 6.0
+    nprobe: int = 32
+    seed: int = 0
+    node_min: int = 32
+    node_ratio: float = 1.25
+    dmax: int | None = None
+    lw: int | None = None
+
+    #: Keys accepted in the block.
+    KEYS = (
+        "type",
+        "lx",
+        "shape",
+        "power",
+        "nprobe",
+        "seed",
+        "node_min",
+        "node_ratio",
+        "dmax",
+        "lw",
+    )
+    #: Accepted values of ``type``.
+    TYPES = ("fourier_highpass",)
+    #: Accepted values of ``shape``.
+    SHAPES = ("sharp", "exp")
+    #: Default ``dmax`` for the methods without an ACC ``dmax``.
+    DEFAULT_DMAX = 64
+
+    @classmethod
+    def from_block(cls, block: Mapping[str, Any]) -> "MapFilterConfig":
+        """
+        Build from an already validated block (``_check_map_filter`` has
+        rejected malformed values; absent optional keys take the defaults).
+        """
+        block = dict(block)
+        return cls(
+            type=block.get("type"),
+            lx=block.get("lx"),
+            shape=block.get("shape", "sharp"),
+            power=block.get("power", 6.0),
+            nprobe=block.get("nprobe", 32),
+            seed=block.get("seed", 0),
+            node_min=block.get("node_min", 32),
+            node_ratio=block.get("node_ratio", 1.25),
+            dmax=block.get("dmax"),
+            lw=block.get("lw"),
+        )
+
+    def resolved_dmax(self, lmax: int, method: CovarianceMethod, acc_dmax: int) -> int:
+        """
+        The ``dmax`` the probes use: the block's, else ``acc_dmax - 1`` for
+        ACC (its kernels carry ``|l1 - l2| < dmax``) and
+        :attr:`DEFAULT_DMAX` otherwise; capped at ``lmax - 1``, and never
+        below 0.
+        """
+        if self.dmax is not None:
+            dmax = self.dmax
+        elif method == CovarianceMethod.ACC:
+            dmax = acc_dmax - 1
+        else:
+            dmax = self.DEFAULT_DMAX
+        return max(0, min(int(dmax), lmax - 1))
+
+    def resolved_lw(self, nside: int, lmax: int) -> int:
+        """The mask band-limit of the probes: the block's, else ``min(3 nside - 1, 2 lmax)``."""
+        if self.lw is not None:
+            return int(self.lw)
+        return min(3 * nside - 1, 2 * lmax)
+
+
 #: Every valid single-frequency observable spectrum, canonical ("leg order")
 #: form (docs/theory/bmode_kernels.md).
 VALID_OBSERVABLES = ("TT", "EE", "BB", "TE", "TB", "EB")
@@ -696,6 +821,9 @@ class ParameterValidator:
         # Check the ACC precompute block, if any
         self._check_acc_precompute(params)
 
+        # Check the map-filter block, if any
+        self._check_map_filter(params)
+
         # Check the spectrum-units keys
         self._check_spectrum_units(params)
 
@@ -923,6 +1051,96 @@ class ParameterValidator:
                 self.warnings.append(warning_msg)
             else:
                 self.logger.debug("Foregrounds parameter format is valid")
+
+    def _check_map_filter(self, params: dict[str, Any]) -> None:
+        """
+        Validate the optional ``map_filter`` block (:class:`MapFilterConfig`).
+
+        Errors: the block is not a mapping; an unknown key; ``type`` missing
+        or not ``fourier_highpass``; ``lx`` missing or not a positive number;
+        ``shape`` not ``sharp`` or ``exp``; ``power`` not a positive number;
+        ``nprobe`` not an integer >= 1; ``seed`` not an integer;
+        ``node_min`` not an integer >= 2; ``node_ratio`` not a number > 1;
+        ``dmax`` not null or an integer >= 0; ``lw`` not null or a positive
+        integer.
+
+        A run with B-mode blocks is not refused: the correction covers the
+        T/E blocks only and the run warns that the blocks with a B leg are
+        uncorrected.
+        """
+        if MAP_FILTER_KEY not in params:
+            return
+        block = params[MAP_FILTER_KEY]
+        where = MAP_FILTER_KEY
+        if not isinstance(block, dict):
+            self.errors.append(
+                f"'{where}' must be a mapping of {list(MapFilterConfig.KEYS)}, "
+                f"got {type(block).__name__}"
+            )
+            return
+
+        unknown = sorted(set(block) - set(MapFilterConfig.KEYS))
+        if unknown:
+            self.errors.append(
+                f"Unknown key(s) {unknown} in '{where}'; expected a subset of "
+                f"{list(MapFilterConfig.KEYS)}"
+            )
+
+        kind = block.get("type")
+        if kind not in MapFilterConfig.TYPES:
+            self.errors.append(
+                f"'{where}.type' is required and must be one of "
+                f"{list(MapFilterConfig.TYPES)}, got {kind!r}"
+            )
+
+        if "lx" not in block:
+            self.errors.append(f"'{where}.lx' is required (the filter cut)")
+        elif not _is_number(block["lx"]) or not block["lx"] > 0:
+            self.errors.append(
+                f"'{where}.lx' must be a positive number, got {block['lx']!r}"
+            )
+
+        shape = block.get("shape", "sharp")
+        if shape not in MapFilterConfig.SHAPES:
+            self.errors.append(
+                f"'{where}.shape' must be one of {list(MapFilterConfig.SHAPES)}, "
+                f"got {shape!r}"
+            )
+
+        power = block.get("power", 6.0)
+        if not _is_number(power) or not power > 0:
+            self.errors.append(
+                f"'{where}.power' must be a positive number, got {power!r}"
+            )
+
+        for key, low in (("nprobe", 1), ("node_min", 2)):
+            value = block.get(key, low)
+            if not _is_int(value) or value < low:
+                self.errors.append(
+                    f"'{where}.{key}' must be an integer >= {low}, got {value!r}"
+                )
+
+        seed = block.get("seed", 0)
+        if not _is_int(seed):
+            self.errors.append(f"'{where}.seed' must be an integer, got {seed!r}")
+
+        ratio = block.get("node_ratio", 1.25)
+        if not _is_number(ratio) or not ratio > 1:
+            self.errors.append(
+                f"'{where}.node_ratio' must be a number > 1, got {ratio!r}"
+            )
+
+        dmax = block.get("dmax")
+        if dmax is not None and (not _is_int(dmax) or dmax < 0):
+            self.errors.append(
+                f"'{where}.dmax' must be null or an integer >= 0, got {dmax!r}"
+            )
+
+        lw = block.get("lw")
+        if lw is not None and (not _is_int(lw) or lw <= 0):
+            self.errors.append(
+                f"'{where}.lw' must be null or a positive integer, got {lw!r}"
+            )
 
     def _check_acc_precompute(self, params: dict[str, Any]) -> None:
         """
@@ -1176,6 +1394,8 @@ class PipelineConfig(Mapping):
         Short git hash of the package at run time, resolved at construction.
     acc_precompute : AccPrecomputeConfig or None
         The ``acc_precompute`` block, or ``None`` if the file has none.
+    map_filter : MapFilterConfig or None
+        The ``map_filter`` block, or ``None`` if the file has none.
     params : Mapping
         Read-only record of the effective parameters: what the file said, with
         alias spellings normalised, defaults applied, and ``save_dir`` and
@@ -1242,6 +1462,8 @@ class PipelineConfig(Mapping):
     post_process_correction: Any = None
     #: The ``acc_precompute`` block; ``None`` when the file has none.
     acc_precompute: AccPrecomputeConfig | None = None
+    #: The ``map_filter`` block; ``None`` when the file has none.
+    map_filter: MapFilterConfig | None = None
 
     #: Read-only record of the effective parameter file. See the class
     #: docstring: this is a snapshot, not a second source of truth.
@@ -1495,6 +1717,11 @@ class PipelineConfig(Mapping):
             acc_precompute=(
                 AccPrecomputeConfig.from_block(params[ACC_PRECOMPUTE_KEY])
                 if ACC_PRECOMPUTE_KEY in params
+                else None
+            ),
+            map_filter=(
+                MapFilterConfig.from_block(params[MAP_FILTER_KEY])
+                if MAP_FILTER_KEY in params
                 else None
             ),
             inpainting_rescaling=optional("inpainting_rescaling"),
@@ -1808,6 +2035,15 @@ class ParameterManager:
         self.logger.info("Checking parameter compatibility for rebinning")
         incompatible = []
         other_params = other_params or {}
+
+        # ``map_filter`` changes the numbers, and a saved file that has it
+        # where this one does not would otherwise go unnoticed (the loop below
+        # walks only this file's keys).
+        if MAP_FILTER_KEY in other_params and MAP_FILTER_KEY not in self.params:
+            self.logger.warning(
+                f"Parameter '{MAP_FILTER_KEY}' is only in the other parameter set"
+            )
+            incompatible.append(MAP_FILTER_KEY)
 
         for param in self.params:
             if param in ParameterValidator.REBINNING_PARAMS:

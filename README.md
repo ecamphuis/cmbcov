@@ -22,6 +22,9 @@ approximations to it, computed natively in NumPy with no external toolchain.
   (ACC only, with a fast BB-only NKA/INKA escape hatch).
 - **PolSpice post-processing** — the decoupled pseudo-to-full $C_\ell$
   transform of the paper's Eq. (55).
+- **Filter-and-bin maps** — an optional correction of the T/E blocks for maps
+  made with a scan-direction high-pass filter (`map_filter` block; see
+  [`docs/theory/filter_and_bin.md`](docs/theory/filter_and_bin.md)).
 - **Binning** — arbitrary bandpower binning with an `lmin` cut.
 
 ## Installation

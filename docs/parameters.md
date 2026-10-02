@@ -66,6 +66,51 @@ computes the kernels (see [`acc_precomputation.md`](acc_precomputation.md)).
 per-Wick-term normalisation reads raw kernel sums, which only the GL grid
 provides.
 
+### `map_filter` block
+
+Optional. Corrects the **T/E** covariance blocks (TT, TE, EE and their
+cross-blocks) for a map made by a scan-direction Fourier high-pass filter
+(filter-and-bin map-making); see
+[`theory/filter_and_bin.md`](theory/filter_and_bin.md). Each raw T/E
+pseudo-spectrum block of spectra $s_1$, $s_2$ is multiplied elementwise by
+
+```math
+\frac{\rho^{ch}(\ell_1, \ell_2)}{F^{L, s_1}_{\ell_1}\thinspace F^{R, s_2}_{\ell_2}}
+```
+
+for every method (NKA, INKA, ACC), where $ch$ is the block's sum-rule
+channel (`00` for TT x TT, `20` for TT x EE, TT x TE and TE x TE, `EE` for
+EE x EE and EE x TE, transposes alike) and $F^{L, s_1}$, $F^{R, s_2}$ are
+the `fl` of the left and right spectra for their frequency pairs (ET uses
+the TE `fl`, which should be a smooth positive reference such as
+$\sqrt{F^{TT} F^{EE}}$). Only the channels the run's blocks need are
+probed. Blocks with a B leg are left **uncorrected** and the run emits one
+`UserWarning` naming them. Without the block the run is unchanged. The map's
+polar axis (the mask's coordinate system) must be the scan axis:
+iso-latitude rings are the scan lines. Without `fl` the factor is $\rho$
+alone, with a warning.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `type` | `fourier_highpass` | required | Kind of filter; only `fourier_highpass` exists. |
+| `lx` | float | required | Cut $m_c = l_x \sin\theta$ of the azimuthal Fourier index. Must be `> 0`. |
+| `shape` | `sharp` \| `exp` | `sharp` | Filter profile around the cut. |
+| `power` | float | 6 | Steepness of the `exp` profile; must be `> 0`, unused by `sharp`. |
+| `nprobe` | int | 32 | Random probes per node of the stochastic sum-rule ratio; `>= 1`. The error falls as the inverse square root. |
+| `seed` | int | 0 | Seed of the probes. |
+| `node_min` | int | 32 | Lowest multipole of the nodes at which $\rho$ is probed (interpolated in between); `>= 2`. |
+| `node_ratio` | float | 1.25 | Geometric spacing of the nodes; `> 1`. |
+| `dmax` | int or null | null | Largest $\lvert \ell_1 - \ell_2 \rvert$ probed, `>= 0`. `null`: the run's ACC `dmax - 1` with ACC, 64 otherwise, capped at `lmax - 1`. |
+| `lw` | int or null | null | Mask band-limit of the probes. `null`: `min(3 * nside - 1, 2 * lmax)`. |
+
+The probed ratios are cached in the kernel directory (`cov_path`), keyed on
+the mask, the channels and every key above, so a rerun with the same filter
+and blocks does not probe again; they are also saved as
+`map_filter_ratio.npz` (`nodes`, `channels` and one `g_<channel>` per
+channel) beside the covariance. A saved parameter file that differs in `map_filter` (or has it
+where the new one has none) makes `--overwrite` refuse, like any other
+change that alters the numbers.
+
 ## Data-model inputs
 
 | Key | Type | Default | Meaning |
@@ -92,7 +137,7 @@ $$\langle \tilde C_\ell \rangle = M_{\ell\ell'} F_{\ell'} B^2_{\ell'} \langle C_
 \qquad
 \Delta C_\ell \simeq \left( C_\ell + \frac{N_\ell}{B^2_\ell} \right) \sqrt{\frac{2}{\nu_\ell}} .$$
 
-The debiasing divides each leg by `data_model` $= B_1 B_2 \, w^{\rm pix} F_\ell$,
+The debiasing divides each leg by `data_model` $= B_1 B_2 \thinspace w^{\mathrm{pix}} F_\ell$,
 so the noise enters the reported error bars as $N_\ell / B^2_\ell$ on its own —
 it grows at high $\ell$, as it should.
 

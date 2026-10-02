@@ -26,6 +26,7 @@ import pytest
 
 healpy = pytest.importorskip("healpy")
 import healpy as hp  # noqa: E402
+from conftest import patchy_mask  # noqa: E402
 
 from cmbcov import grid  # noqa: E402
 from cmbcov.approximations import acc  # noqa: E402
@@ -180,6 +181,17 @@ def mask_alm():
     return hp.map2alm(mask, lmax=LW, iter=10)
 
 
+@pytest.fixture(scope="module", params=["cap", "patchy"])
+def any_mask_alm(request, mask_alm):
+    """``mask_alm`` and the two-patch mask of ``tests/conftest.py``: on the
+    cap (azimuthally symmetric) every coefficient sits at ``M = m`` and the
+    ``-m`` reflection's ``(-1)^(m+M)`` is +1 wherever a coefficient is
+    non-zero, so a held and a streamed set could not disagree on it."""
+    if request.param == "cap":
+        return mask_alm
+    return hp.map2alm(patchy_mask(), lmax=LW, iter=10)
+
+
 @pytest.fixture(scope="module")
 def precompute():
     return _CouplingPrecompute(MaskWlm("baseline_mask.fits", load_path=DATA))
@@ -228,14 +240,14 @@ def test_a_held_central_set_comes_out_of_the_contraction_budget(
 
 
 def test_a_primed_set_is_kept_only_within_half_the_budget(
-    precompute, mask_alm, monkeypatch
+    precompute, any_mask_alm, monkeypatch
 ):
     """A primed set reused by a later ``ellp`` is materialised only while
     the sets held stay within half the budget, is charged to the budget
     while kept, and is dropped at its last use."""
     ellp = ELL + 1
     primed_bytes = (2 * ellp + 1) * _per_m(LMAX)
-    common = {"grid": "gl", "mask_alm": mask_alm, "lw": LW}
+    common = {"grid": "gl", "mask_alm": any_mask_alm, "lw": LW}
     seen = _budgets_seen(monkeypatch)
 
     cache = {}

@@ -92,6 +92,11 @@ __all__ = [
     "gl_synthesis",
     "gl_analysis",
     "gl_synthesis_single_m",
+    "gl_north_rings",
+    "gl_legendre_table",
+    "gl_legendre_table_bytes",
+    "gl_legendre_table_capacity",
+    "gl_ring_modes",
     "gl_synthesis_complex",
     "gl_analysis_complex",
     "full_from_pair",
@@ -455,6 +460,284 @@ def gl_synthesis_single_m(
         nthreads=nt,
     )
     return out.reshape(geom["ntheta"], geom["nphi"])
+
+
+# --------------------------------------------------------------------------- #
+# Legendre tables and ring modes (the batched exact covariance rows)
+# --------------------------------------------------------------------------- #
+def gl_north_rings(lmax_grid: int) -> int:
+    r"""
+    Number of rings of the northern half of the GL grid, equator included.
+
+    The GL nodes are symmetric about the equator: ring ``ntheta - 1 - j``
+    sits at :math:`\pi - \theta_j`, where
+    :math:`\lambda_{LM}(\pi - \theta) = (-1)^{L+M} \lambda_{LM}(\theta)`.
+    Rings ``0 .. n - 1`` with ``n = ceil(ntheta / 2)`` therefore carry every
+    Legendre value of the grid; for odd ``ntheta`` the last of them is the
+    equator, its own mirror image.
+    """
+    ntheta, _ = gl_shape(lmax_grid)
+    return (ntheta + 1) // 2
+
+
+def gl_legendre_table(
+    ms: np.ndarray,
+    lmax: int,
+    lmax_grid: int,
+    nthreads: int | None = None,
+    spin: int = 0,
+    out: np.ndarray | None = None,
+) -> list[tuple[np.ndarray, ...]]:
+    r"""
+    Normalised associated Legendre functions on the northern GL rings, split
+    by the parity of ``L - M`` (``spin=0``), or the two spin-2 functions
+    :math:`\lambda^\pm_{LM}` split the same way (``spin=2``).
+
+    For every order ``M`` in ``ms`` returns the pair ``(even, odd)`` with
+    ``even[i, j] = lambda_{M + 2i, M}(theta_j)`` and
+    ``odd[i, j] = lambda_{M + 2i + 1, M}(theta_j)``, ``L <= lmax``,
+    ``j < gl_north_rings(lmax_grid)``, in the convention of ducc0 and
+    healpy: :math:`Y_{LM}(\theta, \phi) = \lambda_{LM}(\theta) e^{i M \phi}`
+    (Condon-Shortley phase included).  The southern rings follow from
+    :math:`\lambda_{LM}(\pi - \theta) = (-1)^{L+M} \lambda_{LM}(\theta)`,
+    which is why the two parities are kept apart: a sum over all rings of
+    :math:`\lambda_{LM} f` is ``even @ (f_N + f_S)`` and
+    ``odd @ (f_N - f_S)`` on the northern rings.
+
+    The values are ducc0's own, bit for bit the ones its transforms use.
+    ``ducc0.sht.leg2alm`` computes
+    :math:`a_{LM} = \sum_j \mathrm{leg}_j(M)\, \lambda_{LM}(\theta_j)` with no
+    weights, so a call on two rings with legs ``(1, i)`` returns
+    :math:`\lambda_{LM}(\theta_1) + i \lambda_{LM}(\theta_2)` for every
+    ``(L, M)`` at once; ducc0's scaled recursion handles the underflow of
+    :math:`\sin^M\theta` near the poles.  Each call writes its ring pair
+    straight into place (``lstride`` = one row of rings), so every order's
+    table is ring-contiguous rows ``L = M .. lmax`` and the two parities are
+    views of every other row; no transposition or second buffer is needed.
+    A ducc0 call recomputes its recursion coefficients, a fixed cost per
+    ``(L, M)`` whatever the number of rings, so the cost per entry falls with
+    the number of orders per call: at ``lmax`` 2000 on 14 threads, 1, 4 and
+    16 orders ran at 2.5, 0.9 and 0.4 ns per entry (spin 0; spin 2 2.0, 0.7
+    and 0.6), against 3.4, 1.2 and 0.6 with the former transposed layout.
+    (No numpy recursion reproduces these values: at ``lmax`` 2000 the
+    functions near the poles are ill-conditioned in :math:`\cos\theta`, and
+    ducc0 itself is 3e-10 away from an extended-precision evaluation at
+    :math:`\theta = 0.0011`, ``L = 2000``, a numpy recursion 5e-10.)  The
+    ring pairs are spread over ``nthreads`` workers
+    (:func:`~.utils.threading_utils.run_row_blocks`), each ducc0 call
+    single-threaded, so the table is **bit-identical for any thread count**
+    and any grouping of the orders into calls.
+
+    **Spin 2.**  ducc0's spin-2 transforms are HEALPix's: for ``M >= 0`` the
+    (Q, U) ring profile of the (E, B) coefficients of order ``M`` is
+
+    .. math::
+
+        Q_M(\theta) = \sum_L \lambda^+_{LM} E_{LM} + i \lambda^-_{LM} B_{LM},
+        \qquad
+        U_M(\theta) = \sum_L -i \lambda^-_{LM} E_{LM} + \lambda^+_{LM} B_{LM}
+
+    with real :math:`\lambda^\pm_{LM}(\theta)` (``alm2leg`` of an E unit
+    vector returns ``(lambda^+, -i lambda^-)``, of a B unit vector
+    ``(i lambda^-, lambda^+)``), zero for ``L < 2``.  ``leg2alm`` is the
+    adjoint, :math:`E = \sum_\theta \lambda^+ Q + i\lambda^- U`,
+    :math:`B = \sum_\theta -i\lambda^- Q + \lambda^+ U`, so the call with
+    Q legs ``(1, i)`` on two rings and U legs 0 returns
+    :math:`\lambda^+(\theta_1) + i\lambda^+(\theta_2)` in E and ``-i``
+    times the same combination of :math:`\lambda^-` in B (multiplied by
+    ``i`` in place).  The mirror rule
+    is :math:`\lambda^+_{LM}(\pi - \theta) = (-1)^{L+M}
+    \lambda^+_{LM}(\theta)` and :math:`\lambda^-_{LM}(\pi - \theta) =
+    -(-1)^{L+M} \lambda^-_{LM}(\theta)`: the ``L - M``-even rows of
+    :math:`\lambda^-` are odd functions about the equator.  (All of this is
+    asserted against ``alm2leg`` and :func:`gl_synthesis_complex` in
+    ``tests/test_exact_pol_batched.py``.)
+
+    Parameters
+    ----------
+    ms : array_like of int
+        Orders, strictly increasing, in ``[0, lmax]``.
+    lmax : int
+        Highest degree.
+    lmax_grid : int
+        GL grid band-limit (:func:`gl_shape`).
+    nthreads : int, optional
+        Workers; the package thread policy by default.
+    spin : {0, 2}
+        Which functions to tabulate.
+    out : ndarray, optional
+        A one-dimensional ``complex128`` buffer of at least
+        :func:`gl_legendre_table_capacity` elements to build the tables in
+        (they are then views of it, overwritten by the next call on the same
+        buffer); only its last :func:`gl_legendre_table_bytes` bytes are
+        written.  A new buffer by default.
+
+    Returns
+    -------
+    list of tuple of ndarray
+        Per order, in the order of ``ms``: ``(even, odd)`` for ``spin=0``,
+        ``(plus_even, plus_odd, minus_even, minus_odd)`` for ``spin=2``;
+        read-only ``float64`` arrays of shapes ``(ceil(n / 2), n_north)``
+        (even) and ``(floor(n / 2), n_north)`` (odd), ``n = lmax - M + 1``,
+        rows with a constant stride (every other row of the order's
+        ring-contiguous table), i.e. BLAS-compatible as they are.  They
+        share one buffer, of which :func:`gl_legendre_table_bytes` bytes are
+        written.
+    """
+    if spin not in (0, 2):
+        raise ValueError(f"spin must be 0 or 2, got {spin}")
+    ms = np.asarray(ms, dtype=np.int64).ravel()
+    if ms.size == 0:
+        return []
+    if ms[0] < 0 or ms[-1] > lmax or np.any(np.diff(ms) <= 0):
+        raise ValueError("ms must be strictly increasing orders in [0, lmax]")
+    geom = _gl_geometry(lmax_grid)
+    n_north = gl_north_rings(lmax_grid)
+    npair = (n_north + 1) // 2
+    nt = _nthreads(nthreads, lmax_grid)
+    theta = np.empty(2 * npair)
+    theta[:n_north] = geom["theta"][:n_north]
+    theta[n_north:] = geom["theta"][n_north - 1]  # padding ring, discarded
+    n_ell = lmax - ms + 1
+    offset = np.concatenate([[0], np.cumsum(n_ell * npair)])  # complex entries
+    ncomp = 1 if spin == 0 else 2
+    total = int(offset[-1])
+
+    # Layout per component: order after order, rows L = M .. lmax of npair
+    # complex entries (ring pairs), i.e. 2 npair float64 rings per row.
+    # leg2alm addresses (L, M) of ring pair p at mstart + L * lstride with
+    # lstride = npair, and mstart (the hypothetical L = 0 slot) must not
+    # fall before the buffer: the data sit at the end of the buffer, after a
+    # front part that is never written (so np.empty does not commit it).
+    size = gl_legendre_table_capacity(ms, lmax, lmax_grid, spin) // ncomp
+    if out is None:
+        buf = np.empty((ncomp, size), dtype=np.complex128)
+    else:
+        if out.dtype != np.complex128 or out.ndim != 1 or out.size < ncomp * size:
+            raise ValueError(
+                f"out must be a 1-D complex128 array of at least {ncomp * size} "
+                "elements (gl_legendre_table_capacity)"
+            )
+        # one fixed row per component, data at its end: however the blocks
+        # vary, only the last written-size part of each row is ever touched
+        size = out.size // ncomp
+        buf = out[: ncomp * size].reshape(ncomp, size)
+    start = size - total
+    base = start + offset[:-1] - ms * npair
+    # Q legs (1, i) on the ring pair; for spin 2 the U legs are zero.
+    leg = np.zeros((ncomp, 2, ms.size), dtype=np.complex128)
+    leg[0, 0] = 1.0
+    leg[0, 1] = 1.0j
+
+    def pairs(p0: int, p1: int) -> None:
+        for p in range(p0, p1):
+            ducc0.sht.leg2alm(
+                leg=leg,
+                lmax=lmax,
+                theta=theta[2 * p : 2 * p + 2],
+                spin=spin,
+                mval=ms,
+                mstart=base + p,
+                lstride=npair,
+                nthreads=1,
+                alm=buf,
+            )
+
+    run_row_blocks(pairs, npair, nt)
+    if spin == 2:  # B = -i (lambda^-(theta_1) + i lambda^-(theta_2))
+        minus = buf[1, start:]
+
+        def times_i(r0: int, r1: int) -> None:
+            seg = minus[r0 * npair : r1 * npair]
+            np.multiply(seg, 1.0j, out=seg)
+
+        run_row_blocks(times_i, total // npair, nt)
+
+    tables = []
+    for i in range(ms.size):
+        entry = []
+        for c in range(ncomp):
+            rows = buf[c, start + offset[i] : start + offset[i + 1]].view(np.float64)
+            rows = rows.reshape(int(n_ell[i]), 2 * npair)[:, :n_north]
+            even, odd = rows[0::2], rows[1::2]
+            even.flags.writeable = False
+            odd.flags.writeable = False
+            entry += [even, odd]
+        tables.append(tuple(entry))
+    return tables
+
+
+def gl_legendre_table_bytes(
+    ms: np.ndarray, lmax: int, lmax_grid: int, spin: int = 0
+) -> int:
+    """Bytes of the tables :func:`gl_legendre_table` returns for ``ms`` (all
+    it writes); spin 2 holds two functions and twice the bytes."""
+    ms = np.asarray(ms, dtype=np.int64).ravel()
+    npair = (gl_north_rings(lmax_grid) + 1) // 2
+    ncomp = 1 if spin == 0 else 2
+    return ncomp * int(np.sum(lmax - ms + 1)) * npair * 16
+
+
+def gl_legendre_table_capacity(
+    ms: np.ndarray, lmax: int, lmax_grid: int, spin: int = 0
+) -> int:
+    """``complex128`` elements of the buffer :func:`gl_legendre_table`
+    builds the tables of ``ms`` in: the written tables and, in front of
+    them, ``min(ms) (n_north + 1) // 2`` elements per component that are
+    addressed but never written.  A reused buffer (``out``) must hold the
+    capacity of every block given to it; per component, the largest
+    written size plus ``lmax (n_north + 1) // 2`` suffices, and only the
+    written part at the end of each component's share is ever touched."""
+    ms = np.asarray(ms, dtype=np.int64).ravel()
+    npair = (gl_north_rings(lmax_grid) + 1) // 2
+    ncomp = 1 if spin == 0 else 2
+    written = gl_legendre_table_bytes(ms, lmax, lmax_grid, spin) // 16 // ncomp
+    return ncomp * (written + int(ms.min(initial=0)) * npair)
+
+
+def gl_ring_modes(
+    mask_alm: np.ndarray,
+    lw: int,
+    lmax_grid: int,
+    nthreads: int | None = None,
+) -> np.ndarray:
+    r"""
+    Azimuthal modes :math:`W_k(\theta_j)`, ``|k| <= lw``, of a real
+    band-limited map on every ring of the GL grid, from its alm directly.
+
+    ``W(theta_j, phi) = sum_k W_k(theta_j) e^{i k phi}`` exactly: the Legendre
+    stage of the synthesis (``ducc0.sht.alm2leg``) for ``k >= 0``, and
+    :math:`W_{-k} = \overline{W_k}` for a real map.  Unlike
+    :func:`gl_mask_modes` (an FFT of the synthesised map), the modes do not
+    alias when ``2 lw + 1 > nphi``, and only the ``2 lw + 1`` populated
+    columns are stored.  ``W_0`` is the real part of the ``k = 0`` leg, as in
+    a real-map synthesis, which ignores ``Im a_{L0}``.
+
+    Returns
+    -------
+    ndarray
+        Complex array of shape ``(ntheta, 2 lw + 1)``; column ``k + lw`` holds
+        :math:`W_k`.  Agrees with ``gl_mask_modes`` to ~1e-16 where the latter
+        does not alias.
+    """
+    import healpy as hp  # lazy, see utils/healpy_utils.py
+
+    geom = _gl_geometry(lmax_grid)
+    ks = np.arange(lw + 1, dtype=np.int64)
+    leg = ducc0.sht.alm2leg(
+        alm=_check_alm(mask_alm, lw, 0),
+        lmax=lw,
+        theta=geom["theta"],
+        spin=0,
+        mval=ks,
+        mstart=hp.Alm.getidx(lw, 0, ks).astype(np.int64),
+        nthreads=_nthreads(nthreads, lmax_grid),
+    )[0]
+    modes = np.empty((geom["ntheta"], 2 * lw + 1), dtype=np.complex128)
+    modes[:, lw:] = leg
+    modes[:, lw] = leg[:, 0].real
+    modes[:, :lw] = np.conj(leg[:, :0:-1])
+    return modes
 
 
 # --------------------------------------------------------------------------- #

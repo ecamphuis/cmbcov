@@ -59,7 +59,7 @@ validation.
 The one exception to "a B observable needs ACC" is `observables: [BB]`
 alone (cross-frequency BB is fine): NKA and INKA also accept it, with no ACC
 precompute, as a fast route to $\mathrm{Cov}(BB, BB)$ at high $\ell$. It
-computes $\mathrm{Cov}(BB, BB) = 2\, (C^{BB})^2\, \Xi^{EE\to EE}$ — the same
+computes $\mathrm{Cov}(BB, BB) = 2\thinspace (C^{BB})^2\thinspace \Xi^{EE\to EE}$ — the same
 formula as an EE covariance, since NKA/INKA cannot distinguish EE and BB by
 construction — which neglects the leakage of $C^{EE}$ power into the
 pseudo-BB mean entirely.

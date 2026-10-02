@@ -31,9 +31,14 @@ from cmbcov.mask import MaskWlm
 DATA = os.path.join(os.path.dirname(__file__), "data")
 
 
-@pytest.fixture(scope="module")
-def wlm():
-    return MaskWlm("baseline_mask", load_path=DATA)
+@pytest.fixture(scope="module", params=["cap", "patchy"])
+def wlm(request, patchy_mask_dir):
+    """The baseline mask (a polar cap, whose alm are all at ``m = 0``) and
+    the two-patch mask of ``tests/conftest.py`` (every order populated, so
+    the ``m > 0`` alm and their weight in the spectra are exercised)."""
+    if request.param == "cap":
+        return MaskWlm("baseline_mask", load_path=DATA)
+    return MaskWlm("patchy_mask", load_path=patchy_mask_dir)
 
 
 def test_pseudo_analysis_alm_matches_map2alm_iter10(wlm):

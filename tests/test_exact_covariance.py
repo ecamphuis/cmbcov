@@ -16,7 +16,7 @@ import pytest
 
 healpy = pytest.importorskip("healpy")
 
-from conftest import apodised_cap, power_law_cl  # noqa: E402
+from conftest import apodised_cap, patchy_mask, power_law_cl  # noqa: E402
 
 from cmbcov.exact import (  # noqa: E402
     exact_covariance,
@@ -41,9 +41,16 @@ N_SIMS = 10000
 BAND = (20, 50)
 
 
-@pytest.fixture(scope="module")
-def small_setup():
-    return apodised_cap(NSIDE_SMALL), power_law_cl(LMAX_SMALL)
+@pytest.fixture(scope="module", params=["cap", "patchy"])
+def small_setup(request):
+    """
+    The apodised polar cap and the two-patch mask of ``tests/conftest.py``.
+    On the cap every column couples ``M = m'`` only, so an error in how the
+    columns mix azimuthal orders (the ``+M`` / ``-M`` split of the complex
+    maps) would not show; the patchy mask populates every order.
+    """
+    make = apodised_cap if request.param == "cap" else patchy_mask
+    return make(NSIDE_SMALL), power_law_cl(LMAX_SMALL)
 
 
 @pytest.fixture(scope="module")

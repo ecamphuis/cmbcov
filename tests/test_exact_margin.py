@@ -26,7 +26,7 @@ import pytest
 
 healpy = pytest.importorskip("healpy")
 
-from conftest import apodised_cap  # noqa: E402
+from conftest import apodised_cap, patchy_mask  # noqa: E402
 
 from cmbcov.exact import (  # noqa: E402
     exact_covariance,
@@ -46,13 +46,24 @@ LMAX_INT = 14
 LMAX_CONVERGED = LMAX + LW
 
 
-@pytest.fixture(scope="module")
-def setup():
-    """Apodised-cap mask (map and band-limited alm) and a red spectrum."""
-    mask = apodised_cap(NSIDE)
+def _setup(mask):
     mask_alm = ducc0_map2alm(mask, lmax=LW, iter=10)
     cl = 1000.0 / (np.arange(LMAX_CONVERGED + 1) + 1.0) ** 2
     return mask, mask_alm, cl
+
+
+@pytest.fixture(scope="module")
+def setup():
+    """Apodised-cap mask (map and band-limited alm) and a red spectrum."""
+    return _setup(apodised_cap(NSIDE))
+
+
+@pytest.fixture(scope="module", params=["cap", "patchy"])
+def any_setup(request, setup):
+    """``setup`` and the same for the two-patch mask of ``tests/conftest.py``
+    (every azimuthal order populated, so the internal band-limit also reaches
+    the band edges of the coupling across orders)."""
+    return setup if request.param == "cap" else _setup(patchy_mask(NSIDE))
 
 
 @pytest.fixture(autouse=True)
@@ -132,8 +143,8 @@ def _assert_same(part, whole_sliced):
     assert np.array_equal(part, whole_sliced)
 
 
-def test_gl_rows_match_full_matrix_sliced(setup):
-    _, mask_alm, cl = setup
+def test_gl_rows_match_full_matrix_sliced(any_setup):
+    _, mask_alm, cl = any_setup
     whole = _quiet(exact_covariance, mask_alm, cl, LMAX_INT, grid="gl", lw=LW)
     part = _quiet(
         exact_covariance, mask_alm, cl, LMAX, grid="gl", lw=LW, lmax_int=LMAX_INT
@@ -141,8 +152,8 @@ def test_gl_rows_match_full_matrix_sliced(setup):
     _assert_same(part, whole[: LMAX + 1, : LMAX + 1])
 
 
-def test_gl_single_row_matches_full_matrix_sliced(setup):
-    _, mask_alm, cl = setup
+def test_gl_single_row_matches_full_matrix_sliced(any_setup):
+    _, mask_alm, cl = any_setup
     whole_row = _quiet(
         exact_covariance_row, mask_alm, cl, LMAX, LMAX_INT, grid="gl", lw=LW
     )
@@ -159,15 +170,15 @@ def test_gl_single_row_matches_full_matrix_sliced(setup):
     _assert_same(part_row, whole_row[: LMAX + 1])
 
 
-def test_healpix_rows_match_full_matrix_sliced(setup):
-    mask, _, cl = setup
+def test_healpix_rows_match_full_matrix_sliced(any_setup):
+    mask, _, cl = any_setup
     whole = _quiet(exact_covariance, mask, cl, LMAX_INT, nside=NSIDE)
     part = _quiet(exact_covariance, mask, cl, LMAX, nside=NSIDE, lmax_int=LMAX_INT)
     _assert_same(part, whole[: LMAX + 1, : LMAX + 1])
 
 
-def test_pol_blocks_match_full_matrix_sliced(setup):
-    _, mask_alm, cl = setup
+def test_pol_blocks_match_full_matrix_sliced(any_setup):
+    _, mask_alm, cl = any_setup
     cls = {"TT": cl, "EE": 0.1 * cl, "TE": 0.05 * cl}
     spectra = ("TT", "EE", "TE")
     whole = _quiet(
@@ -187,8 +198,8 @@ def test_pol_blocks_match_full_matrix_sliced(setup):
         _assert_same(part[pair], whole[pair][: LMAX + 1, : LMAX + 1])
 
 
-def test_pol_row_matches_full_matrix_sliced(setup):
-    _, mask_alm, cl = setup
+def test_pol_row_matches_full_matrix_sliced(any_setup):
+    _, mask_alm, cl = any_setup
     cls = {"TT": cl, "EE": 0.1 * cl, "TE": 0.05 * cl}
     spectra = ("TT", "TE")
     whole = _quiet(

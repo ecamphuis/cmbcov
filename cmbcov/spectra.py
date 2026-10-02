@@ -566,12 +566,17 @@ class SpectraLoader:
         """
         for key_freq, spectra in fl_dict.items():
             for key_pol, values in spectra.items():
-                bad = np.flatnonzero((values < 0.0) | (values > 1.0))
+                # ``~isfinite``: a NaN (a 0/0 at l = 0, 1 of a simulated
+                # ratio, say) compares False on both sides and would pass,
+                # then spread through every EE/TE element of the covariance.
+                bad = np.flatnonzero(
+                    (values < 0.0) | (values > 1.0) | ~np.isfinite(values)
+                )
                 if bad.size:
                     raise ValueError(
                         f"Transfer function fl from {template.format(key_freq)!r} "
                         f"({key_freq} {key_pol}) has {bad.size} multipole(s) "
-                        f"outside [0, 1] (first ell = {int(bad[0])}, value "
+                        f"outside [0, 1] or not finite (first ell = {int(bad[0])}, value "
                         f"{values[bad[0]]:.6g}; range "
                         f"{values.min():.6g} .. {values.max():.6g}). fl is the "
                         "fraction of the signal the pipeline keeps: outside "

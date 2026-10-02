@@ -21,6 +21,18 @@ Pins four things:
    6.9e-7 / 3.3e-7, EExEE 1.2e-5 / 4.9e-6, TExTE 2.3e-6 / 8.3e-7, worst
    BBxBB 8.7e-4 / 5.4e-4.  T-only precomputes (spin-0 selection alone) are
    looser: TTxTT 5.9e-6 / 2.3e-5 (cap), 1.7e-5 / 8.1e-6 (baseline).
+   Both masks are azimuthally symmetric in the pole frame the selection
+   works in, where the banded integrals then sit at ``M = m`` and the pair
+   rule keeps ``m == m'`` only, so the same checks also run on the two-blob
+   mask of ``tests/conftest.py`` (asymmetric in its pole frame).  There the
+   selected kernels are the naive selection of the full integrals to
+   rounding (6e-15), and every kernel without an E->B leakage leg ``L`` is
+   within the tolerance (at most 2.4e-4), but the kernels with an ``L`` leg
+   are not: ``LLxLL`` 7.1e-3 / 1.2e-2 at ``ellp = ell`` / ``ell + 3``
+   (nside 32), the other kernels with an ``L`` leg up to 1.5e-3 / 2.9e-3.
+   The rules (pair and order thresholds from the spin-0 and spin-2 mode
+   power of the ``E`` response) do not bound the leakage response on such
+   a mask; this is pinned as a strict ``xfail`` below, not hidden.
 3. The manifest round trip: ``term_selection`` and the fractions kept are
    written and read back, an old manifest without the field means ``None``,
    and a run must ask for the same ``term_selection`` to load the cache --
@@ -39,6 +51,8 @@ import numpy as np
 import pytest
 
 healpy = pytest.importorskip("healpy")
+
+from conftest import two_blob_mask  # noqa: E402
 
 from cmbcov.approximations import acc, acc_cache  # noqa: E402
 from cmbcov.approximations.acc import (  # noqa: E402
@@ -75,6 +89,11 @@ def frob(a):
     return np.sqrt(np.sum(a * a))
 
 
+def has_leakage_leg(key):
+    """Whether a kernel key ``"s1xs2"`` has an E->B leakage (``L``) leg."""
+    return "L" in key
+
+
 @pytest.fixture(scope="module")
 def cap_wlm(tmp_path_factory):
     """20 deg cosine-apodised cap at (lon, lat) = (45, 30), nside 32."""
@@ -86,6 +105,12 @@ def cap_wlm(tmp_path_factory):
 @pytest.fixture(scope="module")
 def baseline_wlm():
     return MaskWlm("baseline_mask.fits", load_path=DATA)
+
+
+@pytest.fixture(scope="module")
+def two_blob_wlm(two_blob_mask_dir):
+    """The two-blob mask of ``tests/conftest.py`` at nside 32."""
+    return MaskWlm("two_blob_mask.fits", load_path=two_blob_mask_dir)
 
 
 def _precompute(wlm, ell, nside, **kw):
@@ -158,11 +183,20 @@ def test_term_selection_is_gl_only(baseline_wlm):
 # 2. the selected kernels are within tolerance of the full ones
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("spectra", [None, ("TT",)], ids=["all", "TT"])
-@pytest.mark.parametrize("which", ["cap", "baseline"])
+@pytest.mark.parametrize("which", ["cap", "baseline", "two_blob"])
 def test_selected_kernels_are_within_tolerance(
-    request, which, spectra, cap_wlm, baseline_wlm, capsys
+    request, which, spectra, cap_wlm, baseline_wlm, two_blob_wlm, capsys
 ):
-    wlm, ell, nside = (cap_wlm, 32, 32) if which == "cap" else (baseline_wlm, 16, 16)
+    """
+    On the two-blob mask the kernels with an ``L`` leg are left to
+    :func:`test_leakage_kernels_are_within_tolerance_on_an_asymmetric_pole_frame`
+    (module docstring, item 2).
+    """
+    wlm, ell, nside = {
+        "cap": (cap_wlm, 32, 32),
+        "baseline": (baseline_wlm, 16, 16),
+        "two_blob": (two_blob_wlm, 32, 32),
+    }[which]
     full = _precompute(wlm, ell, nside, spectra=spectra)
     with capsys.disabled():
         print()
@@ -173,6 +207,7 @@ def test_selected_kernels_are_within_tolerance(
         errs = {
             key: frob(full[ellp][key] - selected[ellp][key]) / frob(full[ellp][key])
             for key in full[ellp]
+            if not (which == "two_blob" and has_leakage_leg(key))
         }
         worst = max(errs, key=errs.get)
         with capsys.disabled():
@@ -186,6 +221,144 @@ def test_selected_kernels_are_within_tolerance(
         # every kernel of the set, not only the three named ones
         assert errs[worst] <= TOL, (which, spectra, ellp, worst, errs[worst])
         assert errs["TTxTT"] > 0  # the selection did drop something
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="term selection misses its tolerance on the E->B leakage kernels of a "
+    "mask asymmetric in its pole frame (LLxLL 7.1e-3 / 1.2e-2 at tolerance 1e-3); "
+    "the implementation matches the naive selection to 6e-15, the rules are the cause",
+)
+def test_leakage_kernels_are_within_tolerance_on_an_asymmetric_pole_frame(
+    two_blob_wlm,
+):
+    ell = nside = 32
+    full = _precompute(two_blob_wlm, ell, nside)
+    selected = _precompute(two_blob_wlm, ell, nside, term_selection=TOL)
+    errs = {
+        (ellp, key): frob(full[ellp][key] - selected[ellp][key]) / frob(full[ellp][key])
+        for ellp in (ell, ell + 3)
+        for key in full[ellp]
+        if has_leakage_leg(key)
+    }
+    worst = max(errs, key=errs.get)
+    assert errs[worst] <= TOL, (worst, errs[worst])
+
+
+def _leakage_warnings(record):
+    return [w for w in record if "leakage" in str(w.message)]
+
+
+def test_term_selection_warns_once_with_a_leakage_kernel(cap_wlm):
+    with pytest.warns(UserWarning, match="not guaranteed") as record:
+        # default spectra include LL; two ellp values, still one warning
+        _precompute(cap_wlm, 16, 32, term_selection=TOL)
+    (w,) = _leakage_warnings(record)
+    assert "term_selection=None" in str(w.message)
+    assert w.filename == __file__ or w.filename.endswith("test_acc_term_selection.py")
+
+
+def test_term_selection_warns_for_an_explicit_leakage_pair(cap_wlm):
+    with pytest.warns(UserWarning, match="not guaranteed"):
+        _precompute(
+            cap_wlm,
+            16,
+            32,
+            spectra=["TT", "DD", "DL"],
+            pairs=[("DL", "DL")],
+            term_selection=TOL,
+        )
+
+
+def test_no_leakage_warning_without_term_selection(cap_wlm):
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        _precompute(cap_wlm, 16, 32, spectra=["TT", "DD", "LL"])
+    assert not _leakage_warnings(record)
+
+
+def test_no_leakage_warning_for_t_and_d_channels_only(cap_wlm):
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        _precompute(
+            cap_wlm, 16, 32, spectra=["TT", "DD", "TD", "DT"], term_selection=TOL
+        )
+        _precompute(cap_wlm, 16, 32, spectra=["TT"], term_selection=TOL)
+        # pairs restrict the requested kernels even if spectra lists L
+        _precompute(
+            cap_wlm,
+            16,
+            32,
+            spectra=["TT", "LL"],
+            pairs=[("TT", "TT")],
+            term_selection=TOL,
+        )
+    assert not _leakage_warnings(record)
+
+
+@pytest.mark.parametrize("ellp_offset", [0, 3])
+def test_selected_kernels_are_the_naive_selection_on_an_asymmetric_pole_frame(
+    two_blob_mask_dir, ellp_offset
+):
+    """
+    The selected precompute (banded integrals, reflected ``-m``, the
+    ``(m, m')`` pair mask in the blocked contraction, spin 0 and 2) against
+    the kernel built here from the full two-SHT integrals of the pole-frame
+    mask with the same selection applied by hand -- ``|M - m| <= m_band``,
+    ``keep_m`` / ``keep_mp`` and ``keep_pair`` -- for every default channel
+    pair.  On the two-blob mask the band and the pair rule are not trivial
+    in the pole frame (``m_band`` 24 of 47, half of the pairs kept; every
+    order is kept at this size); on a cap the band is ``M = m`` and the
+    pairs are ``m == m'``, which would hide a mis-paired ``(m, m')`` or a
+    mis-banded ``M``.  Measured 3.8e-15 / 5.6e-15 of the kernel maximum at
+    ``ellp = ell`` / ``ell + 3``.
+    """
+    from cmbcov.approximations.acc import _TermSelectionPlan
+    from cmbcov.grid import spin_weighted_integrals_gl
+    from cmbcov.sht import ducc0_map2alm
+    from cmbcov.term_selection import pole_rotation, rotate_alm
+
+    ell = nside = 16
+    ellp = ell + ellp_offset
+    lmax_out = 2 * nside - 1
+    wlm = MaskWlm("two_blob_mask_16.fits", load_path=two_blob_mask_dir)
+    selected = _precompute(wlm, ell, nside, ellprange=[ellp], term_selection=TOL)[ellp]
+    alm = ducc0_map2alm(wlm.mask, lmax=LW, pol=False, iter=10)
+    alm = rotate_alm(alm, LW, pole_rotation(wlm.mask))
+    plan = _TermSelectionPlan(alm, LW, 2 * nside, ell, TOL, t_only=False)
+    sel = plan.selection(ell, ellp)
+    assert 0 < plan.m_band < LW and 0.1 < sel.frac_pairs < 0.9
+
+    def fields(l_val, keep):
+        m = np.arange(-l_val, l_val + 1)
+        band = np.abs(np.arange(-lmax_out, lmax_out + 1)[None, :] - m[:, None])
+        inside = (band <= plan.m_band)[:, None, :] & keep[:, None, None]
+        t = np.array(
+            [spin_weighted_integrals_gl(alm, LW, l_val, k, lmax_out) for k in m]
+        )
+        eb = np.array(
+            [spin_weighted_integrals_gl(alm, LW, l_val, k, lmax_out, spin=2) for k in m]
+        )
+        return [t * inside, eb[:, 0] * inside, eb[:, 1] * inside]
+
+    central = fields(ell, sel.keep_m)
+    primed = fields(ellp, sel.keep_mp)
+    for key, got in selected.items():
+        a, b = key.split("x")
+        k1, k2 = COUPLING_SPECTRA.index(a), COUPLING_SPECTRA.index(b)
+        theta = [
+            np.einsum(
+                "mLM,nLM->mnL",
+                central[_CENTRAL_FIELD[k]],
+                np.conj(primed[_PRIME_FIELD[k]]),
+            )
+            * sel.keep_pair[:, :, None]
+            for k in (k1, k2)
+        ]
+        flat = [t.reshape(-1, lmax_out + 1) for t in theta]
+        ref = (flat[0].T @ np.conj(flat[1])).real
+        scale = np.abs(ref).max()
+        assert np.abs(got - ref).max() <= 1e-13 * scale, (key, ellp)
 
 
 def test_selection_actually_drops_terms(cap_wlm):
@@ -252,13 +425,17 @@ def _old_estimate(alm, lw, ell, ellp, wrap):
     return est, pm, pmp
 
 
+@pytest.mark.parametrize("which", ["cap", "two_blob"])
 @pytest.mark.parametrize("ell, ellp", [(12, 12), (10, 14), (14, 10)])
-def test_select_terms_with_2lw_below_ell_plus_ellp(ell, ellp):
+def test_select_terms_with_2lw_below_ell_plus_ellp(ell, ellp, which):
     from cmbcov.term_selection import select_terms
 
     lw = LW_SMALL
     assert 2 * lw < ell + ellp
-    mask = cap_mask(16, 45.0, 30.0, 20.0, 8.0)
+    if which == "cap":
+        mask = cap_mask(16, 45.0, 30.0, 20.0, 8.0)
+    else:
+        mask = two_blob_mask(16)
     alm = _pole_alm(mask, lw)
     sel = select_terms(alm, lw, ell, ellp, TOL)  # IndexError before the fix
 
@@ -309,13 +486,20 @@ def test_select_terms_does_not_wrap_negative_differences():
     assert not sel.keep_pair[neg_far].any()
 
 
-def test_selected_kernels_within_tolerance_with_small_lw(cap_wlm_small):
+@pytest.mark.parametrize("which", ["cap", "two_blob"])
+def test_selected_kernels_within_tolerance_with_small_lw(
+    cap_wlm_small, two_blob_mask_dir, which
+):
     """End to end with ``2 lw < ell + ell'``: runs, and stays within tolerance."""
     ell, nside, lw = 16, 16, LW_SMALL
     assert 2 * lw < 2 * ell
+    if which == "cap":
+        wlm = cap_wlm_small
+    else:
+        wlm = MaskWlm("two_blob_mask_16.fits", load_path=two_blob_mask_dir)
     kw = {"spectra": ("TT",), "lw": lw}
-    full = _precompute(cap_wlm_small, ell, nside, **kw)
-    selected = _precompute(cap_wlm_small, ell, nside, term_selection=TOL, **kw)
+    full = _precompute(wlm, ell, nside, **kw)
+    selected = _precompute(wlm, ell, nside, term_selection=TOL, **kw)
     for ellp in (ell, ell + 3):
         assert full[ellp].keys() == selected[ellp].keys()
         for key in full[ellp]:

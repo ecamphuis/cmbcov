@@ -6,6 +6,7 @@ matrices. It orchestrates all the steps: parameter loading, data preparation,
 and covariance computation.
 """
 
+import functools
 import logging
 import os
 from collections.abc import Mapping
@@ -102,6 +103,11 @@ class CovarianceMatrixGenerator:
         # compute_covariance_matrix,
         # written beside the covariance by _save_bb_leakage_report.
         self._bb_leakage_report: dict[str, Any] | None = None
+
+        # The filter-and-bin sum-rule ratio (``nodes``, ``g``) of a run with a
+        # ``map_filter`` block, filled in by setup_map_filter, written beside
+        # the covariance by _save_map_filter; None otherwise.
+        self._map_filter_ratio: dict[str, np.ndarray] | None = None
 
     @property
     def params(self) -> Mapping[str, Any]:
@@ -433,6 +439,8 @@ class CovarianceMatrixGenerator:
         # object. Refresh it before computing.
         self.covariance_instance.config.debiasing_dict = self.debiasing_dict
 
+        self.setup_map_filter()
+
         # Compute main covariance matrix
         # missing="identity": a frequency pair absent from the noise (e.g.
         # `nl: {}`) means no noise for it, not a bug -- keep it that way.
@@ -457,6 +465,136 @@ class CovarianceMatrixGenerator:
             )
 
         return final_cov
+
+    #: Name of the filter sum-rule ratio written beside the covariance.
+    MAP_FILTER_NAME = "map_filter_ratio.npz"
+
+    def setup_map_filter(self) -> None:
+        """
+        Build the filter-and-bin correction of a ``map_filter`` run and hand
+        it to the covariance object (``config.filter_rho`` and
+        ``config.filter_fl``); does nothing without the block.
+
+        ``rho`` is the filtered sum-rule ratio of the mask, one per sum-rule
+        channel the run's T/E blocks need
+        (:func:`cmbcov.filtering.channels_for`;
+        :func:`cmbcov.filtering.filtered_sum_rule_ratio`, probed at nodes
+        ``default_nodes`` and interpolated by
+        :func:`~cmbcov.filtering.rho_matrix`). The probes are the expensive
+        part, so the ratios are cached in the kernel directory under the mask
+        digest, the channels and every parameter they depend on
+        (:func:`~cmbcov.filtering.cached_sum_rule_ratio`). The transfer
+        functions are ``fl_dict[pair]`` (every Stokes pair the run loads;
+        ``ET`` falls back to ``TE`` in the covariance): all ones without
+        ``fl`` (the factor is then ``rho`` alone, with a warning). Blocks
+        with a B leg are left uncorrected, with a warning.
+        """
+        settings = self.config.map_filter
+        self._map_filter_ratio = None
+        if settings is None:
+            return
+        from .. import filtering
+        from ..exact import _mask_alm_for_gl
+
+        cov = self.covariance_instance
+        lmax = self.config.lmax
+        stokes_pairs = self.cov_keys.stokekey()
+        channels = filtering.channels_for(stokes_pairs)
+        uncorrected = [
+            s
+            for s in stokes_pairs
+            if tuple(s.split("x")) not in filtering.BLOCK_CHANNEL
+        ]
+        if uncorrected:
+            self.logger.warning(
+                "map_filter: the blocks with a B leg (%s) are left uncorrected "
+                "(docs/theory/filter_and_bin.md)",
+                ", ".join(uncorrected),
+            )
+        if not channels:
+            self.logger.warning(
+                "map_filter is set but the run has no T/E block: nothing to correct"
+            )
+            return
+        if self.config.fl is None:
+            self.logger.warning(
+                "map_filter is set without fl: the correction is rho alone "
+                "(transfer function taken as 1)"
+            )
+
+        lw = settings.resolved_lw(cov.wlm.nside, lmax)
+        dmax = settings.resolved_dmax(lmax, self.config.method, self.config.dmax or 0)
+        nodes = filtering.default_nodes(lmax, settings.node_min, settings.node_ratio)
+        profile = functools.partial(
+            filtering.highpass_profile,
+            lx=settings.lx,
+            shape=settings.shape,
+            power=settings.power,
+        )
+        identity = {
+            "mask_digest": cov.wlm.mask_digest,
+            "type": settings.type,
+            "lx": settings.lx,
+            "shape": settings.shape,
+            "power": settings.power,
+            "channels": list(channels),
+            "nodes": [int(n) for n in nodes],
+            "dmax": dmax,
+            "nprobe": settings.nprobe,
+            "seed": settings.seed,
+            "lw": lw,
+            "lmax": lmax,
+        }
+        computed = []
+
+        def compute() -> dict[str, np.ndarray]:
+            computed.append(True)
+            mask_alm, _ = _mask_alm_for_gl(cov.wlm.mask, cov.wlm.nside, lw)
+            return filtering.filtered_sum_rule_ratio(
+                mask_alm,
+                lw,
+                profile,
+                nodes,
+                dmax,
+                channels=channels,
+                nprobe=settings.nprobe,
+                seed=settings.seed,
+                verbose=self.verbose_mode,
+            )
+
+        self.logger.info(
+            f"map_filter: channels {', '.join(channels)}, {len(nodes)} nodes "
+            f"({nodes[0]}..{nodes[-1]}), dmax={dmax}, lw={lw}, "
+            f"nprobe={settings.nprobe}"
+        )
+        g = filtering.cached_sum_rule_ratio(
+            self.config.acc_kernel_dir, identity, compute
+        )
+        self.logger.info(
+            "map_filter: sum-rule ratio "
+            + ("computed" if computed else "read from the cache")
+        )
+        self._map_filter_ratio = {
+            "nodes": np.asarray(nodes),
+            "channels": np.array(list(channels)),
+            **{f"g_{ch}": np.asarray(g[ch]) for ch in channels},
+        }
+
+        cov.config.filter_rho = {
+            ch: filtering.rho_matrix(nodes, g[ch], lmax) for ch in channels
+        }
+        cov.config.filter_fl = {
+            pair: dict(self.fl_dict[pair]) for pair in self.combined_frequencies
+        }
+
+    def _save_map_filter(self, base_dir: str) -> None:
+        """
+        Write the filter sum-rule ratios beside the covariance: ``nodes``,
+        ``channels`` and one ``g_<channel>`` per channel.
+        """
+        if self._map_filter_ratio is None:
+            return
+        np.savez(os.path.join(base_dir, self.MAP_FILTER_NAME), **self._map_filter_ratio)
 
     def _warn_bb_only_leakage(self, cl_used: dict[str, dict[str, np.ndarray]]) -> None:
         """
@@ -534,6 +672,7 @@ class CovarianceMatrixGenerator:
         self._save_conditioning_report(base_dir, final_cov)
         self._save_error_budget(base_dir)
         self._save_bb_leakage_report(base_dir)
+        self._save_map_filter(base_dir)
 
         # Save window functions if requested
         if save_windows:

@@ -18,7 +18,10 @@ things --
 4. A precompute requesting the new ``TL`` channel (not computed by any
    default run) reproduces the naive ``(m, m')`` double-loop reference
    (the same reference form as ``tests/test_acc_vectorised.py``), for one
-   pair on a tiny config.
+   pair on a tiny config -- on the test mask and on the two-patch mask of
+   ``tests/conftest.py``: on the former (an azimuthally symmetric cap)
+   ``Theta(m, m')`` is diagonal in ``(m, m')``, so a transposed or
+   mis-paired ``(m, m')`` block would not show.
 5. Every place that probes an ACC kernel file *by name* on disk -- not only
    the kernel loader itself -- accepts an old-name-only cache: the survey
    cache has no new-named file at all, so :meth:`Cov.acc_internal_lmax` and
@@ -299,10 +302,17 @@ def _naive_kernel(mask_alm, lw, ell, ellp, lmax, central_field, prime_field):
     return (flat.T @ flat.conj()).real
 
 
-def test_new_bmode_channel_matches_the_naive_double_loop():
+def _wlm(which, patchy_mask_dir):
+    if which == "cap":
+        return MaskWlm("baseline_mask.fits", load_path=DATA)
+    return MaskWlm("patchy_mask.fits", load_path=patchy_mask_dir)
+
+
+@pytest.mark.parametrize("which", ["cap", "patchy"])
+def test_new_bmode_channel_matches_the_naive_double_loop(which, patchy_mask_dir):
     """``TL`` (T central, L=B primed -- new, not part of any default
     precompute) reproduces the naive double-loop reference on a tiny config."""
-    wlm = MaskWlm("baseline_mask.fits", load_path=DATA)
+    wlm = _wlm(which, patchy_mask_dir)
     mask_alm = ducc0_map2alm(wlm.mask, lmax=LW, pol=False, iter=10)
     lmax = 2 * NSIDE
 
@@ -332,10 +342,13 @@ def test_new_bmode_channel_matches_the_naive_double_loop():
     )
 
 
+@pytest.mark.parametrize("which", ["cap", "patchy"])
 @pytest.mark.parametrize("pair", [("DL", "DL"), ("LD", "LD"), ("LT", "LT")])
-def test_other_new_bmode_channels_match_the_naive_double_loop(pair):
+def test_other_new_bmode_channels_match_the_naive_double_loop(
+    pair, which, patchy_mask_dir
+):
     """The remaining three new channels (``DL``, ``LD``, ``LT``), same check."""
-    wlm = MaskWlm("baseline_mask.fits", load_path=DATA)
+    wlm = _wlm(which, patchy_mask_dir)
     mask_alm = ducc0_map2alm(wlm.mask, lmax=LW, pol=False, iter=10)
     lmax = 2 * NSIDE
 

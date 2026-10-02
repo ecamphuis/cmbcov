@@ -25,6 +25,13 @@ gains with ``grid="gl"``:
 The HEALPix default path is untouched by this feature; that is pinned by
 ``tests/test_acc_coupling.py`` (rerun alongside this file, not duplicated
 here).
+
+Parseval, Eq. 22 and ACC(GL) vs exact(GL) run on the test mask (an
+azimuthally symmetric cap, on which every ``I_{lm,LM}`` sits at ``M = m``
+and ``Theta`` is diagonal in ``(m, m')``) and on the two-patch mask of
+``tests/conftest.py``, which populates every order: measured there
+``sum(Theta)/Eq.22 - 1`` = 2.5e-13 .. 3.5e-13 and ACC/exact - 1 = -2.5e-13
+.. -3.5e-13, the same as on the cap.
 """
 
 import os
@@ -75,12 +82,20 @@ LMAX = 2 * NSIDE - 1  # ACC's theta_before_summing has lmax_out = 2*NSIDE - 1
 # is actually about) from the separate, expected effect of ACC's finite
 # l1,l2 reach.
 LW = 10
+MASKS = ["cap", "patchy"]
 
 
-@pytest.fixture(scope="module")
-def small_mask_alm():
+def _wlm(which, patchy_mask_dir):
+    """The test mask (``"cap"``) or the two-patch mask as a ``MaskWlm``."""
+    if which == "cap":
+        return MaskWlm("baseline_mask.fits", load_path=os.path.abspath(DATA))
+    return MaskWlm("patchy_mask.fits", load_path=patchy_mask_dir)
+
+
+@pytest.fixture(scope="module", params=MASKS)
+def small_mask_alm(request, patchy_mask_dir):
     """A short mask alm, reused across the Parseval checks below."""
-    mask = hp.read_map(os.path.join(DATA, "baseline_mask.fits"))
+    mask = _wlm(request.param, patchy_mask_dir).mask
     lw = 15
     return hp.map2alm(mask, lmax=lw, iter=10), lw
 
@@ -117,10 +132,10 @@ def test_spin_weighted_integrals_gl_satisfies_parseval(small_mask_alm, ell, m):
     assert lhs == pytest.approx(rhs, rel=1e-12, abs=1e-16)
 
 
-@pytest.fixture(scope="module")
-def gl_setup():
+@pytest.fixture(scope="module", params=MASKS)
+def gl_setup(request, patchy_mask_dir):
     """ACC(GL) Theta, an exact Xi[W^2] from the same mask alm, and a toy cl."""
-    wlm = MaskWlm("baseline_mask.fits", load_path=os.path.abspath(DATA))
+    wlm = _wlm(request.param, patchy_mask_dir)
     theta = precompute_acc_kernels(
         wlm,
         None,

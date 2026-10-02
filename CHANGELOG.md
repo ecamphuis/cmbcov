@@ -1,5 +1,82 @@
 # Changelog
 
+## 0.6.0 — 2026-10-01
+
+### Added
+
+- **`map_filter` block: filter-and-bin correction of the T/E
+  covariance.** For a map made with a scan-direction Fourier high-pass, each
+  raw T/E pseudo-spectrum block is multiplied by
+  $\rho^{ch} / (F^{L} F^{R})$, with $\rho^{ch}$ the filtered sum-rule ratio of the mask in the block's
+  channel (`00` for TT x TT, `20` for TT x EE, TT x TE and TE x TE, `EE` for
+  EE x EE and EE x TE; probed stochastically at a few multipoles, only for
+  the channels the run needs, cached in the kernel directory) and $F^{s}$ the
+  `fl` of each leg's spectrum, for NKA, INKA and ACC. On toy patches every
+  T/E block was within 0.7% of the exact filtered covariance at
+  $\ell \ge 3.3\thinspace l_x$. Blocks with a B leg are left uncorrected (one
+  `UserWarning` naming them): a single factor was up to 22% off for BB x BB.
+  Without the block nothing changes. `CovarianceConfig` gains `filter_rho`
+  (`{channel: rho}`) and `filter_fl` (`{freq_pair: {stokes: fl}}`);
+  `cmbcov.filtering` provides the probes (`filtered_sum_rule_ratio(...,
+  channels=)`, which returns `{channel: g}`), `CHANNELS`, `BLOCK_CHANNEL`
+  and `channels_for`. See `docs/theory/filter_and_bin.md`.
+
+- **`max_memory_gb`** (`exact_covariance_row`, `exact_covariance`,
+  `exact_covariance_row_pol`, `exact_covariance_pol`, GL grid only; a
+  `ValueError` with `grid="healpix"`): memory budget of a row in GiB,
+  default 2. It covers the arrays the row holds that grow with the problem,
+  and sets how many columns are computed together and whether the Legendre
+  tables are kept for all rows; it changes the result only at the level of
+  rounding. A polarised column needs up to nine times the memory of a
+  temperature one, and its tables up to three times, so polarised rows
+  compute fewer columns together at the same budget. Not covered: the mask
+  as loaded and the internal buffers of ducc0 and the BLAS library; with
+  the default budget the process grew by 2.0-2.3 GiB (temperature) and
+  2.3-2.9 GiB (polarisation, a few chunks) in our measurements, and over a
+  whole polarised row up to 4.4 GiB on macOS, whose allocator keeps freed
+  memory (`MallocLargeCache=0` keeps it at 2 GiB, more slowly). With
+  `nprocs > 1` (`exact_covariance`) the budget applies to each worker
+  process.
+
+### Performance
+
+- **Exact covariance rows on the Gauss-Legendre grid are faster, for
+  temperature and polarisation.** `exact_covariance_row`,
+  `exact_covariance`, `exact_covariance_row_pol` and `exact_covariance_pol`
+  with `grid="gl"` now compute the columns of a row together, as matrix
+  products with tables of Legendre functions and one batched FFT, instead
+  of separate spherical-harmonic transforms for every column. Only the
+  azimuthal orders and degrees the mask can reach are computed. At the
+  default memory budget the rows are roughly 2.5 to 4 times faster than
+  before, from lmax 500 to 2000, for both temperature and polarised rows
+  (measured on a 14-core laptop under load, mask band-limit 384, one row at
+  the highest multipole; the range reflects the load): temperature, 3.7-10 s
+  instead of 25 s at lmax 500 and 28-36 s instead of 130 s at lmax 1000;
+  all six polarised spectra, 1-2 minutes instead of 5 at lmax 500 and
+  10-12.5 minutes instead of 37 at lmax 1000 (lmax 1500 and 2000 were
+  estimated from sampled columns and show the same gain). The rows agree
+  with the previous code to a few 1e-15 of their largest entry, and are
+  identical for any number of threads.
+
+### Changed
+
+- **Term selection now warns when combined with E to B leakage kernels.**
+  `precompute_acc_kernels(..., term_selection=<tol>)` emits a `UserWarning`
+  (once per call) when a requested kernel has a leakage leg (`LL`, `TL`,
+  `LT`, `DL`, `LD`; the default `spectra` includes `LL`). On a mask that is not
+  azimuthally symmetric about its centre the tolerance is not guaranteed for
+  these kernels: errors up to about 10 times the tolerance were measured
+  (`LLxLL` 1.2e-2 at tolerance 1e-3 on a two-blob mask). Kernels without a
+  leakage leg stay within the tolerance. No computed number changes.
+
+### Fixed
+
+- **A transfer function with a NaN is now refused.** `fl` files are checked
+  for `[0, 1]`; a NaN (the 0/0 of a measured ratio at l = 0, 1) passed both
+  comparisons and spread through every EE and TE element of the covariance
+  with no error. `SpectraLoader._check_transfer_function_range` now also
+  rejects non-finite values.
+
 ## 0.5.0 — 2026-09-30
 
 ### Changed
@@ -174,12 +251,12 @@
   multiplied by the data model. This is the MASTER convention (Hivon et al.
   2002, [astro-ph/0105302](https://arxiv.org/abs/astro-ph/0105302), their
   Eqs. (15)-(16)); the debiasing already divides each leg by
-  $B_1 B_2 w^{\rm pix} F_\ell$, so the noise enters the reported error bars as
+  $B_1 B_2 w^{\mathrm{pix}} F_\ell$, so the noise enters the reported error bars as
   $N_\ell / B^2_\ell$.
 
 - **White-noise levels now follow that convention too, which changes numbers.**
   A dict of white-noise levels used to set `noise_is_biased = False`, which
-  multiplied the flat level by $B^2 w^{\rm pix} F_\ell$ and so effectively
+  multiplied the flat level by $B^2 w^{\mathrm{pix}} F_\ell$ and so effectively
   treated it as *already* beam-deconvolved — a flat noise contribution to the
   error bars at every $\ell$. That contradicted both the code's own comment and
   the MASTER convention. The noise contribution now grows as $1/B^2_\ell$ at
@@ -199,7 +276,7 @@
   $N^{TT} = (\sigma_T \pi/10800)^2$ and
   $N^{EE} = N^{BB} = (\sigma_P \pi/10800)^2$ independently. A single number
   keeps the old rule $N^{EE} = N^{BB} = 2 N^{TT}$, i.e. it is the
-  $\sigma_P = \sqrt 2 \, \sigma_T$ special case. One dict may mix the two forms.
+  $\sigma_P = \sqrt 2 \thinspace \sigma_T$ special case. One dict may mix the two forms.
 
 ## 0.1.0 — initial public release
 

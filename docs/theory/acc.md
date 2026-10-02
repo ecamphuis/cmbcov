@@ -125,7 +125,7 @@ The sum rule is exact only when $\Theta$ and $\Xi$ come from the same
 band-limited mask and $\Theta$ is summed over its full support. In practice
 $\Xi$ (`Cov.Xi`) is built from the mask at its own band limit, the kernels
 from the mask truncated at `acc_precompute.lw` and stored for
-$L_1, L_2 < 2\thinspace n_{\rm side}$. The error budget written beside every
+$L_1, L_2 < 2\thinspace n_{\mathrm{side}}$. The error budget written beside every
 ACC covariance (`error_budget.txt`) therefore evaluates the sum rule at
 $(\ell_\ast, \ell_\ast + d)$ for every diagonal $d < d_{\max}$ and reports
 $\max_d \left|\sum\Theta^{TT\times TT}/(n\thinspace\Xi^{00}) - 1\right|$,

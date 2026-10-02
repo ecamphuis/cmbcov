@@ -98,6 +98,7 @@ def test_tf_uncertainty_is_a_no_op_for_a_perfect_transfer_function(tmp_path):
     [
         (np.linspace(0.5, 1.5, LMAX), 30),  # above 1
         (np.linspace(-0.2, 0.8, LMAX), 0),  # below 0
+        (np.r_[np.nan, np.nan, np.linspace(0.5, 1.0, LMAX - 2)], 0),  # NaN
     ],
 )
 def test_fl_outside_zero_one_is_refused(tmp_path, values, first_bad):

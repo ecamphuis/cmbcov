@@ -141,6 +141,13 @@ number of terms summed to a small fraction of the full set. The default,
 [`theory/term_selection.md`](theory/term_selection.md) for the selection
 rule and its accuracy/cost trade-off.
 
+**Limitation.** The tolerance is not guaranteed for the E to B leakage
+kernels (channels `LL`, `TL`, `LT`, `DL`, `LD`) on masks that are not
+azimuthally symmetric about their centre: errors up to about 10 times the
+tolerance were measured. `precompute_acc_kernels` emits a `UserWarning` when
+`term_selection` is combined with such a channel (the default `spectra`
+includes `LL`); `term_selection=None`, or a `spectra` without `L`, avoids it.
+
 ## Cost guidance
 
 - The precompute cost grows with `centralell`, `dmax` and `nside`

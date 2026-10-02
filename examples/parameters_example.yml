@@ -182,6 +182,20 @@ spectrum_units: Cl
 # (outside that range the debiasing and the add_tf_uncertainty factor below
 # would silently degrade to 1). Default: none (1.0 everywhere).
 fl: null
+# Filter-and-bin maps (optional): corrects the T/E blocks for a map made with
+# a scan-direction Fourier high-pass, |M| > lx * sin(theta) on each
+# iso-latitude ring (docs/theory/filter_and_bin.md). The mask must be in the
+# coordinate system whose polar axis is the scan axis. Needs `fl` above; the
+# first run probes the mask (minutes at survey scale) and caches the result
+# under cov_path. Blocks with a B observable are left uncorrected.
+# map_filter:
+#   type: fourier_highpass
+#   lx: 300
+#   shape: sharp        # or 'exp': exp(-(lx sin(theta) / |M|)^power)
+#   power: 6            # 'exp' only
+#   nprobe: 32
+#   lw: null            # mask band-limit of the probes; set it to
+#                       # acc_precompute.lw on a high-resolution mask
 # Transfer function 'hl'. Accepted and stored on the parsed config but not
 # currently read or applied anywhere in the pipeline.
 hl: null

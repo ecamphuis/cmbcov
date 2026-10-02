@@ -167,7 +167,7 @@ $\ell = 64$, tolerance $10^{-3}$, decomposing the rules:
 | 0 | $1.3\times10^{-4}$ | $1.1\times10^{-5}$ | $1.3\times10^{-4}$ | $1.7\times10^{-7}$ |
 | 19 | $6.6\times10^{-3}$ | $9.7\times10^{-5}$ | $6.7\times10^{-3}$ | $4.5\times10^{-6}$ |
 
-The pair criterion $p_m\, p_{m'} A(m - m')\ge\epsilon_{\mathrm{pair}}\max$
+The pair criterion $p_m\thinspace p_{m'} A(m - m')\ge\epsilon_{\mathrm{pair}}\max$
 carries no dependence on $\ell' - \ell$, while the kernel itself shrinks as
 the two multipoles separate, so the discarded terms become a larger fraction
 of a smaller kernel.
@@ -213,7 +213,7 @@ at 128. The $m$ and band selections are untouched by it.
 The kernel error above is not what a run sees. Measured end to end — full
 and selected kernel caches on the survey footprint at $n_{\mathrm{side}} = 64$,
 $\ell_\ast = 64$, `dmax = 20`, assembled into the ACC covariance with Planck
-spectra and $10\thinspace\mu\mathrm{K}$-arcmin noise over $10 \le \ell < 128$,
+spectra and $10\thinspace\mu\mathrm{K}\thinspace\mathrm{arcmin}$ noise over $10 \le \ell < 128$,
 tolerance $10^{-3}$:
 
 | $\epsilon_{\mathrm{pair}}$ | pairs kept | TT error per element, relative to $\sqrt{C_{\ell\ell}C_{\ell'\ell'}}$ | TT variance of $\Delta\ell = 20$ bandpowers |
@@ -245,6 +245,21 @@ For scale, the ACC translation error itself is of the same order
 ($-5.6\times10^{-3}$ at $\ell = 500$ on the survey footprint). The default
 was kept for that reason. The production configuration ($\ell_\ast = 250$,
 $n_{\mathrm{side}} = 256$) has not been measured this way.
+
+### Limitation: the E to B leakage kernels
+
+The selection rules estimate which terms matter from the mode power of the
+response of the E field, and that power does not bound the response of the
+leakage field $L$. On a mask that is not azimuthally symmetric about its centre
+(in the pole frame), the kernels with an $L$ leg (`LL`, `TL`, `LT`, `DL`, `LD`)
+can therefore miss the requested tolerance: measured on a two-blob mask at
+$n_{\mathrm{side}} = 32$ and tolerance $10^{-3}$, `LLxLL` is off by up to
+$1.2\times10^{-2}$ and the other leakage-leg kernels by $1.0$ to $2.9\times10^{-3}$,
+while the kernels without an $L$ leg stay inside the tolerance. The
+implementation itself is exact (it reproduces a naive selection of the full
+integrals to $10^{-13}$); the rules are the cause. `precompute_acc_kernels`
+warns when `term_selection` is combined with an leakage-leg channel, and
+`term_selection=None` avoids the problem.
 
 ### Checking your own mask
 

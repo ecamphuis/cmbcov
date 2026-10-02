@@ -15,7 +15,7 @@ $\hat C_\ell = \sum_{\ell'} G_{\ell\ell'} \tilde C_{\ell'}$. At the level of
 the covariance this is a congruence transform,
 
 ```math
-\hat\Sigma = G_{\mathrm{left}}\, \tilde\Sigma\, G_{\mathrm{right}}^{T},
+\hat\Sigma = G_{\mathrm{left}}\thinspace \tilde\Sigma\thinspace G_{\mathrm{right}}^{T},
 ```
 
 `CovariancePostProcessor.pseudo_to_spice` for a T/E-only block (`G_left`,
@@ -73,8 +73,8 @@ is the pre-existing, bit-identical behaviour, and it omits a small term:
 PolSpice decoupling genuinely mixes EE and BB,
 
 ```math
-\hat C^{EE} = {}^{+}G\,\tilde C^{EE} + {}^{-}G\,\tilde C^{BB}, \qquad
-\hat C^{BB} = {}^{-}G\,\tilde C^{EE} + {}^{+}G\,\tilde C^{BB},
+\hat C^{EE} = {}^{+}G\thinspace \tilde C^{EE} + {}^{-}G\thinspace \tilde C^{BB}, \qquad
+\hat C^{BB} = {}^{-}G\thinspace \tilde C^{EE} + {}^{+}G\thinspace \tilde C^{BB},
 ```
 
 and at the covariance level every EE or BB output block can receive a
@@ -85,8 +85,7 @@ pseudo BB block:
 
 ```math
 \mathrm{Cov}(\hat C^X, \hat C^Y) = \sum_{a \in \mathrm{src}(X)}
-\sum_{b \in \mathrm{src}(Y)} G_{X\leftarrow a}\,
-\mathrm{Cov}(\tilde C^a, \tilde C^b)\, G_{Y\leftarrow b}^{T},
+\sum_{b \in \mathrm{src}(Y)} G_{X\leftarrow a}\thinspace \mathrm{Cov}(\tilde C^a, \tilde C^b)\thinspace G_{Y\leftarrow b}^{T},
 ```
 
 with $\mathrm{src}(EE) = \mathrm{src}(BB) = \{EE, BB\}$ and

@@ -24,6 +24,7 @@ cmbcov/
 │   │                                     #   almxfl, cplx_spin_weighted_ylm
 │   ├── grid.py                          # Gauss-Legendre grid primitives
 │   ├── term_selection.py                # A-priori (m, m', M) term selection for ACC
+│   ├── filtering.py                     # Filter-and-bin sum-rule ratio rho for TT blocks
 │   ├── exact.py                         # exact_covariance, exact_covariance_row (+ _pol)
 │   ├── spectra.py                       # SpectraLoader
 │   ├── keys.py                          # SpecKey, CovKey, CovKeys
@@ -97,7 +98,7 @@ One module per choice of the reduced coupling kernel $\bar\Theta$.
   differ only in the choice of $\bar\Theta$; the mask, the kernels and the
   block layout are shared, reached through `self.cov`.
 - **`nka.py`**: `NKAStrategy` — delta functions,
-  $\Sigma = 2\, C_\ell C_{\ell'}\, \Xi[W^2]$.
+  $\Sigma = 2\thinspace C_\ell C_{\ell'}\thinspace \Xi[W^2]$.
 - **`inka.py`**: `INKAStrategy` — the renormalised MASTER kernel.
 - **`acc.py`**: `ACCStrategy` (the recompute side, reached through a `Cov`)
   and `precompute_acc_kernels` (the one-off precompute, needing only the
@@ -127,8 +128,16 @@ The exact (non-approximate) covariance of the paper's Sect. 3 lives in
 - **`grid.py`**: Gauss-Legendre grids — exact synthesis/analysis
   (`gl_synthesis`/`gl_analysis`, real and complex, spin 0 and 2), the
   minimal band-limit for a product of band-limited fields
-  (`gl_minimal_lmax`), and the ACC-precompute integrals
-  (`spin_weighted_integrals_gl`, `banded_integrals_gl`).
+  (`gl_minimal_lmax`), the ACC-precompute integrals
+  (`spin_weighted_integrals_gl`, `banded_integrals_gl`), and the Legendre
+  tables (spin 0 and spin 2) and ring modes of the batched exact rows
+  (`gl_legendre_table`, `gl_ring_modes`).
+- **`filtering.py`**: the optional filter-and-bin correction of TT x TT blocks
+  (`map_filter` block): the high-pass profile, the stochastic filtered
+  sum-rule ratio `rho` of the mask at a few nodes, its interpolation and
+  cache, and the transfer-function correction `rho / (fl_left fl_right)`
+  that `Cov` applies to the raw block. See
+  [`theory/filter_and_bin.md`](theory/filter_and_bin.md).
 - **`term_selection.py`**: `select_terms` and its building blocks
   (`pole_rotation`, `rotate_alm`, `mode_power`, `azimuthal_spectrum`) — the
   a-priori rule deciding which $(m, m', M)$ ACC-kernel terms carry weight,
@@ -136,7 +145,8 @@ The exact (non-approximate) covariance of the paper's Sect. 3 lives in
   [`theory/term_selection.md`](theory/term_selection.md).
 - **`exact.py`**: `exact_covariance_row`/`exact_covariance` (matrix-free
   exact pseudo $C_\ell$ covariance, TT, HEALPix or GL grid) and
-  `exact_covariance_row_pol`/`exact_covariance_pol` (GL grid, full T/E/B).
+  `exact_covariance_row_pol`/`exact_covariance_pol` (GL grid, full T/E/B);
+  on GL the columns of a row are batched within `max_memory_gb`.
 - **`spectra.py`**: `SpectraLoader` — the data model: CMB spectra, beams,
   pixel window and noise for each frequency/Stokes combination.
 - **`keys.py`**: `SpecKey`/`CovKey`/`CovKeys` — which spectra exist, the

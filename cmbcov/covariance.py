@@ -10,7 +10,7 @@ import hashlib
 import json
 import os
 import warnings
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
@@ -131,6 +131,25 @@ class CovarianceConfig:
         strategy reads). A later computation reuses a block only on an exact
         manifest match and otherwise recomputes and overwrites it. Off by
         default: nothing is read or written.
+    filter_rho : dict, optional
+        Filtered sum-rule ratios ``{channel: rho}``, each ``rho(l1, l2)`` of
+        shape ``(lmax, lmax)`` (from :func:`cmbcov.filtering.rho_matrix`),
+        keyed by the channels of :data:`cmbcov.filtering.CHANNELS`
+        (``"00"``, ``"20"``, ``"EE"``). Every raw T/E block with stokes pair
+        ``(s1, s2)`` is multiplied elementwise by
+        ``rho[ch] / (fl_left[s1][l1] fl_right[s2][l2])``, ``ch =
+        filtering.BLOCK_CHANNEL[(s1, s2)]``, before the PolSpice transform,
+        D_ell scaling, debiasing and binning; a T/E block whose channel is
+        missing raises ``ValueError``. Blocks with a B leg are left unchanged
+        and the run warns once. The ``save_raw_blocks`` cache keeps the
+        uncorrected block. ``None`` (the default): no correction.
+    filter_fl : dict, optional
+        ``filter_fl[freq_pair][stokes]``: transfer function (length at least
+        ``lmax``) of each frequency pair of the run and each spectrum
+        (``"TT"``, ``"TE"``, ``"EE"``; ``"ET"`` falls back to ``"TE"``), for
+        ``filter_rho``. ``None`` means ``fl = 1`` (the factor is ``rho``
+        alone). ``fl["TE"]`` should be a smooth positive reference such as
+        ``sqrt(fl["TT"] fl["EE"])`` (docs/theory/filter_and_bin.md).
     """
 
     method: str = CovarianceMethod.NKA
@@ -162,9 +181,47 @@ class CovarianceConfig:
     #: covariance, binned. A run with a B-mode observable must set it to
     #: ``False`` until the PolSpice EE/BB mixing is implemented.
     polspice_postprocess: bool = True
+    filter_rho: dict[str, np.ndarray] | None = None
+    filter_fl: dict[str, dict[str, np.ndarray]] | None = None
 
     def validate(self) -> None:
         """Validate configuration parameters."""
+        if self.filter_rho is not None:
+            from .filtering import CHANNELS
+
+            if not isinstance(self.filter_rho, Mapping):
+                raise ValueError(
+                    "filter_rho must be a dict {channel: rho} with channels "
+                    f"among {CHANNELS} (e.g. {{'00': rho}} for TT only), got "
+                    f"{type(self.filter_rho).__name__}"
+                )
+            for channel, rho in self.filter_rho.items():
+                if channel not in CHANNELS:
+                    raise ValueError(
+                        f"filter_rho has unknown channel {channel!r}; known: "
+                        f"{CHANNELS}"
+                    )
+                rho = np.asarray(rho)
+                if rho.ndim != 2 or rho.shape != (self.lmax, self.lmax):
+                    raise ValueError(
+                        f"filter_rho[{channel!r}] must have shape (lmax, lmax) "
+                        f"= ({self.lmax}, {self.lmax}), got {rho.shape}"
+                    )
+        if self.filter_fl is not None:
+            if self.filter_rho is None:
+                raise ValueError("filter_fl is set without filter_rho")
+            for pair, by_stokes in self.filter_fl.items():
+                if not isinstance(by_stokes, Mapping):
+                    raise ValueError(
+                        f"filter_fl[{pair!r}] must be a dict {{stokes: fl}} "
+                        f"(e.g. {{'TT': fl}}), got {type(by_stokes).__name__}"
+                    )
+                for stokes, fl in by_stokes.items():
+                    if np.ndim(fl) != 1 or len(fl) < self.lmax:
+                        raise ValueError(
+                            f"filter_fl[{pair!r}][{stokes!r}] must be a 1-d "
+                            f"array of length at least lmax = {self.lmax}"
+                        )
         if not isinstance(self.polspice_postprocess, (bool, np.bool_)):
             raise ValueError(
                 "polspice_postprocess must be true or false, got "
@@ -1386,7 +1443,46 @@ class Cov:
         # dropped with this call (see _leg_projection).
         projections: dict[tuple, np.ndarray] = {}
 
+        # map_filter: each T/E block is multiplied by the factor of its
+        # sum-rule channel (cmbcov.filtering.BLOCK_CHANNEL); blocks with a B
+        # leg are left as they are. The channels are checked here, before
+        # anything is computed.
+        filter_channel: dict[str, str] = {}
+        if self.config.filter_rho is not None:
+            from .filtering import BLOCK_CHANNEL
+
+            uncorrected = []
+            for stokes in covariance_keys.stokekey():
+                channel = BLOCK_CHANNEL.get(tuple(stokes.split("x")))
+                if channel is None:
+                    uncorrected.append(stokes)
+                elif channel not in self.config.filter_rho:
+                    raise ValueError(
+                        f"map_filter: block {stokes} needs the sum-rule "
+                        f"channel {channel!r}, which filter_rho does not have "
+                        f"(it has {sorted(self.config.filter_rho)}); compute it "
+                        "with filtering.filtered_sum_rule_ratio(..., "
+                        "channels=filtering.channels_for(...))."
+                    )
+                else:
+                    filter_channel[stokes] = channel
+            if uncorrected:
+                warnings.warn(
+                    "map_filter: the filter-and-bin correction covers the T/E "
+                    "blocks only; the blocks with a B leg "
+                    f"({', '.join(uncorrected)}) are left uncorrected "
+                    "(docs/theory/filter_and_bin.md).",
+                    UserWarning,
+                    stacklevel=2,
+                )
+        filter_factors: dict[tuple[str, str, str, str], np.ndarray] = {}
+
         def consume(cov_key: CovKey, covariance_term: np.ndarray) -> None:
+            channel = filter_channel.get(cov_key.stokekey())
+            if channel is not None:
+                covariance_term = covariance_term * self._filter_factor(
+                    cov_key, channel, filter_factors
+                )
             if needs_bmode_mixing:
                 raw_blocks[cov_key] = covariance_term
             else:
@@ -1488,6 +1584,55 @@ class Cov:
 
         strategy = StrategyFactory.create_strategy(self)
         return strategy.error_budget(covariance_keys, band_edges=band_edges)
+
+    def _filter_factor(
+        self,
+        cov_key: CovKey,
+        channel: str,
+        cache: dict[tuple[str, str, str, str], np.ndarray],
+    ) -> np.ndarray:
+        """
+        The ``(lmax, lmax)`` factor ``rho[channel] / (fl_left[s1]
+        fl_right[s2])`` of a T/E block (``config.filter_rho`` /
+        ``filter_fl``), kept in ``cache`` for the blocks with the same
+        frequency pairs and stokes pair. ``fl`` of ``"ET"`` falls back to
+        that of ``"TE"``.
+        """
+        from .filtering import transfer_correction
+
+        left, right = cov_key.freqkey().split("x")
+        s1, s2 = cov_key.stokekey().split("x")
+        key = (left, right, s1, s2)
+        factor = cache.get(key)
+        if factor is None:
+            fl = self.config.filter_fl
+            if fl is None:
+                fl_left = fl_right = np.ones(self.lmax)
+            else:
+                fl_left = self._filter_fl(fl, left, s1)
+                fl_right = self._filter_fl(fl, right, s2)
+            factor = transfer_correction(
+                self.config.filter_rho[channel], fl_left, fl_right
+            )
+            cache[key] = factor
+        return factor
+
+    def _filter_fl(self, fl: dict, pair: str, stokes: str) -> np.ndarray:
+        """``fl[pair][stokes]`` (``"ET"`` falling back to ``"TE"``), cut to lmax."""
+        if pair not in fl:
+            raise ValueError(
+                f"map_filter: filter_fl has no entry for frequency pair {pair!r}"
+            )
+        by_stokes = fl[pair]
+        name = stokes
+        if name not in by_stokes and name == "ET":
+            name = "TE"
+        if name not in by_stokes:
+            raise ValueError(
+                f"map_filter: filter_fl[{pair!r}] has no {stokes!r} transfer "
+                f"function (it has {sorted(by_stokes)})"
+            )
+        return np.asarray(by_stokes[name], dtype=float)[: self.lmax]
 
     # ================== Raw per-block cache (save_raw_blocks) ==================
 

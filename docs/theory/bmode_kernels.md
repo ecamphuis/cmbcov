@@ -375,7 +375,7 @@ lacks the added pairs and is refused, with a message listing them. Either
 rerun `cmbcov-precompute`, or add only the missing pairs to the cache with
 `precompute_acc_kernels(..., pairs=[...])` and the mask, `centralell`,
 `dmax`, `nside`, `lw` and `grid` it was built with. Extending a cache is
-safe: the per-$(\ell, \ell')$ manifest records the kernel files written,
+safe: the manifest of each $(\ell, \ell')$ pair records the kernel files written,
 and a precompute with the same identity (mask, `centralell`, grid, `lw`,
 `nside`, term selection) merges its pairs and channels into that record,
 so a cache built in steps has the manifests and kernels of a one-shot

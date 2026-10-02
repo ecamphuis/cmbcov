@@ -146,7 +146,7 @@ $\min(\ell, \ell')$, so that no entry near `lmax` loses part of its
 translated kernel, every spectrum must reach
 
 ```math
-\ell_{\mathrm{int}} = \ell_{\max} + \max(0,\, S - 1 - \ell_\ast)
+\ell_{\mathrm{int}} = \ell_{\max} + \max(0,\thinspace S - 1 - \ell_\ast)
 ```
 
 with $S$ the kernel size (`2 * nside` of the ACC precompute) and $\ell_\ast$
@@ -193,7 +193,7 @@ spectrum (`cmb_spectrum`: no beam, no pixel window, no transfer function) to
 the *expected* value of each reported, debiased bandpower,
 
 ```math
-\langle \hat C^X_b \rangle = \sum_\ell W^X_{b\ell}\, C^X_\ell ,
+\langle \hat C^X_b \rangle = \sum_\ell W^X_{b\ell}\thinspace C^X_\ell ,
 ```
 
 as one plain-text file per two-letter spectrum and frequency pair among
@@ -227,15 +227,15 @@ instead of writing anything; enable `polspice_postprocess`, or drop
 $D_\ell$ scaling (`Dl: true`) is folded into `W`'s output axis, matching the
 covariance's own convention; the input axis stays $C_\ell$. The instrument
 enters on both axes, as it does in the covariance. The covariance is
-computed for the beamed spectrum $\mathcal{D}_\ell C_\ell$, with the data
-model $\mathcal{D}_\ell = B^A_\ell B^B_\ell\, p_\ell\, F_\ell$ of the pair
+computed for the beamed spectrum $\mathcal D_\ell C_\ell$, with the data
+model $\mathcal D_\ell = B^A_\ell B^B_\ell\thinspace p_\ell\thinspace F_\ell$ of the pair
 $A \times B$ (`SpectraLoader.data_model`: the beams of both frequencies, the
 pixel window of the Stokes pair, $p_T^2$, $p_T p_P$ or $p_P^2$, and the
 transfer function), and the data bandpower is debiased by
-$d_\ell = 1/\mathcal{D}_\ell$. Each file is therefore
+$d_\ell = 1/\mathcal D_\ell$. Each file is therefore
 
 ```math
-W = P\, \mathrm{diag}(\delta_\ell\, d_\ell)\, K\, \mathrm{diag}(\mathcal{D}_\ell),
+W = P\thinspace \mathrm{diag}(\delta_\ell\thinspace d_\ell)\thinspace K\thinspace \mathrm{diag}(\mathcal D_\ell),
 ```
 
 with $P$ the binning, $\delta_\ell = \ell(\ell+1)/2\pi$ under `Dl: true`
@@ -248,9 +248,9 @@ the run writes. The covariance's own leg factor (`debiasing_dict`,
 `add_tf_uncertainty` inflation $1 + \sqrt{(1 - F_\ell)/3999}$. Both
 multiply the covariance only and are never applied to the data, so the
 windows leave them out.
-Windows written before 2026-09-28 lacked the factor $\mathrm{diag}(\mathcal{D}_\ell)$: with a beam or
+Windows written before 2026-09-28 lacked the factor $\mathrm{diag}(\mathcal D_\ell)$: with a beam or
 pixel window on (the pixel window defaults to nside 8192), $W C$ was off
-by about the binned $1/\mathcal{D}_\ell$: 1.003 to 1.30 per bin on the
+by about the binned $1/\mathcal D_\ell$: 1.003 to 1.30 per bin on the
 package's test baseline (nside-32 pixel window, $\ell < 60$), and 0.94 to
 1.40 across $\ell$ = 425 to 2975 for the SPT-3G D1 150 GHz beam normalised
 near $\ell$ = 800.

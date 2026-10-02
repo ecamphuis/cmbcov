@@ -13,6 +13,20 @@ than merely *stable*. Two routes with no shared code reach the same number:
 
 Agreement at the 1e-4 level at nside=16 pins the ACC kernel's shape and the
 Eq. 22-25 normalisation together.
+
+Both run on the test mask (an azimuthally symmetric cap: every integral
+``I_{lm,LM}`` sits at ``M = m``, ``Theta`` is diagonal in ``(m, m')`` and
+every exact column couples ``M = m'`` only) and on the two-patch mask of
+``tests/conftest.py``, where the orders mix (83% of its power at ``m > 0``),
+smoothed with a 15 deg FWHM Gaussian.  The smoothing keeps the mask in
+``[0, 1]`` (a positive kernel) and its power within ACC's reach at
+``nside = 16``: Eq. 22 sums ``l1, l2 <= 2 nside - 1 = 31`` and so holds only
+if ``W Y_lm`` has no power above that.  Unsmoothed, the patchy mask's edges
+put 1% of it there (Eq. 22 ratio 0.990, hence ACC/exact 1.010 through the
+Eq. 23 normalisation) while its raw kernel ``2/n C Theta C`` still matches
+the exact covariance to 3e-5 -- a truncation, not a coupling, effect.
+Smoothed, measured Eq. 22 ratio 1 - 1.6e-4 .. 1 - 2.1e-4 and ACC/exact
+1 + 1.6e-4 .. 1 + 2.1e-4 (cap: 0.99988 .. 0.99995 and 1e-4).
 """
 
 import os
@@ -33,24 +47,45 @@ from cmbcov.covariance import Cov, CovarianceConfig, CovarianceMethod
 from cmbcov.exact import exact_covariance_row
 from cmbcov.kernels.coupling import KERNEL_TT, coupling_kernels
 from cmbcov.keys import CovKey
+from cmbcov.sht import almxfl, ducc0_alm2map, ducc0_map2alm
 
 DATA = os.path.join(os.path.dirname(__file__), "data")
 NSIDE = 16
 ELL = 16
 ELLPS = [ELL, ELL + 1, ELL + 2, ELL + 3]
+SMOOTHING_FWHM_DEG = 15.0
 
 
 @pytest.fixture(scope="module")
-def setup():
+def smooth_patchy_dir(tmp_path_factory, patchy_mask_dir):
+    """``smooth_patchy.fits``: the patchy mask smoothed with a Gaussian of
+    ``SMOOTHING_FWHM_DEG`` (module docstring), at its nside 32."""
+    mask = hp.read_map(os.path.join(patchy_mask_dir, "patchy_mask.fits"))
+    lmax = 3 * hp.npix2nside(mask.size) - 1
+    ell = np.arange(lmax + 1)
+    sigma = np.radians(SMOOTHING_FWHM_DEG) / np.sqrt(8 * np.log(2))
+    beam = np.exp(-0.5 * ell * (ell + 1) * sigma**2)
+    smooth = ducc0_alm2map(
+        almxfl(ducc0_map2alm(mask, lmax=lmax, iter=10), beam),
+        hp.npix2nside(mask.size),
+        lmax=lmax,
+    )
+    out = tmp_path_factory.mktemp("smooth_patchy")
+    hp.write_map(str(out / "smooth_patchy.fits"), smooth, dtype=np.float64)
+    return str(out)
+
+
+@pytest.fixture(scope="module", params=["cap", "smooth_patchy"])
+def setup(request):
     config = CovarianceConfig(
         method=CovarianceMethod.ACC, lmax=48, dmax=4, centralell=ELL
     )
-    cov = Cov(
-        "baseline_mask.fits",
-        config=config,
-        mask_path=os.path.abspath(DATA),
-        save_dir=tempfile.mkdtemp(),
+    name, path = (
+        ("baseline_mask.fits", os.path.abspath(DATA))
+        if request.param == "cap"
+        else ("smooth_patchy.fits", request.getfixturevalue("smooth_patchy_dir"))
     )
+    cov = Cov(name, config=config, mask_path=path, save_dir=tempfile.mkdtemp())
     # ACC's own degraded mask, exactly as _setup_coupling_computation builds it.
     wn, nside = cov.wlm.degrade_mask(NSIDE)
     lmax = 2 * nside - 1  # ACC kernels are (2 nside) square, indices 0..2nside-1

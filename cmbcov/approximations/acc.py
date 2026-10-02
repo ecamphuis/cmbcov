@@ -74,9 +74,12 @@ __all__ = [
 #: B-mode support (docs/theory/bmode_kernels.md); :data:`CHANNEL_ALIASES`
 #: accepts the old names.  ``TD`` pairs T at ``l`` with D at ``l'``; ``DT``
 #: pairs D at ``l`` with T at ``l'``.  At ``l == l'`` one has ``Theta^{DT}(m,
-#: m') = conj(Theta^{TD}(m', m))`` and every kernel built from ``DT`` equals
-#: its ``TD`` counterpart (this was the old ``ET``/``TE`` relation); for
-#: ``l != l'`` they differ (measured 3e-3 to 1.6e-2 of the kernel maximum at
+#: m') = conj(Theta^{TD}(m', m))``, so a kernel whose ``DT`` legs are all
+#: swapped for ``TD`` is unchanged (``DTxDT = TDxTD``, ``DTxTT = TDxTT``;
+#: the old ``ET``/``TE`` relation) -- but the mixed ``TDxDT`` is not
+#: ``TDxTD`` (2e-3 of the maximum on an asymmetric test mask; they agree
+#: only on an azimuthally symmetric one, where ``Theta^{TD}`` is diagonal and
+#: real).  For ``l != l'`` ``DT`` and ``TD`` differ (measured 3e-3 to 1.6e-2 of the kernel maximum at
 #: ``(16, 17)`` and ``(16, 19)`` on the test mask), and ``DT`` is what the
 #: second Wick contraction of Cov(TE, TE) needs.  The kernels
 #: ``output["s1xs2"]`` are ordered pairs of this tuple.
@@ -144,6 +147,11 @@ _PRIME_FIELD = (0, 1, 2, 1, 0, 2, 0, 2, 1)
 #: added): the sixteen ``{TT,DD,TD,DT}^2`` pairs (old ``{TT,EE,TE,ET}^2``).
 #: ``LL`` is computed by the precompute but never read back by the strategy.
 _DEFAULT_KERNEL_STOKES = ("TT", "DD", "TD", "DT")
+
+
+#: The :data:`COUPLING_CHANNELS` with an E->B leakage (``L``) leg, for which
+#: term selection does not meet its tolerance on every mask.
+_LEAKAGE_CHANNELS = frozenset(c for c in COUPLING_CHANNELS if "L" in c)
 
 
 def _resolve_spectra(
@@ -3489,6 +3497,26 @@ class _CouplingPrecompute:
                 "term_selection is implemented for grid='gl' only "
                 f"(got grid={grid!r})"
             )
+
+        if term_selection is not None:
+            requested = (
+                {c for ab in pairs_tuple for c in ab}
+                if pairs_tuple is not None
+                else set(spectra_tuple)
+            )
+            leaky = sorted(requested & _LEAKAGE_CHANNELS)
+            if leaky:
+                # Once per precompute: this method runs once per call.
+                warnings.warn(
+                    f"term_selection={term_selection:g} with E->B leakage kernels "
+                    f"({', '.join(leaky)}): the tolerance is not guaranteed for "
+                    "the kernels that involve the leakage field on masks that "
+                    "are not azimuthally symmetric about their centre; errors "
+                    "up to ~10x the tolerance were measured. Use "
+                    "term_selection=None to avoid this",
+                    UserWarning,
+                    stacklevel=3,
+                )
 
         # Validate inputs and setup parameters
         nside, wn_for_ell, lmax, mask_alm, lw = self._setup_coupling_computation(

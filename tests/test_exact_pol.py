@@ -5,7 +5,9 @@ Exact polarised pseudo-Cl covariance on the Gauss-Legendre grid
 
 The polarised algorithm applies ``K = blockdiag(K_0, K_2)`` to unit vectors
 in T, E and B, multiplies by the 3x3 spectrum matrix and applies ``K`` again,
-then contracts the correlators ``R^{XZ}`` with Wick's theorem.  The tests pin
+then contracts the correlators ``R^{XZ}`` with Wick's theorem.  The public
+functions compute the columns in batches (``tests/test_exact_pol_batched.py``
+pins them against the per-column path); the tests here run on them.  The tests pin
 the normalisation and the Wick contraction (full-sky identities for every
 block), the two symmetries (row/column and m' -> -m'), the minimal-grid rule
 for spin 2, agreement with the TT-only implementation, the HEALPix-path
@@ -13,8 +15,13 @@ guard, and (slow) agreement with ``healpy.synfast``/``anafast`` Monte Carlo
 simulations of masked polarised skies -- including the pure E -> B leakage
 variance, which is the sharpest test of the spin-2 bookkeeping.
 
-The fixtures are local on purpose: healpy is the independent oracle, and this
-module must not depend on the shared ``tests/conftest.py`` fixtures.
+The Monte Carlo fixtures are local on purpose: healpy is the independent
+oracle, and this module must not depend on the shared ``tests/conftest.py``
+fixtures.  Only the mask shape of the comparisons between two computations
+(the symmetries, the grid rule, the TT block) comes from there: they run on
+the apodised cap and on ``patchy_mask``, since on the cap every column
+couples ``M = m'`` only and an error in how the spin-0 and spin-2
+transforms mix azimuthal orders would not show.
 """
 
 import time
@@ -24,8 +31,14 @@ import pytest
 
 healpy = pytest.importorskip("healpy")
 
+from conftest import patchy_mask  # noqa: E402
+
 from cmbcov.exact import (  # noqa: E402
     SPECTRA,
+    _cl_matrix,
+    _exact_row_gl,
+    _exact_row_pol_gl,
+    _mask_alm_for_gl,
     exact_covariance,
     exact_covariance_pol,
     exact_covariance_row,
@@ -88,6 +101,21 @@ def cap():
 def cap_rows(cap):
     """Rows l' = 20 and 40 of all four-spectrum blocks on the cap mask."""
     mask, cls = cap
+    return {lp: exact_covariance_row_pol(mask, cls, lp, LMAX) for lp in (20, 40)}
+
+
+@pytest.fixture(scope="module", params=["cap", "patchy"])
+def any_mask(request, cap):
+    """The cap and ``patchy_mask`` (every azimuthal order populated)."""
+    return cap if request.param == "cap" else (patchy_mask(NSIDE), spectra(LMAX))
+
+
+@pytest.fixture(scope="module")
+def any_rows(request, any_mask, cap):
+    """Rows l' = 20 and 40 of all four-spectrum blocks on ``any_mask``."""
+    if any_mask is cap:
+        return request.getfixturevalue("cap_rows")
+    mask, cls = any_mask
     return {lp: exact_covariance_row_pol(mask, cls, lp, LMAX) for lp in (20, 40)}
 
 
@@ -154,16 +182,18 @@ def test_full_sky_identities_for_every_block():
 
 
 # --------------------------------------------------------------------------- #
-# Symmetries and grid rule on the apodised cap
+# Symmetries and grid rule on the apodised cap and the patchy mask
 # --------------------------------------------------------------------------- #
-def test_row_column_symmetry_between_blocks(cap_rows):
+def test_row_column_symmetry_between_blocks(any_rows):
     """
     cov(XY, ZW)_{l l'} == cov(ZW, XY)_{l' l}: element (40) of the l' = 20 row
     of block (XY, ZW) equals element (20) of the l' = 40 row of block
     (ZW, XY).  K is Hermitian on GL, so this holds at round-off: measured
-    3e-13 element-wise, 1e-16 of the block scale.
+    3e-13 element-wise, 1e-16 of the block scale (patchy mask: 3e-16
+    element-wise) one column at a time; 3.3e-13 (patchy: 7e-16) with the
+    batched columns the public function now uses.
     """
-    r20, r40 = cap_rows[20], cap_rows[40]
+    r20, r40 = any_rows[20], any_rows[40]
     specs = ("TT", "TE", "EE", "BB")
     scale = max(np.abs(r20[k]).max() for k in r20)
     for a in specs:
@@ -173,20 +203,22 @@ def test_row_column_symmetry_between_blocks(cap_rows):
             np.testing.assert_allclose(x, y, rtol=1e-11, err_msg=f"{a},{b}")
 
 
-def test_m_prime_symmetry(cap):
-    """m' >= 0 with weight 2 Re must reproduce the full m' loop (measured 6e-16)."""
-    mask, cls = cap
+def test_m_prime_symmetry(any_mask):
+    """m' >= 0 with weight 2 Re must reproduce the full m' loop (measured 6e-16,
+    patchy mask 4e-16; batched columns 7e-16 and 4e-16)."""
+    mask, cls = any_mask
     fast = exact_covariance_row_pol(mask, cls, 12, LMAX, use_symmetry=True)
     full = exact_covariance_row_pol(mask, cls, 12, LMAX, use_symmetry=False)
     for k in fast:
         assert rel_err(fast[k], full[k]) < 1e-13, k
 
 
-def test_minimal_grid_is_exact_for_spin2(cap):
+def test_minimal_grid_is_exact_for_spin2(any_mask):
     """The spin-0 rule Lg = lmax + ceil((Lw-1)/2) also holds for the spin-2
     round trips: the minimal grid and the over-resolved grid lmax + Lw agree
-    to 1e-13 on every block (measured 1e-14)."""
-    mask, cls = cap
+    to 1e-13 on every block (measured 1e-14; patchy mask 3e-15; batched
+    columns 8.6e-15 and 2.3e-15)."""
+    mask, cls = any_mask
     assert gl_minimal_lmax(LMAX, LW) == 107
     minimal = exact_covariance_row_pol(mask, cls, 12, LMAX)
     large = exact_covariance_row_pol(mask, cls, 12, LMAX, lmax_grid=LMAX + LW)
@@ -197,27 +229,46 @@ def test_minimal_grid_is_exact_for_spin2(cap):
 # --------------------------------------------------------------------------- #
 # Agreement with the TT-only implementation, API behaviour
 # --------------------------------------------------------------------------- #
-def test_tt_block_matches_exact_covariance_row(cap, cap_rows):
+def test_tt_block_matches_exact_covariance_row(any_mask, any_rows):
     """
-    spectra=("TT",) must equal exact_covariance_row(grid="gl") on the cap
-    mask, with nonzero TE in ``cls`` (the TT block depends on C^TT only).
-    The TT block of the four-spectrum row is the same number.
+    spectra=("TT",) must equal the per-column TT row on the cap mask, with
+    nonzero TE in ``cls`` (the TT block depends on C^TT only).  The TT block
+    of the four-spectrum row is the same number.
 
-    The two are no longer the same arithmetic: the TT path carries a column as
-    the pair of real-map alms and multiplies ``C_L`` there, while the polarised
-    path still builds the ``(lmax+1, 2 lmax+1)`` full-``M`` array and contracts
-    ``cmat`` into it (see ``tests/test_exact_gl_speed.py``).  Those differ by an
-    ulp on the intermediates, so the rows agree to 1.4e-16 of the row maximum
-    but only to 1.2e-13 on the single element at l = 49, which is 3e-9 of the
-    peak and round-off limited.  The bounds below are those measured values.
+    Three arithmetics are involved, each pinned at its own measured bound.
+    The per-column polarised path (``_exact_row_pol_gl(..., batched=False)``)
+    builds the ``(lmax+1, 2 lmax+1)`` full-``M`` array and contracts ``cmat``
+    into it, while the per-column TT path carries a column as the pair of
+    real-map alms and multiplies ``C_L`` there (see
+    ``tests/test_exact_gl_speed.py``).  Those differ by an ulp on the
+    intermediates, so the rows agree to 1.4e-16 of the row maximum but only
+    to 1.2e-13 on the single element at l = 49, which is 3e-9 of the peak and
+    round-off limited (patchy mask: 1.9e-16 of the maximum, 1.1e-15
+    element-wise).  The bounds of the first loop are those measured values.
+
+    The public functions compute the columns in batches by Legendre matrix
+    products (``tests/test_exact_batched.py``,
+    ``tests/test_exact_pol_batched.py``; for ``spectra=("TT",)`` the TT
+    kernel itself): the TT block of ``exact_covariance_row_pol`` (TT alone
+    or with TE, EE, BB) and ``exact_covariance_row`` agree with the reference
+    to 1.00e-15 of the row maximum on the cap (6.3e-13 on the element at
+    l = 53) and 9.5e-17 on the patchy mask, asserted at the batched paths'
+    bound of 1e-13 of the maximum.
     """
-    mask, cls = cap
-    ref = exact_covariance_row(mask, cls["TT"], 20, LMAX, grid="gl")
-    tt_only = exact_covariance_row_pol(mask, cls, 20, LMAX, spectra=("TT",))
-    assert set(tt_only) == {("TT", "TT")}
-    for got in (tt_only[("TT", "TT")], cap_rows[20][("TT", "TT")]):
+    mask, cls = any_mask
+    mask_alm, lw = _mask_alm_for_gl(mask, None, None)
+    ref = _exact_row_gl(mask_alm, lw, cls["TT"], 20, LMAX, batched=False)
+    cmat = _cl_matrix(cls, LMAX)
+    for specs in (("TT",), ("TT", "TE", "EE", "BB")):
+        got = _exact_row_pol_gl(mask_alm, lw, cmat, 20, LMAX, specs, batched=False)
+        got = got[("TT", "TT")]
         assert np.abs(got - ref).max() < 1e-15 * np.abs(ref).max()
         np.testing.assert_allclose(got, ref, rtol=1e-12)
+    tt_only = exact_covariance_row_pol(mask, cls, 20, LMAX, spectra=("TT",))
+    assert set(tt_only) == {("TT", "TT")}
+    public = exact_covariance_row(mask, cls["TT"], 20, LMAX, grid="gl")
+    for got in (tt_only[("TT", "TT")], any_rows[20][("TT", "TT")], public):
+        assert np.abs(got - ref).max() < 1e-13 * np.abs(ref).max()
 
 
 def test_matrix_builder_and_key_handling(cap, cap_rows):

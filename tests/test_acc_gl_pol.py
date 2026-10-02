@@ -32,6 +32,22 @@ band-limited at ``LW = 10`` (as ``tests/test_acc_gl.py``) unless stated:
 The polarised *blocks* of the strategy are deliberately not asserted: with
 the package's ``norm_Xi`` they are 3-16% high on this mask, entirely from
 the normalisation (the kernels are exact, see above).
+
+On the test mask (an azimuthally symmetric cap) every ``I_{lm,LM}`` sits at
+``M = m`` and ``Theta^s(m, m')`` is real and diagonal in ``(m, m')``, so an
+error in how the spin-0 and spin-2 coefficients mix azimuthal orders would
+not show.  The integrals against HEALPix, the kernels against the exact
+Wick terms, the ET identities and the GL-vs-HEALPix kernels therefore also
+run on the two-patch mask of ``tests/conftest.py`` (every order populated).
+Measured there: integrals E 1.3e-4, B 2.2e-4, T 3.5e-4; Wick terms 1.1e-15;
+the ET kernels differ from the TE ones by 3.2e-2 / 9.0e-3 at ``(16, 17)`` /
+``(16, 19)``.  One statement above is a property of the symmetric cap only:
+at ``l == l'`` the kernels ``TDxDT`` and ``TDxTD`` are equal on the cap
+(2e-19) but not on the patchy mask (2.1e-3), since ``Theta^{DT}(m, m') =
+conj(Theta^{TD}(m', m))`` turns ``Re sum Theta^{TD} conj(Theta^{DT})`` into
+``Re sum Theta^{TD}(m, m') Theta^{TD}(m', m)``, which equals the ``TDxTD``
+sum only when ``Theta^{TD}`` is real and diagonal.  ``DT`` is what the
+exact Wick term needs at ``l == l'`` too (checked to 1.1e-15 below).
 """
 
 import os
@@ -63,7 +79,7 @@ from cmbcov.grid import (
 from cmbcov.kernels.coupling import KERNEL_TT, coupling_kernels
 from cmbcov.keys import CovKey
 from cmbcov.mask import MaskWlm
-from cmbcov.sht import ducc0_map2alm
+from cmbcov.sht import ducc0_alm2map, ducc0_map2alm
 
 DATA = os.path.abspath(os.path.join(os.path.dirname(__file__), "data"))
 NSIDE = 16
@@ -80,15 +96,24 @@ KSIZE = 2 * NSIDE  # kernel size: L = 0..31
 FREQ = "090GHz"
 
 
-def _cov(save_dir, dmax=DMAX):
+MASKS = ["cap", "patchy"]
+
+
+def _cov(save_dir, dmax=DMAX, mask=("baseline_mask.fits", DATA)):
     config = CovarianceConfig(
         method=CovarianceMethod.ACC, lmax=LMAX, dmax=dmax, centralell=ELL
     )
+    name, path = mask
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # low centralell warning
-        return Cov(
-            "baseline_mask.fits", config=config, mask_path=DATA, save_dir=save_dir
-        )
+        return Cov(name, config=config, mask_path=path, save_dir=save_dir)
+
+
+def _mask(which, patchy_mask_dir):
+    """``(file name, directory)`` of the test mask or the two-patch mask."""
+    if which == "cap":
+        return ("baseline_mask.fits", DATA)
+    return ("patchy_mask.fits", patchy_mask_dir)
 
 
 def _spectra(size):
@@ -127,9 +152,9 @@ def test_spin2_integrals_vanish_below_ell_2():
         spin_weighted_integrals_gl(fs, 0, 4, 0, 8, spin=1)
 
 
-@pytest.fixture(scope="module")
-def healpix_integral_setup():
-    cov = _cov(tempfile.mkdtemp())
+@pytest.fixture(scope="module", params=MASKS)
+def healpix_integral_setup(request, patchy_mask_dir):
+    cov = _cov(tempfile.mkdtemp(), mask=_mask(request.param, patchy_mask_dir))
     wn, _ = cov.wlm.degrade_mask(NSIDE)
     lw = 3 * NSIDE - 1
     # The alm of the very pixel mask the HEALPix path multiplies by, so the
@@ -149,8 +174,10 @@ def test_spin2_integrals_match_healpix_path(healpix_integral_setup, ell, m):
     Measured ``max|diff| / max|E_GL|`` with the HEALPix ``map2alm`` at
     ``iter=3``: E 9.3e-5 .. 5.5e-4, B 7.7e-5 .. 5.1e-4; T is 6.1e-5 .. 2.0e-4
     at ``m = 0`` and 2.0e-4 .. 1.0e-3 otherwise.  (At ``iter=0``, E and B
-    reached 6.1e-3 and T 4.9e-2 at ``m = 0``.)  B is normalised by the E scale because the azimuthally
-    symmetric mask has no ``m = 0`` E->B leakage (|B|/|E| ~ 1e-8 on GL).
+    reached 6.1e-3 and T 4.9e-2 at ``m = 0``.)  B is normalised by the E
+    scale because the azimuthally symmetric mask has no ``m = 0`` E->B
+    leakage (|B|/|E| ~ 1e-8 on GL).  Patchy mask: E, B and T at most 1.3e-4,
+    2.2e-4 and 3.5e-4.
     """
     cov, wn, mask_alm, lw = healpix_integral_setup
     lmax_out = 2 * NSIDE - 1
@@ -172,11 +199,8 @@ def test_spin2_integrals_match_healpix_path(healpix_integral_setup, ell, m):
 # --------------------------------------------------------------------------- #
 # (B) the precompute: ET kernels, loader, GL vs HEALPix
 # --------------------------------------------------------------------------- #
-@pytest.fixture(scope="module")
-def gl_precompute():
-    """GL kernels at (16, 16..19), LW=10, saved to disk; the strategy that
-    loads them; the mask alm they were built from; the exact reference."""
-    cov = _cov(tempfile.mkdtemp())
+def _gl_precompute(mask):
+    cov = _cov(tempfile.mkdtemp(), mask=mask)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         precompute_acc_kernels(
@@ -205,17 +229,41 @@ def gl_precompute():
     return cov, strategy, mask_alm, cls, exact, exact_no_te
 
 
-def test_loader_returns_distinct_et_kernels(gl_precompute):
-    _, strategy, _, _, _, _ = gl_precompute
+@pytest.fixture(scope="module")
+def gl_precompute():
+    """GL kernels at (16, 16..19), LW=10, saved to disk; the strategy that
+    loads them; the mask alm they were built from; the exact reference."""
+    return _gl_precompute(_mask("cap", None))
+
+
+@pytest.fixture(scope="module", params=MASKS)
+def any_precompute(request, patchy_mask_dir):
+    """``gl_precompute`` on the test mask and on the two-patch mask."""
+    if request.param == "cap":
+        return request.getfixturevalue("gl_precompute")
+    return _gl_precompute(_mask("patchy", patchy_mask_dir))
+
+
+def test_loader_returns_distinct_et_kernels(any_precompute):
+    cov, strategy, _, _, _, _ = any_precompute
     same = strategy.get_covariance_coupling(ELL, ELL)
     assert set(same) == {
         (a, b) for a in ("TT", "DD", "TD", "DT") for b in ("TT", "DD", "TD", "DT")
     }
-    # l == l': every DT kernel equals its TD counterpart (old ET / TE)
-    for a in ("TT", "DD", "TD"):
+    # l == l': the DT kernels paired with TT, DD or DT equal their TD
+    # counterparts (old ET / TE) on any mask (measured 2e-15 on the patchy one)
+    for a in ("TT", "DD"):
         assert _rel(same[(a, "DT")], same[(a, "TD")]) < 1e-12
         assert _rel(same[("DT", a)], same[("TD", a)]) < 1e-12
     assert _rel(same[("DT", "DT")], same[("TD", "TD")]) < 1e-12
+    # ... but TDxDT equals TDxTD only when Theta^TD is real and diagonal in
+    # (m, m'), i.e. on an azimuthally symmetric mask (module docstring)
+    mixed = _rel(same[("TD", "DT")], same[("TD", "TD")])
+    assert _rel(same[("DT", "TD")], same[("TD", "TD")]) == pytest.approx(mixed)
+    if cov.mask == "baseline_mask.fits":
+        assert mixed < 1e-12
+    else:
+        assert mixed > 1e-3
     # l != l': they differ, and DTxTD is the transpose of TDxDT
     for ellp, floor in [(ELL + 1, 2e-3), (ELL + 3, 5e-3)]:
         k = strategy.get_covariance_coupling(ELL, ellp)
@@ -254,7 +302,7 @@ def test_loader_refuses_a_cache_without_et_files():
         strategy.get_covariance_coupling(ELL, ELL)
 
 
-def test_polarised_kernels_reproduce_exact_wick_terms(gl_precompute):
+def test_polarised_kernels_reproduce_exact_wick_terms(any_precompute):
     r"""
     Each Wick term of the exact polarised covariance, isolated by the choice
     of spectra, equals ``(1/n) C1 . Theta^{s1xs2}_{16,l'} . C2`` with the
@@ -262,9 +310,10 @@ def test_polarised_kernels_reproduce_exact_wick_terms(gl_precompute):
     for the spectra truncated to the kernel's ``L < 32`` (the kernel has no
     support beyond ``l' + LW = 29``).  Measured 1e-15 .. 1e-14.  The two
     terms needing ET are also evaluated with the TE kernel substituted for
-    it: off by 3.3e-3 / 8.4e-3 at ``(16, 17)`` / ``(16, 19)``.
+    it: off by 3.3e-3 / 8.4e-3 at ``(16, 17)`` / ``(16, 19)`` (patchy mask:
+    7.5e-3 / 1.3e-2, and 1.1e-15 for the kernels themselves).
     """
-    _, strategy, _, cls, exact, exact_no_te = gl_precompute
+    _, strategy, _, cls, exact, exact_no_te = any_precompute
     tt, ee, te = (cls[s][:KSIZE] for s in ("TT", "EE", "TE"))
     for ellp in ROWS:
         n = (2 * ELL + 1) * (2 * ellp + 1)
@@ -372,7 +421,14 @@ def test_healpix_et_cross_spectrum_is_the_swapped_te_entry(tmp_path):
         )
 
 
-def test_gl_and_healpix_polarised_kernels_agree_after_normalisation():
+@pytest.mark.parametrize(
+    "which, kernel_tol, sum_tol",
+    [("cap", 2e-3, 1e-3), ("patchy_band_limited", 1e-6, 1e-7)],
+    ids=["cap", "patchy_band_limited"],
+)
+def test_gl_and_healpix_polarised_kernels_agree_after_normalisation(
+    which, kernel_tol, sum_tol, patchy_mask_dir, tmp_path
+):
     """
     Normalised kernels (Eq. 23) from the two backends at ``nside=16``, GL
     with the ``lw = 3 nside - 1 = 47`` default: measured 1.1e-4 .. 8.1e-4 for
@@ -381,12 +437,38 @@ def test_gl_and_healpix_polarised_kernels_agree_after_normalisation():
     HEALPix E/B convention), times 0.9998 .. 0.9999.  At ``iter=0``, the
     normalised kernels agreed to 9e-3 and the sums carried a 0.969 .. 0.993
     deficit.
+
+    ``patchy_band_limited``: the two-patch mask of ``tests/conftest.py``
+    band-limited at ``LW`` and synthesised straight onto the ``nside=16``
+    working map (as in ``tests/test_acc_healpix_complex_theta.py``), with GL
+    at ``lw = LW``, so that both branches see the same function and what is
+    left is the HEALPix transform error, not the pixelisation of the mask
+    (the raw patchy mask at the ``lw = 47`` default differs by 4.5e-3, sums
+    0.989 .. 0.998, from its sharper edges).  Measured: normalised kernels
+    5.5e-8 at worst (all 25 pairs), sums 1 - 1.1e-8 .. 1 + 5.1e-9.  This
+    covers the cross pairs (``TTxDD``, ``TDxDT``, ``LL``, ...) on a mask
+    whose ``Theta`` is complex and not diagonal in ``(m, m')``.
     """
-    cov = _cov(tempfile.mkdtemp(), dmax=2)
+    if which == "cap":
+        wlm = _cov(tempfile.mkdtemp(), dmax=2).wlm
+        lw = {}
+    else:
+        band_limited = ducc0_alm2map(
+            ducc0_map2alm(
+                hp.read_map(os.path.join(patchy_mask_dir, "patchy_mask.fits")),
+                lmax=LW,
+                iter=10,
+            ),
+            NSIDE,
+            lmax=LW,
+        )
+        hp.write_map(str(tmp_path / "patchy16.fits"), band_limited, dtype=np.float64)
+        wlm = MaskWlm("patchy16.fits", load_path=str(tmp_path))
+        lw = {"lw": LW}
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         hpx = precompute_acc_kernels(
-            cov.wlm,
+            wlm,
             None,
             centralell=ELL,
             dmax=2,
@@ -395,7 +477,14 @@ def test_gl_and_healpix_polarised_kernels_agree_after_normalisation():
             grid="healpix",
         )
         gl = precompute_acc_kernels(
-            cov.wlm, None, centralell=ELL, dmax=2, nside=NSIDE, dryrun=True, grid="gl"
+            wlm,
+            None,
+            centralell=ELL,
+            dmax=2,
+            nside=NSIDE,
+            dryrun=True,
+            grid="gl",
+            **lw,
         )
     legs = {"TT": 0, "DD": 2, "LL": 2, "TD": 1, "DT": 1}
     for ellp in (ELL, ELL + 1):
@@ -403,9 +492,9 @@ def test_gl_and_healpix_polarised_kernels_agree_after_normalisation():
             for b in COUPLING_SPECTRA:
                 key = f"{a}x{b}"
                 g, h = gl[ellp][key], hpx[ellp][key]
-                assert _rel(h / h.sum(), g / g.sum()) < 2e-3, f"{ellp} {key}"
+                assert _rel(h / h.sum(), g / g.sum()) < kernel_tol, f"{ellp} {key}"
                 sum_ratio = h.sum() / g.sum() / np.sqrt(2) ** (legs[a] + legs[b])
-                assert 0.999 < sum_ratio < 1.001, f"{ellp} {key}: {sum_ratio:.4f}"
+                assert abs(sum_ratio - 1) < sum_tol, f"{ellp} {key}: {sum_ratio:.4f}"
 
 
 # --------------------------------------------------------------------------- #

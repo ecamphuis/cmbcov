@@ -9,7 +9,7 @@ the derivations are in [`theory/acc.md`](theory/acc.md) and
 ## NKA — Narrow Kernel Approximation
 
 **Assumes** the coupling kernel is narrow enough to replace by delta
-functions (Eq. 27 of the paper), giving $\Sigma = 2\, C_\ell C_{\ell'}\, \Xi[W^2]$
+functions (Eq. 27 of the paper), giving $\Sigma = 2\thinspace C_\ell C_{\ell'}\thinspace \Xi[W^2]$
 (Eq. 26) directly from the mask's power spectrum $W^2$. Exact on the full
 sky; accurate wherever the spectrum varies slowly compared with the width of
 the true coupling kernel.
@@ -33,7 +33,7 @@ hatch (see [`polarisation.md`](polarisation.md)); no TB/EB.
 
 **Assumes** the same delta-function structure as NKA, but with the spectrum
 first smoothed by the renormalised MASTER kernel $\bar M$ (each row summing
-to one), $\Sigma = 2\, \bar C_\ell \bar C_{\ell'}\, \Xi[W^2]$ (Eq. 31). This
+to one), $\Sigma = 2\thinspace \bar C_\ell \bar C_{\ell'}\thinspace \Xi[W^2]$ (Eq. 31). This
 captures some of the coupling NKA discards, at the same cost.
 
 **Cost.** Same as NKA: no precompute, one extra matrix-vector product
@@ -102,8 +102,13 @@ kernel channels and accuracy off `centralell`.
 row, with no approximation. They are standalone functions, not a
 `covariance_approximation` choice — there is no `Cov` wrapper for them.
 
-**Cost.** Expensive at high `lmax`: each row is its own spherical-harmonic
-transform. Not a production method.
+**Cost.** Expensive at high `lmax`: a row costs of order $\ell'^4$ and the
+full matrix $\ell_{\max}^5$. Not a production method. On the GL grid the
+columns of a row, TT and polarised, are computed together; `max_memory_gb`
+(default 2 GiB) sets how many (the result changes only at the level of
+rounding). A polarised column needs up to nine times the memory of a TT
+one, so fewer are computed together. See [`theory/exact_covariance.md`](theory/exact_covariance.md),
+Sect. 4.
 
 **Accuracy.** The reference: every approximation above is measured against
 it.

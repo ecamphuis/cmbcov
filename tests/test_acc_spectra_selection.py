@@ -56,18 +56,14 @@ ELLP_RANGE = [ELL, ELL + 1]
 FREQ = "090GHz"
 
 
-def _cov(save_dir, dmax=DMAX):
+def _cov(save_dir, dmax=DMAX, mask=("baseline_mask.fits", os.path.abspath(DATA))):
     config = CovarianceConfig(
         method=CovarianceMethod.ACC, lmax=LMAX, dmax=dmax, centralell=ELL
     )
+    name, path = mask
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # low centralell warning
-        return Cov(
-            "baseline_mask.fits",
-            config=config,
-            mask_path=os.path.abspath(DATA),
-            save_dir=save_dir,
-        )
+        return Cov(name, config=config, mask_path=path, save_dir=save_dir)
 
 
 def _tt_cl(size):
@@ -80,9 +76,18 @@ def _tt_cl(size):
 # --------------------------------------------------------------------------- #
 # (A) the precompute: spectra=("TT",) vs spectra=None (dryrun)
 # --------------------------------------------------------------------------- #
+@pytest.fixture(scope="module", params=["cap", "patchy"])
+def dryrun_mask(request, patchy_mask_dir):
+    """The test mask, and the two-patch mask of ``tests/conftest.py`` (on the
+    former, a cap, every ``Theta(m, m')`` is diagonal in ``(m, m')``)."""
+    if request.param == "cap":
+        return ("baseline_mask.fits", os.path.abspath(DATA))
+    return ("patchy_mask.fits", patchy_mask_dir)
+
+
 @pytest.fixture(scope="module")
-def full_dryrun():
-    cov = _cov(tempfile.mkdtemp())
+def full_dryrun(dryrun_mask):
+    cov = _cov(tempfile.mkdtemp(), mask=dryrun_mask)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         return precompute_acc_kernels(
@@ -98,8 +103,8 @@ def full_dryrun():
 
 
 @pytest.fixture(scope="module")
-def tt_only_dryrun():
-    cov = _cov(tempfile.mkdtemp())
+def tt_only_dryrun(dryrun_mask):
+    cov = _cov(tempfile.mkdtemp(), mask=dryrun_mask)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         return precompute_acc_kernels(

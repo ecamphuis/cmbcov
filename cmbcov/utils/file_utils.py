@@ -10,31 +10,24 @@ import os
 import subprocess
 from hashlib import blake2b
 
-#: Timeout for the ``git`` subprocess call below, in seconds. This runs on
-#: every pipeline run, so it must not hang if ``git`` itself stalls (e.g. a
-#: network-mounted or locked repository).
+#: Timeout, in seconds, of the ``git`` subprocess call below, so a stalled
+#: ``git`` (e.g. on a network-mounted or locked repository) cannot hang a run.
 _GIT_HASH_TIMEOUT = 5
 
 
 def get_git_revision_short_hash() -> str:
     """
-    Get the short Git revision hash for the current repository.
-    This is useful for tracking code versions in outputs.
+    Get the short Git revision hash of the repository containing this package.
 
-    Parameters
-    ----------
-    repository_path : str, optional
-        Path to the Git repository. If None, uses the cmbcov package default path.
+    Used to tag outputs with the code version.
 
     Returns
     -------
     str
         Short Git revision hash, or a deterministic ``"unknown-XXXXXXXX"``
-        fallback (a blake2b digest of the repository path) if ``git`` is
-        unavailable, times out, or is not a repository. Deterministic so
-        that repeated calls -- in the same process or in separate ones, e.g.
-        parallel pipeline runs on the same path -- agree, unlike the
-        previous fallback which used Python's randomised ``hash()``.
+        fallback (a blake2b digest of the package path) if ``git`` is
+        unavailable, times out, or the package is not in a repository.
+        The fallback is the same in every process, so parallel runs agree.
     """
     # this file
     repository_path = os.path.dirname(os.path.abspath(__file__))

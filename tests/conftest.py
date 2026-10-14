@@ -29,15 +29,19 @@ import os
 import numpy as np
 import pytest
 
-from cmbcov.sht import alm2cl, ducc0_alm2map, ducc0_map2alm
-from cmbcov.term_selection import rotate_alm
+from cmbcov.approximations.acc.term_selection import rotate_alm
+from cmbcov.harmonics.sht import alm2cl, ducc0_alm2map, ducc0_map2alm
 
 healpy = pytest.importorskip("healpy")
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+# The tests live in subfolders mirroring the package; reach the shared data
+# and reference files through these, never through ``__file__`` of a test.
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(TESTS_DIR, "data")
+REFERENCE_DIR = os.path.join(TESTS_DIR, "reference")
 
-# Monte Carlo comparison, shared by tests/test_exact_covariance.py and
-# tests/test_exact_gl.py.
+# Monte Carlo comparison, shared by tests/exact/test_exact_covariance.py
+# and tests/exact/test_exact_gl.py.
 NSIDE = 32
 LMAX = 60
 N_SIMS = 10000

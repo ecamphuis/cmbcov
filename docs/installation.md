@@ -46,7 +46,7 @@ pip install -e ".[dev]"        # test + black, ruff, isort, pre-commit, sphinx
 pip install -e ".[plotting]"   # matplotlib, seaborn
 ```
 
-`test` is enough to run the full test suite (`pytest`) and its Wigner-3j
+`test` is enough to run the test suite (`pytest`) and its Wigner-3j
 cross-checks (`sympy`); `dev` adds the formatting and linting tools used by
 the pre-commit hooks; `plotting` is only used by example scripts that
 produce figures.
@@ -54,10 +54,19 @@ produce figures.
 ## Running the tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q
+.venv/bin/python -m pytest tests/ -q                     # the fast suite (default)
+.venv/bin/python -m pytest tests/ -q -m slow             # only the slow tests
+.venv/bin/python -m pytest tests/ -q -m "slow or not slow"   # everything
 ```
+
+A plain `pytest` leaves out the tests marked `slow` (more than about 5 s each:
+the Monte Carlo comparisons and the largest identities); `pyproject.toml` sets `-m 'not slow'` by default, and an `-m`
+on the command line replaces it. A slow test named by its node id is
+deselected too, unless the command carries `-m "slow or not slow"`. CI runs
+the fast suite on every push and pull request, and the slow tests in a
+separate job after a merge to main (or on request).
 
 `tests/data/` holds golden fixtures tracked in git (a small nside-16 mask and
 the recorded end-to-end covariance and ACC coupling kernels it produces).
-`tests/test_coupling_kernels.py` needs `sympy` (the `dev` extra) and is
+`tests/mask/test_coupling_kernels.py` needs `sympy` (the `dev` extra) and is
 skipped otherwise.

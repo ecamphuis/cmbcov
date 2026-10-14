@@ -2,8 +2,9 @@
 """
 Command-line interface for covariance matrix computation.
 
-This script provides the main command-line interface for computing
-TTTEEE covariance matrices using the cmbcov package.
+Exposed as the ``compute-covariance`` and ``cmbcov-cov`` console scripts.
+Computes the covariance matrices described by a parameter file with
+:class:`~cmbcov.config.generator.CovarianceMatrixGenerator`.
 """
 
 import argparse
@@ -11,11 +12,29 @@ import os
 import sys
 from collections.abc import Sequence
 
-from ..generator.generator import CovarianceMatrixGenerator
+from ..config.generator import CovarianceMatrixGenerator
+from ..utils.logging_utils import configure_logging
+
+
+def _report_outcome(args: argparse.Namespace, generator) -> int:
+    """Print where the run put its results; returns the exit code 0."""
+    # Without --verbose the root logger sits at WARNING (configure_logging)
+    # and nothing else is printed, so always report the outcome.
+    if args.dryrun:
+        print("Dry run complete; no covariance computed.")
+        return 0
+
+    config = generator.config
+    save_dir = config.save_dir if config is not None else None
+    if args.save and save_dir:
+        print(f"Covariance written to {os.path.join(save_dir, config.cov_name)}")
+    else:
+        print("Run complete (results not saved).")
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Main function for command line interface."""
+    """Run the command line interface. Returns the exit code."""
 
     parser = argparse.ArgumentParser(
         description="Generate TTTEEE covariance matrices",
@@ -79,6 +98,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+    configure_logging(args.verbose)
 
     if (
         args.parameter_file_positional is not None
@@ -97,28 +117,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         parameter_file=parameter_file, verbose=args.verbose
     )
 
-    generator.run_full_analysis(
-        overwrite=args.overwrite,
-        save=args.save,
-        save_corrections=args.save_corrections,
-        save_windows=args.save_windows,
-        dryrun=args.dryrun,
-    )
+    analysis = {
+        "overwrite": args.overwrite,
+        "save": args.save,
+        "save_corrections": args.save_corrections,
+        "save_windows": args.save_windows,
+        "dryrun": args.dryrun,
+    }
 
-    # Without --verbose the library logger sits at WARNING and the command
-    # prints nothing at all, so a run that takes minutes gives no sign that it
-    # succeeded or where it put anything. Always report the outcome.
-    if args.dryrun:
-        print("Dry run complete; no covariance computed.")
-        return 0
-
-    config = generator.config
-    save_dir = config.save_dir if config is not None else None
-    if args.save and save_dir:
-        print(f"Covariance written to {os.path.join(save_dir, config.cov_name)}")
-    else:
-        print("Run complete (results not saved).")
-    return 0
+    generator.run_full_analysis(**analysis)
+    return _report_outcome(args, generator)
 
 
 if __name__ == "__main__":

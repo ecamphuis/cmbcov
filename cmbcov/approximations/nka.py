@@ -8,7 +8,7 @@ whenever the spectrum varies slowly compared with the width of the coupling.
 
 import numpy as np
 
-from ..keys import CovKey
+from ..assembly.keys import CovKey
 from .base import CovarianceStrategy
 
 __all__ = ["NKAStrategy"]
@@ -18,25 +18,22 @@ class NKAStrategy(CovarianceStrategy):
     """
     Narrow Kernel Approximation (NKA) strategy.
 
-    This strategy implements the simplest analytical covariance approximation
-    where coupling kernels are approximated as narrow (delta-function-like).
-    This assumes minimal coupling between different multipoles due to masking.
+    The coupling kernels are approximated by delta functions, which neglects
+    the coupling between different multipoles introduced by the mask.
     """
 
     def compute_covariance_term(
         self, cov_key: CovKey, cl: dict[str, dict[str, np.ndarray]]
     ) -> np.ndarray:
         """
-        Compute NKA covariance term using narrow kernel approximation.
+        Compute the NKA covariance term of ``cov_key``.
 
         Parameters
         ----------
         cov_key : CovKey
             Covariance key specifying which cross-spectra to compute
         cl : Dict[str, Dict[str, np.ndarray]]
-            Power spectra organized as cl[freq_combination][stokes_combination]
-        config : CovarianceConfig
-            Configuration parameters
+            Power spectra, ``cl[freq_combination][stokes_combination]``.
 
         Returns
         -------
@@ -75,13 +72,12 @@ class NKAStrategy(CovarianceStrategy):
         """
         ``self.cov.norm_Xi[left, right]``, with "BB" looked up as "EE".
 
-        ``Cov._compute_norm_xi`` stays the exact T/E alphabet
-        (``tests/test_norm_xi_channels.py`` pins it): the BB-only NKA/INKA
-        escape hatch (``generator.parameter_validation.APPROXIMATIONS_SUPPORTING_B``,
-        docs/theory/bmode_kernels.md) instead maps "BB" onto
-        "EE" here. The spin-weight rule gives ``BB`` the same weight as
-        ``EE`` (``w(BB) = 1``), so ``BB x BB`` is exactly the ``Xi^{EE->EE}``
-        channel, up to the E->B leakage this mode neglects throughout.
+        ``Cov._compute_norm_xi`` only has the T/E alphabet; the BB-only
+        NKA/INKA mode (see ``BB_ONLY_OBSERVABLES`` in
+        ``config.validation`` and docs/theory/bmode_kernels.md)
+        maps "BB" onto "EE" here. ``BB`` has the same spin-weight as ``EE``
+        (``w(BB) = 1``), so ``BB x BB`` is the ``Xi^{EE->EE}`` channel, up to
+        the E->B leakage this mode neglects.
         """
         norm_xi = self.cov.norm_Xi
         key = (
@@ -95,23 +91,24 @@ class NKAStrategy(CovarianceStrategy):
         power_spectrum: np.ndarray, stokes_key: str
     ) -> np.ndarray:
         """
-        Convert power spectrum to covariance format.
+        Convert a power spectrum to the 2-D array multiplying ``Xi``.
+
+        For TT, EE, BB this is ``sqrt(|C_l C_l'|)``; for TE, ET it is
+        ``(C_l + C_l') / 2``.
 
         Parameters
         ----------
         power_spectrum : np.ndarray
             Input power spectrum array
         stokes_key : str
-            Stokes parameter combination ("TT", "EE", "BB", "TE", or "ET").
-            "BB" only reaches here through the BB-only NKA/INKA escape
-            hatch (``generator.parameter_validation.APPROXIMATIONS_SUPPORTING_B``,
-            docs/theory/bmode_kernels.md): it is treated
-            exactly like "EE", leakage from C^EE neglected.
+            One of "TT", "EE", "BB", "TE", "ET". "BB" (BB-only NKA/INKA mode,
+            docs/theory/bmode_kernels.md) is treated like "EE", neglecting
+            the leakage from C^EE.
 
         Returns
         -------
         np.ndarray
-            Converted power spectrum in covariance format
+            Array of shape ``(n_ell, n_ell)``.
 
         Raises
         ------

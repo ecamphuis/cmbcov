@@ -22,7 +22,7 @@ for development.
 Discipline: only ``healpy`` I/O and nside/index arithmetic are used directly
 (``hp.read_map``); every spherical-harmonic transform goes through
 ``cmbcov.mask``/``grid``/``sht``, exactly as
-``tests/test_no_healpy_transforms.py`` requires of the package itself.
+``tests/harmonics/test_no_healpy_transforms.py`` requires of the package itself.
 """
 
 from __future__ import annotations
@@ -37,14 +37,14 @@ from collections.abc import Sequence
 import healpy as hp
 import numpy as np
 
-from cmbcov.grid import (
+from cmbcov.harmonics.grid import (
     gl_minimal_lmax,
     gl_quadrature_weights,
     gl_shape,
     gl_synthesis,
 )
+from cmbcov.harmonics.sht import almxfl
 from cmbcov.mask import MaskWlm, mask_spectral_moment
-from cmbcov.sht import almxfl
 
 # Measured on this machine: one m' column of the ACC
 # precompute at lmax=500, Lw=250 (GL grid band-limit 625, i.e. 626 rings)
@@ -200,7 +200,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # maxiter / epsilon. Before that helper existed it requested the bare
     # defaults, and the cache guard's maxiter/epsilon equality check made it
     # silently re-solve at lmax=2*nside whenever --maxiter != 20 -- discarding
-    # the solve this script just paid for. See tests/test_mask_alm_cache.py.
+    # the solve this script just paid for. See tests/mask/test_mask_alm_cache.py.
     mask_alm_ref = wlm.mask_alm
     print(
         f"Computing the exact mask and W^2 power spectra "

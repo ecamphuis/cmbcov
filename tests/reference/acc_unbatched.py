@@ -11,7 +11,7 @@ and ``wick_block`` its B-run path (``_compute_covariance_term_wick``), with
 
 import numpy as np
 
-from cmbcov.approximations.acc import (
+from cmbcov.approximations.acc.bands import (
     _ASSEMBLY_CHUNK_BYTES,
     _acc_band,
     _check_spectrum_length,
@@ -181,7 +181,7 @@ def te_block(strategy, cov_key, cl):
 
 def wick_block(strategy, cov_key, cl):
     """The per-Wick-term per-block assembly of a run with a B observable."""
-    from cmbcov.keys import _is_parity_odd_spec
+    from cmbcov.assembly.keys import _is_parity_odd_spec
 
     config = strategy.cov.config
     dmax = config.dmax

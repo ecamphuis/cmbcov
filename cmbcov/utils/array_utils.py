@@ -11,14 +11,14 @@ from typing import Any
 
 import numpy as np
 
-#: The first ``.fits`` spectrum read in this process, once it has been warned
-#: about (a run reads one file per frequency pair).
+#: Holds the first ``.fits`` spectrum path read in this process, so that the
+#: assumption warning is issued once (a run reads one file per frequency pair).
 _WARNED_FITS_READ: list = []
 
 #: Accepted values of the ``spectrum_units`` parameter-file key and of its
 #: per-input overrides: the convention a *tabulated* spectrum file is written
-#: in. ``"Cl"`` is :math:`C_\ell` itself (the package's internal convention,
-#: and the historical behaviour: no conversion); ``"Dl"`` is
+#: in. ``"Cl"`` is :math:`C_\ell` itself (the package's internal convention:
+#: no conversion); ``"Dl"`` is
 #: :math:`D_\ell = \ell(\ell+1)C_\ell/2\pi`, which is what CAMB's
 #: ``*_lensedCls.dat`` and most published spectra carry.
 SPECTRUM_UNITS = ("Cl", "Dl")
@@ -42,16 +42,13 @@ def dl_to_cl(values: np.ndarray) -> np.ndarray:
 
     Notes
     -----
-    ``ell = 0`` and ``ell = 1`` are set to **zero**, not left as they were and
-    not extrapolated: :math:`\\ell(\\ell+1)` vanishes at ``ell = 0`` and the
-    conversion is undefined there, while at ``ell = 1`` the monopole/dipole
-    convention of a :math:`D_\\ell` file is not fixed (CAMB files start at
-    ``ell = 2``, so both entries are padding). Neither multipole carries
-    signal in this package: the covariance is reported from ``lmin >= 2`` and
-    a non-zero ``C_0``/``C_1`` would only add mask-coupled leakage from modes
-    that do not exist. Note that the ``Cl`` convention leaves them untouched,
-    so the two conventions genuinely differ at ``ell < 2`` for a file whose
-    first two rows are not zero.
+    ``ell = 0`` and ``ell = 1`` are set to **zero**: :math:`\\ell(\\ell+1)`
+    vanishes at ``ell = 0``, and the monopole/dipole convention of a
+    :math:`D_\\ell` file is not fixed (CAMB files start at ``ell = 2``). Neither
+    multipole carries signal here, and a non-zero ``C_0``/``C_1`` would only
+    add mask-coupled leakage. The ``Cl`` convention leaves them untouched, so
+    the two conventions differ at ``ell < 2`` for a file whose first two rows
+    are not zero.
     """
     values = np.asarray(values, dtype=float)
     ell = np.arange(values.shape[0], dtype=float)
@@ -60,41 +57,43 @@ def dl_to_cl(values: np.ndarray) -> np.ndarray:
     if values.ndim == 1:
         output[2:] = 2.0 * np.pi * values[2:] / denominator
     else:
-        # `2 pi D_l / (l(l+1))` as written, one rounding: the equivalent
-        # `D_l * (2 pi / (l(l+1)))` differs from it by an ulp, which would
-        # make a converted D_l file and the same spectrum tabulated as C_l
-        # disagree in the last bit of the covariance.
+        # Evaluated as `2 pi D_l / (l(l+1))` (one rounding): the equivalent
+        # `D_l * (2 pi / (l(l+1)))` differs by an ulp.
         output[2:] = 2.0 * np.pi * values[2:] / denominator[:, np.newaxis]
     return output
 
 
 def read_spectrum_file(file_path: str, lmax: int) -> np.ndarray:
     """
-    Read a power spectrum from a file and ensure it has length lmax.
+    Read a power spectrum from a file, truncated to ``lmax`` multipoles.
+
+    ``.txt``/``.dat`` files have ell in the first column and one spectrum per
+    further column. ``.fits`` files are read with ``healpy.read_cl`` and must
+    start at ``ell = 0``.
 
     Parameters
     ----------
     file_path : str
         Path to the spectrum file
     lmax : int
-        Desired maximum multipole
+        Number of multipoles to return (ell = 0 .. lmax - 1)
 
     Returns
     -------
     np.ndarray
-        Spectrum array of shape (lmax, n_spectra)
+        Spectrum array of shape (lmax, n_spectra), ell down the rows
 
     Raises
     ------
+    TypeError
+        If ``file_path`` is not a string
     ValueError
-        If file format is unsupported or data is invalid
+        If ``lmax`` is not a positive integer, the file format is
+        unsupported, or the data is invalid or ends before ``lmax - 1``
     FileNotFoundError
         If the file does not exist
-
-    Notes
-    -----
-    The ``.npy`` branch is an intentional unimplemented stub: it always
-    raises ``NotImplementedError``.
+    NotImplementedError
+        For ``.npy`` files (not implemented)
     """
     import healpy as hp  # lazy, see utils/healpy_utils.py
 
@@ -148,7 +147,7 @@ def read_spectrum_file(file_path: str, lmax: int) -> np.ndarray:
         ells = spectrum[:, 0].astype(int)
         if np.any(np.diff(ells) != 1):
             raise ValueError("Spectrum file must have consecutive ell values")
-        if np.max(ells) < lmax - 1:  # Fixed off-by-one error
+        if np.max(ells) < lmax - 1:
             raise ValueError(
                 f"Spectrum file {file_path!r} must extend to at least lmax: it "
                 f"ends at ell = {int(np.max(ells))}, but {lmax} multipoles "
@@ -170,7 +169,7 @@ def safe_divide(
     numerator: np.ndarray, denominator: np.ndarray, default: float = 1.0
 ) -> np.ndarray:
     """
-    Safely divide arrays, handling division by zero and NaN values.
+    Divide arrays, replacing non-finite results (division by zero, NaN) by ``default``.
 
     Parameters
     ----------
@@ -220,11 +219,8 @@ def _operate_nested_dicts(
     missing : {"identity", "error"}, optional
         What to do with a key present on only one side. ``"identity"``
         carries the lone value through unchanged (the identity element for
-        the operation: 0 for add, 1 for mult -- the previous, only,
-        behaviour). ``"error"`` raises :class:`KeyError` naming the key path
-        and which side lacks it. Defaults to ``"error"`` so that a call
-        nobody thought the missing-key policy through for fails loudly
-        instead of silently combining mismatched dictionaries.
+        the operation: 0 for add, 1 for mult). ``"error"`` raises
+        :class:`KeyError` naming the key path and which side lacks it.
     _path : str, optional
         Key path accumulated by recursive calls, for error messages. Not for
         external callers.
@@ -316,11 +312,9 @@ def add_nested_dicts(
         Second dictionary to add
     missing : {"identity", "error"}, optional
         Policy for a key present on only one side: ``"identity"`` carries it
-        through unchanged (0 is the identity element for addition -- the
-        previous, only, behaviour); ``"error"`` (the default) raises
-        :class:`KeyError` naming the key path and which side lacks it, so
-        that a caller which has not thought about the missing-key case fails
-        loudly rather than silently combining mismatched dictionaries.
+        through unchanged (0 is the identity element for addition);
+        ``"error"`` (the default) raises :class:`KeyError` naming the key path
+        and which side lacks it.
 
     Returns
     -------
@@ -362,11 +356,9 @@ def mult_nested_dicts(
         Second dictionary to multiply
     missing : {"identity", "error"}, optional
         Policy for a key present on only one side: ``"identity"`` carries it
-        through unchanged (1 is the identity element for multiplication --
-        the previous, only, behaviour); ``"error"`` (the default) raises
-        :class:`KeyError` naming the key path and which side lacks it, so
-        that a caller which has not thought about the missing-key case fails
-        loudly rather than silently combining mismatched dictionaries.
+        through unchanged (1 is the identity element for multiplication);
+        ``"error"`` (the default) raises :class:`KeyError` naming the key path
+        and which side lacks it.
 
     Returns
     -------

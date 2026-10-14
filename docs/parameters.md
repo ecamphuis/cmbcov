@@ -1,7 +1,7 @@
 # Parameter-file reference
 
 The authoritative source of every key is
-[`cmbcov/generator/parameter_validation.py`](../cmbcov/generator/parameter_validation.py);
+[`cmbcov/config/validation.py`](../cmbcov/config/validation.py);
 [`examples/parameters_example.yml`](../examples/parameters_example.yml) is a
 runnable, commented template. This page groups the keys and states their
 type, default and constraints.
@@ -96,20 +96,45 @@ alone, with a warning.
 | `lx` | float | required | Cut $m_c = l_x \sin\theta$ of the azimuthal Fourier index. Must be `> 0`. |
 | `shape` | `sharp` \| `exp` | `sharp` | Filter profile around the cut. |
 | `power` | float | 6 | Steepness of the `exp` profile; must be `> 0`, unused by `sharp`. |
-| `nprobe` | int | 32 | Random probes per node of the stochastic sum-rule ratio; `>= 1`. The error falls as the inverse square root. |
+| `nprobe` | int | 32 | Random probes per node of the stochastic sum-rule ratio, at the nodes outside the near-cut range (below $0.95\thinspace l_x$ and from $2\thinspace l_x$ up); `>= 1`. The error falls as the inverse square root. |
 | `seed` | int | 0 | Seed of the probes. |
-| `node_min` | int | 32 | Lowest multipole of the nodes at which $\rho$ is probed (interpolated in between); `>= 2`. |
+| `node_min` | int | 32 | Lowest multipole of the geometric nodes at which $\rho$ is probed (interpolated in between); `>= 2`. |
 | `node_ratio` | float | 1.25 | Geometric spacing of the nodes; `> 1`. |
+| `near_cut_step` | number or null | null | Spacing of the extra nodes between $0.95\thinspace l_x$ and $2\thinspace l_x$ (rounded, at least 1); a geometric node closer than half a step to one of them is dropped. `null`: $l_x / 15$ (20 at $l_x = 300$). `0`: no extra nodes at all (the geometric list of v0.6.0), neither near the cut nor through the rolloff of a `lowpass`; with a `lowpass` whose rolloff starts below `lmax` ($0.6\thinspace l_x^{\mathrm{low}} < \ell_{\max}$) the run logs a warning, because that rolloff is then interpolated from the geometric nodes alone (up to about 4% off for `exp`, more for `sharp`, at toy scale). |
+| `nprobe_near_cut` | int or null | 128 | Probes of the nodes from $0.95\thinspace l_x$ to below $2\thinspace l_x$, `>= 1`. `null`: the complete basis of each node's degree ($2\ell' + 1$ probes), which makes the ratio exact there. It is expensive at survey scale: with $l_x = 300$, mask band-limit 875 and 8 threads, about 2.6 hours for the three white channels and 1.3 hours for spectrum-aware TT; `128` took about 24 and 13 minutes and changed the binned variances by at most 0.4% in a survey-like test. |
+| `lowpass` | mapping or null | null | A scan-direction low-pass multiplying the high-pass, $h = h_{\mathrm{high}}\thinspace h_{\mathrm{low}}$, for a map whose time stream is band-limited (SPT-3G: cut 300, low-pass 6144). Absent or `null`: no low-pass, and the results and cache keys are exactly those of a file without the key. Keys below; see [`theory/filter_and_bin.md`](theory/filter_and_bin.md), "The low-pass". `fl` must include the low-pass, as it must include the high-pass; nothing checks it. |
+| `lowpass.lx` | float | required | Cut $m_c = l_x \sin\theta$ of the low-pass, the same convention as the high-pass `lx`. Finite, `> 0`, and above the high-pass `lx`. |
+| `lowpass.shape` | `exp` \| `sharp` | `exp` | `exp`: $h_{\mathrm{low}} = \exp[-(\lvert M \rvert / (l_x \sin\theta))^p]$; `sharp`: 1 where $\lvert M \rvert \le l_x \sin\theta$, else 0. The ratio of the `sharp` shape has off-diagonal structure at its kink that the (mean, distance) interpolation cannot carry: blocks within a few multipoles of `lx` are about 3-4% off even with the fine nodes, and the run logs a warning when `lx <= lmax`. The `exp` shape has no such limit. |
+| `lowpass.power` | float | 6 | Exponent $p$ of the `exp` shape; finite, `> 0`; unused by `sharp`. |
 | `dmax` | int or null | null | Largest $\lvert \ell_1 - \ell_2 \rvert$ probed, `>= 0`. `null`: the run's ACC `dmax - 1` with ACC, 64 otherwise, capped at `lmax - 1`. |
 | `lw` | int or null | null | Mask band-limit of the probes. `null`: `min(3 * nside - 1, 2 * lmax)`. |
+| `spectrum_aware` | bool | false | Probe every TT x TT block with the run's own spectra instead of the white `00` channel: the block is multiplied by its own ratio of filtered to unfiltered covariance, with no `fl` division. Needed for a sharp cut, which scatters low $\ell$ TT power to high $\ell$ (TT variance 5.5% low at $\ell$ = 2000-3500 otherwise). The other T/E blocks are unchanged. The ratio depends on the spectra: changing them probes again. |
+
+Near the cut the nodes also carry the probes to a higher internal
+band-limit (at least $3.5\thinspace l_x$ for the nodes from
+$0.95\thinspace l_x$ to below $1.3\thinspace l_x$; not a parameter). The
+three near-cut settings are explained in
+[`theory/filter_and_bin.md`](theory/filter_and_bin.md), Sect. 2, "Near the
+cut". With
+`map_filter` the run logs a warning naming the bins whose lowest `fl`
+(any T/E spectrum, any frequency pair) is below 0.3, and a stronger one for
+those below 0.1: cut those.
 
 The probed ratios are cached in the kernel directory (`cov_path`), keyed on
-the mask, the channels and every key above, so a rerun with the same filter
-and blocks does not probe again; they are also saved as
-`map_filter_ratio.npz` (`nodes`, `channels` and one `g_<channel>` per
-channel) beside the covariance. A saved parameter file that differs in `map_filter` (or has it
+the mask, the channels, the nodes with their probe counts and band-limit
+floors, and every key above (the `lowpass` entry only when there is one, so
+the caches of files without it stay valid), so a rerun with the same filter
+and blocks does not probe again; with `spectrum_aware` the TT x TT ratios
+are keyed on the blocks' Wick terms and a digest of the spectra as well, so
+a change of `cmb_spectrum`, `foregrounds`, `nl`, `beams`, `pixwin` or `fl`
+probes them again (the white channels are not affected). They are also
+saved as `map_filter_ratio.npz` (`nodes`, `nprobe` and `lmax_int_floor`
+per node, `channels` and one `g_<channel>` per channel; with `spectrum_aware` also
+`spectrum_aware_blocks`, the TT x TT block names, and one `g_block_<i>`
+per block in that order) beside the covariance. A saved parameter file that differs in `map_filter` (or has it
 where the new one has none) makes `--overwrite` refuse, like any other
 change that alters the numbers.
+
 
 ## Data-model inputs
 

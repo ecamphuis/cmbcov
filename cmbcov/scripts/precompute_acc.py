@@ -20,7 +20,7 @@ backend settings come from its ``acc_precompute`` block::
       scratch_dir: /fast/scratch  # optional, default the kernel directory
 
 The kernels are written to ``<cov_path>/covariance_coupling/``
-(:attr:`~cmbcov.generator.parameter_validation.PipelineConfig.acc_kernel_dir`).
+(:attr:`~cmbcov.config.validation.PipelineConfig.acc_kernel_dir`).
 """
 
 from __future__ import annotations
@@ -30,7 +30,8 @@ import sys
 import time
 from collections.abc import Sequence
 
-from ..generator.generator import CovarianceMatrixGenerator
+from ..config.generator import CovarianceMatrixGenerator
+from ..utils.logging_utils import configure_logging
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -38,7 +39,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Precompute the ACC coupling kernels for a covariance parameter "
-            "file (once per mask), for later compute-covariance runs of the "
+            "file (once per mask), for later cmbcov-cov runs of the "
             "same file."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -65,6 +66,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Validate the file and print the plan without computing",
     )
     args = parser.parse_args(argv)
+    configure_logging(args.verbose)
 
     if (
         args.parameter_file is not None

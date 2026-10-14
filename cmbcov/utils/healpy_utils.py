@@ -6,17 +6,13 @@ spherical harmonic operations commonly used in CMB analysis.
 
 healpy is imported lazily across the package
 ---------------------------------------------
-``import healpy`` executes ``healpy/__init__``, which imports
-``healpy.visufunc`` (matplotlib) and ``healpy.rotator``
-(``astropy.coordinates``): 0.24 s of the 0.27 s ``import
-cmbcov`` took (``python -X importtime``). The
-package uses healpy only for FITS I/O (``read_map``, ``write_cl``,
-``read_cl``), the pixel window, ``gauss_beam``, pixel-count checks and the
-``Alm`` index helpers. So no module imports it at top level. Each
-function that needs it does ``import healpy as hp`` in its own body (a
-``sys.modules`` lookup after the first call). A process that never reaches
-one of those functions never loads healpy, matplotlib or
-``astropy.coordinates``. ``tests/test_no_healpy_transforms.py`` pins this.
+``import healpy`` pulls in matplotlib (``healpy.visufunc``) and
+``astropy.coordinates`` (``healpy.rotator``), which dominates the import time
+of ``cmbcov``. The package uses healpy only for FITS I/O (``read_map``,
+``write_cl``, ``read_cl``), the pixel window, ``gauss_beam``, pixel-count
+checks and the ``Alm`` index helpers, so no module imports it at top level.
+Each function that needs it does ``import healpy as hp`` in its own body.
+A process that never reaches one of those functions never loads healpy.
 """
 
 import numpy as np

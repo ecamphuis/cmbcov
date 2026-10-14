@@ -1,14 +1,10 @@
 """
 Command-line validation of a covariance parameter file.
 
-Exposed as the ``validate-parameters`` console script. ``pyproject.toml``
-declared this entry point but the module did not exist, so installing the
-package produced a command that failed immediately on import.
-
-Validating separately from computing is worth doing: a covariance run reads
-large masks and computes coupling kernels before it ever touches most
-parameters, so a typo in a frequency label or a missing beam file would
-otherwise surface many minutes in.
+Exposed as the ``validate-parameters`` console script. Validating separately
+from computing is worthwhile: a covariance run reads large masks and computes
+coupling kernels before it touches most parameters, so a typo in a frequency
+label or a missing beam file would otherwise surface many minutes in.
 """
 
 from __future__ import annotations
@@ -19,7 +15,8 @@ from collections.abc import Sequence
 
 import yaml
 
-from ..generator.parameter_validation import ParameterValidator
+from ..config.validation import ParameterValidator
+from ..utils.logging_utils import configure_logging
 
 
 def _load(path: str) -> dict:
@@ -29,7 +26,7 @@ def _load(path: str) -> dict:
     except FileNotFoundError:
         raise SystemExit(f"error: parameter file not found: {path}") from None
     except yaml.YAMLError as exc:
-        # Keep the mark: it names the line and column of the problem.
+        # The message includes the line and column of the problem.
         raise SystemExit(f"error: could not parse {path}: {exc}") from None
 
 
@@ -40,10 +37,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
+        "parameter_file",
+        nargs="?",
+        default=None,
+        help="Path to the YAML parameter file (same as --parameter-file)",
+    )
+    parser.add_argument(
         "--parameter-file",
         "-p",
-        default="parameters.yml",
-        help="Path to the YAML parameter file",
+        dest="parameter_file_option",
+        default=None,
+        help="Path to the YAML parameter file (default: parameters.yml)",
     )
     parser.add_argument(
         "--strict",
@@ -51,6 +55,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Treat warnings as failures",
     )
     args = parser.parse_args(argv)
+    configure_logging(verbose=False)
+    if (
+        args.parameter_file is not None
+        and args.parameter_file_option is not None
+        and args.parameter_file != args.parameter_file_option
+    ):
+        parser.error("give the parameter file once, positionally or with -p")
+    args.parameter_file = (
+        args.parameter_file or args.parameter_file_option or "parameters.yml"
+    )
 
     params = _load(args.parameter_file)
     validator = ParameterValidator()

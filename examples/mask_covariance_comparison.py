@@ -57,12 +57,12 @@ from cmbcov.approximations.acc import (
     coupling_ellprange,
     precompute_acc_kernels,
 )
-from cmbcov.binning import BinningManager
-from cmbcov.covariance import Cov, CovarianceConfig, CovarianceMethod
+from cmbcov.assembly.binning import BinningManager
+from cmbcov.assembly.covariance import Cov, CovarianceConfig, CovarianceMethod
+from cmbcov.assembly.keys import CovKey, CovKeys
 from cmbcov.exact import exact_covariance_row
-from cmbcov.grid import gl_minimal_lmax
-from cmbcov.keys import CovKey, CovKeys
-from cmbcov.sht import ducc0_map2alm
+from cmbcov.harmonics.grid import gl_minimal_lmax
+from cmbcov.harmonics.sht import ducc0_map2alm
 from cmbcov.utils.file_utils import get_git_revision_short_hash
 
 #: Single frequency label used throughout; the CovKeys/Cov machinery is
@@ -277,7 +277,7 @@ def compute_exact_covariance(
 
     # Band-limited mask alm, built once and reused for every row: passing it
     # (rather than the pixel map) to exact_covariance_row avoids repeating the
-    # iter=10 map2alm that builds it (module docstring of exact.py).
+    # iter=10 map2alm that builds it (module docstring of exact/__init__.py).
     mask_alm = ducc0_map2alm(
         np.asarray(mask_map, dtype=float), lmax=lw, pol=False, iter=10
     )

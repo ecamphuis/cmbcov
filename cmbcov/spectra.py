@@ -10,9 +10,8 @@ spectra, and the post-processing corrections -- and then assembles the
 
 together with the inverse factors used to debias the covariance afterwards.
 
-This is deliberately separate from the workflow that drives it: everything
-here is a function of the parameter file and the frequency/Stokes layout, and
-nothing here knows about output directories, versioning or the covariance
+Everything here is a function of the parameter file and the frequency/Stokes
+layout; nothing knows about output directories, versioning or the covariance
 object.
 """
 
@@ -33,7 +32,7 @@ from .utils import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
-    from .generator.parameter_validation import PipelineConfig
+    from .config.validation import PipelineConfig
 
 __all__ = ["SpectraLoader", "detect_parity_odd_nonzero", "stokes_columns"]
 
@@ -43,17 +42,16 @@ __all__ = ["SpectraLoader", "detect_parity_odd_nonzero", "stokes_columns"]
 #: same spectra as ``TE``/``TB``/``EB`` with the two fields swapped, so they
 #: are taken from those columns (``C_l^{ET} = C_l^{TE}``, exact for any
 #: statistically isotropic sky). A 9-column file gives them explicitly and
-#: they are read as they are, so a file that distinguishes them is honoured.
+#: they are read as given.
 SPECTRUM_FILE_LAYOUTS = {
     1: ("TT",),
     4: ("TT", "EE", "BB", "TE"),
     9: ("TT", "EE", "BB", "TE", "TB", "EB", "ET", "BT", "BE"),
 }
 
-#: Parity-odd spectra: absent from a file (a 1- or 4-column layout, or a
-#: 9-column one written without them), they default to zero rather than
-#: raising -- the usual EB null-test convention -- unlike every other
-#: spectrum :func:`stokes_columns` reads.
+#: Parity-odd spectra. When absent from a file they default to zero (with a
+#: warning) rather than raising, as is usual for an EB null test; any other
+#: missing spectrum is an error (:func:`stokes_columns`).
 _PARITY_ODD_KEYS = ("TB", "BT", "EB", "BE")
 
 
@@ -62,18 +60,16 @@ def _read_full_spectrum_columns(file_path: str) -> np.ndarray | None:
     Every row of a spectrum file's columns (no leading ``ell`` column, no
     ``lmax`` truncation or padding), for :func:`detect_parity_odd_nonzero`.
 
-    Deliberately independent of :func:`~cmbcov.utils.array_utils.read_spectrum_file`,
-    which requires the file to reach a given ``lmax`` and returns exactly
-    ``lmax`` rows -- checking C^TB/C^EB for zero needs the opposite: every
-    row the file has, however many that is, with no length requirement.
+    Independent of :func:`~cmbcov.utils.array_utils.read_spectrum_file`, which
+    requires the file to reach a given ``lmax`` and returns exactly ``lmax``
+    rows; the zero check needs every row the file has.
 
     Returns
     -------
     ndarray or None
         ``(nrows, nspec)``, or ``None`` if the file does not exist or is not
-        one of the supported formats (``.txt``, ``.dat``, ``.fits``); the
-        caller then has nothing to check, not an error to raise (the real
-        reader, used elsewhere, is what validates the file).
+        a supported format (``.txt``, ``.dat``, ``.fits``). Validation is left
+        to the real reader.
     """
     if not os.path.exists(file_path):
         return None
@@ -114,13 +110,11 @@ def _value_has_nonzero_parity_odd(value: Any, freq_key: str | None) -> bool:
     One ``cmb_spectrum``/``foregrounds``-shaped parameter value: whether it
     supplies a non-zero TB or EB anywhere.
 
-    A constant (``cmb_spectrum`` only) applies to every requested Stokes
-    key alike, including TB/EB if they are requested, so a non-zero
-    constant counts; a per-Stokes-key dict with no ``TB``/``EB`` entry is
-    zero by construction, matching :meth:`SpectraLoader._load_cmb_spectrum`.
-    A file path is read with ``freq_key`` substituted in if given
-    (``foregrounds`` is one file per frequency pair; ``cmb_spectrum`` is
-    read once, ``freq_key=None``).
+    A constant (``cmb_spectrum`` only) applies to every requested Stokes key,
+    so a non-zero constant counts; a per-Stokes-key dict with no ``TB``/``EB``
+    entry is zero, as in :meth:`SpectraLoader._load_cmb_spectrum`. A file path
+    is read with ``freq_key`` substituted in if given (``foregrounds`` is one
+    file per frequency pair; ``cmb_spectrum`` is read once, ``freq_key=None``).
     """
     if value is None:
         return False
@@ -141,16 +135,13 @@ def detect_parity_odd_nonzero(
 ) -> bool:
     """
     Whether ``C^TB`` or ``C^EB`` is non-zero anywhere in ``cmb_spectrum`` or
-    ``foregrounds``, over every row present in the file(s) actually used --
-    not merely up to ``lmax``: a non-zero value past ``lmax`` only costs extra
-    ACC kernel pairs, so being conservative over the whole file is fine, and
-    an EB null test (TB/EB requested but zero or absent) must get the
-    smaller, 25-pair kernel set, not 45.
+    ``foregrounds``, over every row of the file(s) used, not just up to
+    ``lmax``. This is conservative (a non-zero value past ``lmax`` only costs
+    extra ACC kernel pairs), and an EB null test (TB/EB requested but zero or
+    absent) gets the smaller 25-pair kernel set, not 45.
 
-    Needs no ``lmax`` and therefore no ACC kernel cache -- unlike
-    :attr:`SpectraLoader.spectra_lmax` -- which is what lets both the ACC
-    precompute (before any cache exists) and :attr:`SpectraLoader.parity_odd_nonzero`
-    share this one function, so the two decisions cannot disagree.
+    Needs no ``lmax`` and hence no ACC kernel cache, so the ACC precompute and
+    :attr:`SpectraLoader.parity_odd_nonzero` share this one decision.
 
     Parameters
     ----------
@@ -162,7 +153,7 @@ def detect_parity_odd_nonzero(
         frequency pairs, or ``None``).
     combined_frequencies : sequence of str
         Frequency-pair keys ``foregrounds`` is checked at, e.g. from
-        :meth:`~cmbcov.keys.CovKeys.combined_frequencies`.
+        :meth:`~cmbcov.assembly.keys.CovKeys.combined_frequencies`.
     """
     if _value_has_nonzero_parity_odd(cmb_spectrum, None):
         return True
@@ -331,12 +322,12 @@ class SpectraLoader:
         return self._spectra_lmax
 
     def _resolve_spectra_lmax(self) -> int:
-        from .approximations.acc import (
+        from .approximations.acc.bands import (
             acc_cached_kernel_size,
             acc_internal_lmax,
             require_acc_cache_pairs,
         )
-        from .covariance import CovarianceMethod
+        from .assembly.covariance import CovarianceMethod
 
         config = self.config
         if config.method != CovarianceMethod.ACC:
@@ -344,12 +335,9 @@ class SpectraLoader:
 
         if any("B" in obs for obs in config.observables):
             # A B observable: derive the needed pairs from the observables
-            # list, not the plain T/E channel square, and -- unlike the
-            # plain path below -- fail loudly (require_acc_cache_pairs,
-            # naming every missing pair) if the on-disk cache does
-            # not cover them, rather than silently reporting whatever size
-            # the pairs it does have imply.
-            from .bmode_wick import required_kernel_pairs
+            # list, and fail loudly (require_acc_cache_pairs names every
+            # missing pair) if the cache does not cover them.
+            from .approximations.acc.bmode_wick import required_kernel_pairs
 
             pairs = sorted(
                 required_kernel_pairs(
@@ -362,7 +350,7 @@ class SpectraLoader:
                 config.acc_kernel_dir, config.centralell, config.dmax, pairs
             )
         else:
-            from .generator.parameter_validation import acc_kernel_spectra_needed
+            from .config.validation import acc_kernel_spectra_needed
 
             needed = acc_kernel_spectra_needed(config.stokes)
             pairs = [(a, b) for a in needed for b in needed]
@@ -375,7 +363,7 @@ class SpectraLoader:
                 "No ACC coupling kernel found under "
                 f"{config.acc_kernel_dir!r}/covariance_coupling for (centralell, "
                 f"centralell + d) = ({config.centralell}, {config.centralell}+d), "
-                f"d < {config.dmax}. Run `precompute-acc` on this parameter file "
+                f"d < {config.dmax}. Run `cmbcov-precompute` on this parameter file "
                 "first: the spectra are loaded to lmax + max(0, S - 1 - "
                 "centralell), which depends on the kernel size S."
             )
@@ -385,11 +373,10 @@ class SpectraLoader:
         """
         ``"Cl"`` or ``"Dl"`` for one of the three spectrum inputs
         (``cmb_spectrum``, ``foregrounds``, ``nl``), from
-        :meth:`~cmbcov.generator.parameter_validation.PipelineConfig.spectrum_units_of`.
+        :meth:`~cmbcov.config.validation.PipelineConfig.spectrum_units_of`.
 
-        A configuration object that predates the key (any object duck-typing
-        as a ``PipelineConfig``) has no such method; it then means ``"Cl"``,
-        which is what the package did before the key existed.
+        A configuration object without that method (e.g. a duck-typed
+        ``PipelineConfig``) means ``"Cl"``.
         """
         resolve = getattr(self.config, "spectrum_units_of", None)
         if resolve is None:
@@ -414,14 +401,12 @@ class SpectraLoader:
             The convention the file's columns are written in, for a file
             that holds power spectra. ``"Dl"`` converts every column with
             :func:`~cmbcov.utils.array_utils.dl_to_cl`
-            *here*, before anything else sees the array, so the rest of the
-            package only ever handles ``C_l``. ``None`` (the default) marks a
-            **dimensionless** input -- beams, the pixel window, transfer
-            functions, post-processing corrections -- which carries no units
-            key and is never scaled; ``"Cl"`` is a spectrum that needs no
-            conversion. ``None`` and ``"Cl"`` do exactly the same thing to
-            the array; they are distinguished so that every call site says
-            which kind of input it is reading.
+            *here*, so the rest of the package only handles ``C_l``. ``None``
+            (the default) marks a **dimensionless** input (beams, pixel
+            window, transfer functions, post-processing corrections), which is
+            never scaled; ``"Cl"`` is a spectrum that needs no conversion.
+            ``None`` and ``"Cl"`` treat the array identically; they differ
+            only in documenting the kind of input.
         """
         lmax = self.spectra_lmax if lmax is None else lmax
         try:
@@ -532,13 +517,11 @@ class SpectraLoader:
         }
 
     def _load_fl(self) -> None:
-        """Load transfer functions (fl and hl)."""
+        """Load the transfer function ``fl``."""
         self.logger.info("Loading transfer functions...")
 
-        # units=None: fl (and hl, which nothing reads yet) is a transfer
-        # function -- the dimensionless fraction of the signal the pipeline
-        # keeps, in [0, 1] -- not a power spectrum. The spectrum_units key
-        # does not apply to it and must never scale it.
+        # units=None: fl is a dimensionless transfer function, not a power
+        # spectrum, so the spectrum_units key never scales it.
         self.fl_dict = self._load_multiple(
             self.config.fl, "fl", self.spectra_lmax, default=1.0, units=None
         )
@@ -550,25 +533,20 @@ class SpectraLoader:
         fl_dict: dict[str, dict[str, np.ndarray]], template: str
     ) -> None:
         """
-        Refuse a transfer function outside ``[0, 1]``.
+        Refuse a transfer function outside ``[0, 1]`` or not finite.
 
-        ``fl`` is the fraction of the signal the pipeline keeps, so it lies in
-        ``[0, 1]``, and both of its uses break silently outside that range:
-        the covariance is computed for spectra multiplied by
-        ``data_model = B B pixwin fl`` and divided back by it afterwards, so
-        ``fl <= 0`` makes that division infinite (and ``safe_divide`` then
-        substitutes 1, i.e. no debiasing at all); and the transfer-function
-        uncertainty ``1 + sqrt((1 - fl) / 3999)`` is NaN for ``fl > 1``, which
-        the final ``nan_to_num`` turns into 1, i.e. silently no uncertainty.
-        Both are exactly the silent substitutions this package raises on
-        instead. No tolerance is applied: 0 and 1 themselves are fine, and
-        anything beyond them has one of the two effects above.
+        ``fl`` is the fraction of the signal the pipeline keeps. Outside
+        ``[0, 1]`` both of its uses degrade silently: the debiasing divides by
+        ``data_model = B B pixwin fl``, so ``fl <= 0`` makes the division
+        infinite (``safe_divide`` then substitutes 1, i.e. no debiasing); and
+        the uncertainty factor ``1 + sqrt((1 - fl) / 3999)`` is NaN for
+        ``fl > 1`` (the final ``nan_to_num`` turns it into 1). No tolerance is
+        applied: 0 and 1 themselves are accepted.
         """
         for key_freq, spectra in fl_dict.items():
             for key_pol, values in spectra.items():
-                # ``~isfinite``: a NaN (a 0/0 at l = 0, 1 of a simulated
-                # ratio, say) compares False on both sides and would pass,
-                # then spread through every EE/TE element of the covariance.
+                # ``~isfinite``: a NaN compares False on both sides and would
+                # otherwise pass.
                 bad = np.flatnonzero(
                     (values < 0.0) | (values > 1.0) | ~np.isfinite(values)
                 )
@@ -608,22 +586,22 @@ class SpectraLoader:
         self, lmax: int, stokes_keys: list[str] | None = None
     ) -> dict[str, np.ndarray]:
         """
-        Load CMB power spectrum.
+        Load the CMB power spectrum.
 
         A tabulated file is read in the units
         ``config.spectrum_units_of("cmb_spectrum")`` gives and converted to
-        ``C_l`` here. A *constant* spectrum (a float, or a dict of per-Stokes
-        floats) is a ``C_l`` by construction -- there is no multipole to
-        divide by -- so asking for ``Dl`` with one raises rather than being
-        quietly ignored.
+        ``C_l``. A *constant* spectrum (a float, or a dict of per-Stokes
+        floats) is a ``C_l`` by construction, so asking for ``Dl`` with one
+        raises.
 
         Parameters
         ----------
+        lmax : int
+            Number of multipoles.
         stokes_keys : list of str, optional
             Which Stokes keys to return, default :attr:`combined_stokes`.
-            :meth:`read_extra_stokes_spectrum` passes a key outside
-            ``combined_stokes`` -- e.g. ``EE`` for a BB-only run's leakage
-            warning -- through this.
+            :meth:`read_extra_stokes_spectrum` uses it for a key outside
+            ``combined_stokes``.
         """
         stokes_keys = self.combined_stokes if stokes_keys is None else stokes_keys
         cl_param = self.config.cmb_spectrum
@@ -674,13 +652,9 @@ class SpectraLoader:
 
         Used by the BB-only NKA/INKA leakage warning
         (``generator.generator.CovarianceMatrixGenerator.compute_covariance_matrix``,
-        docs/theory/bmode_kernels.md) to read ``C^EE`` for a
-        run whose ``combined_stokes`` is ``["BB"]`` alone: the same
-        ``cmb_spectrum`` source the run already has, just a column
-        :meth:`_load_cmb_spectrum` does not otherwise pick. Not cached and
-        not part of :attr:`cl_dict`: this is a diagnostic read for a
-        warning, not a covariance input -- the covariance itself never sees
-        this spectrum.
+        docs/theory/bmode_kernels.md) to read ``C^EE`` for a run whose
+        ``combined_stokes`` is ``["BB"]`` alone. Not cached and not part of
+        :attr:`cl_dict`: it is a diagnostic read, not a covariance input.
 
         Parameters
         ----------
@@ -766,22 +740,19 @@ class SpectraLoader:
                         cmb_spectrum[key_pol[::-1]] + fg[key_freq][key_pol[::-1]]
                     )
 
-                # Apply units and correction
                 self.cl_dict[key_freq][key_pol] = np.nan_to_num(
                     signal_spectrum, nan=0.0, posinf=0.0, neginf=0.0
                 )
 
     #: Accepted spellings of the noise parameter, in order of precedence.
-    #: ``nl`` is the documented name; ``noise`` is kept for backward compatibility.
+    #: ``nl`` is the documented name; ``noise`` is accepted as an alias.
     NOISE_PARAM_ALIASES = ("nl", "noise")
 
     def _resolve_noise_param(self) -> tuple[str | None, object]:
         """
         Find which noise parameter the user actually supplied.
 
-        Both ``nl`` and ``noise`` are accepted as aliases for the same
-        parameter, so a user-specified noise level is never silently
-        discarded regardless of which spelling the parameter file uses.
+        ``nl`` and ``noise`` are aliases for the same parameter.
 
         Returns
         -------
@@ -791,8 +762,8 @@ class SpectraLoader:
         """
         for name in self.NOISE_PARAM_ALIASES:
             value = getattr(self.config, name, None)
-            # An empty dict/string is treated as "not supplied" so that the
-            # default value from OPTIONAL_PARAMS does not masquerade as input.
+            # An empty dict/string counts as not supplied (the default from
+            # OPTIONAL_PARAMS).
             if value is None or (isinstance(value, (dict, str)) and len(value) == 0):
                 continue
             return name, value
@@ -823,9 +794,9 @@ class SpectraLoader:
                 rest = pair[len(f1) :]
                 if rest in freqs:
                     return f1, rest
-        # Fall back to the historical halving rule so an unexpected key still
-        # produces something rather than raising here; the caller only uses
-        # the result to look levels up, and an unknown name yields zero.
+        # Fall back to halving the string so an unexpected key still yields
+        # something; the caller only uses the result to look levels up, and
+        # an unknown name yields zero.
         half = len(pair) // 2
         return pair[:half], pair[half:]
 
@@ -892,9 +863,8 @@ class SpectraLoader:
         expected = set(freqs)
         pair_spellings = {f1 + f2 for f1 in freqs for f2 in freqs}
 
-        # dict.get(key, 0.0) silently yields zero noise for any key that does
-        # not match the expected spelling, which is how a typo turns into a
-        # signal-only covariance with no diagnostic. Check the keys first.
+        # Check the keys first: a mistyped key would otherwise give zero
+        # noise silently.
         for key in noise:
             if key in expected:
                 continue
@@ -955,11 +925,11 @@ class SpectraLoader:
         Load noise spectra.
 
         ``nl`` is the noise power spectrum of the map **as delivered to the
-        estimator**: it carries no beam, no pixel window and no transfer
-        function, and it is never multiplied by the data model. This is the
-        MASTER convention (Hivon et al. 2002, astro-ph/0105302, Eqs. (15)-(16));
-        the debiasing divides each leg by ``B1 B2 pix fl``, so the noise
-        enters the reported error bars as ``N_l / B_l^2``.
+        estimator**: it carries no beam, pixel window or transfer function and
+        is never multiplied by the data model (MASTER convention, Hivon et al.
+        2002, astro-ph/0105302, Eqs. (15)-(16)). The debiasing divides each leg
+        by ``B1 B2 pix fl``, so the noise enters the error bars as
+        ``N_l / B_l^2``.
 
         Three input forms are accepted:
 
@@ -975,12 +945,11 @@ class SpectraLoader:
            in the units ``config.spectrum_units_of("nl")`` gives.
 
         In forms 1 and 2 every cross-Stokes spectrum (TE/ET, TB/BT, EB/BE) is
-        zero -- map noise is uncorrelated between Stokes parameters -- and the
-        dict keys are **single frequencies**, not frequency pairs: an auto pair
-        ``f+f`` takes that frequency's level and a cross pair ``f1+f2`` is
-        noiseless, since map noise is uncorrelated between bands. Levels are a
-        flat ``C_l`` by construction, so ``nl_units: Dl`` with a dict raises
-        instead of being ignored.
+        zero, the dict keys are **single frequencies** (not frequency pairs),
+        an auto pair ``f+f`` takes that frequency's level, and a cross pair
+        ``f1+f2`` is noiseless (map noise is uncorrelated between bands and
+        between Stokes parameters). Levels are a flat ``C_l``, so
+        ``nl_units: Dl`` with a dict raises.
         """
         self.logger.info("Loading noise spectra...")
 
@@ -996,8 +965,7 @@ class SpectraLoader:
             )
 
         if noise is None:
-            # Loud, not silent: a noiseless covariance underestimates the
-            # error bars.
+            # A noiseless covariance underestimates the error bars.
             warnings.warn(
                 "No noise power spectrum supplied (looked for "
                 f"{' and '.join(self.NOISE_PARAM_ALIASES)}); the covariance will "
@@ -1029,10 +997,8 @@ class SpectraLoader:
                     noise[key_pol], nan=0.0, posinf=0.0, neginf=0.0
                 )
             # Only where ET is one of this run's spectra: prepare_workflow
-            # multiplies nl_dict by a data model built over exactly
-            # combined_stokes and refuses any extra key, so an unconditional
-            # alias broke every single-frequency run with white-noise `nl`
-            # (combined_stokes has TE but no ET there).
+            # combines nl_dict with a data model built over exactly
+            # combined_stokes and refuses any extra key.
             if (
                 ("TE" in noise)
                 and ("ET" not in noise)
@@ -1045,20 +1011,17 @@ class SpectraLoader:
     @property
     def parity_odd_nonzero(self) -> bool:
         """
-        Whether ``C^TB`` or ``C^EB`` is non-zero anywhere it was requested:
-        the usual EB null test has both exactly zero, which is the smaller
-        (25-pair) ACC kernel set; any non-zero value needs the larger
-        (45-pair) one (:func:`~cmbcov.bmode_wick.required_kernel_pairs`).
-        False (not an error) if TB/EB were not requested at all
-        (``"TB"``/``"EB"`` absent from :attr:`combined_stokes`) -- they are
-        then not even read (:func:`stokes_columns`), so there is nothing to
-        check.
+        Whether ``C^TB`` or ``C^EB`` is non-zero anywhere it was requested.
 
-        Delegates to :func:`detect_parity_odd_nonzero`, over the raw
-        ``cmb_spectrum``/``foregrounds`` inputs -- not :attr:`cl_dict`, which
-        is truncated to ``spectra_lmax`` -- so this needs no ``spectra_lmax``
-        (hence no ACC kernel cache) and gives the same answer the ACC
-        precompute's own check does, before either loads any spectra.
+        The usual EB null test has both exactly zero, which needs the smaller
+        (25-pair) ACC kernel set; any non-zero value needs the larger
+        (45-pair) one (:func:`~cmbcov.approximations.acc.bmode_wick.required_kernel_pairs`).
+        False if neither ``"TB"`` nor ``"EB"`` is in :attr:`combined_stokes`.
+
+        Delegates to :func:`detect_parity_odd_nonzero` on the raw
+        ``cmb_spectrum``/``foregrounds`` inputs rather than :attr:`cl_dict`
+        (which is truncated to ``spectra_lmax``), so it needs no ACC kernel
+        cache and agrees with the ACC precompute's own check.
         """
         if "TB" not in self.combined_stokes and "EB" not in self.combined_stokes:
             return False
@@ -1075,8 +1038,7 @@ class SpectraLoader:
         self._load_noise_spectra()
 
     def load_post_process(self) -> None:
-        """Load post-processing correction factors.
-        All post-processing corrections are in form of mutiple factors (Hl, inpainting, etc.)
+        """Load post-processing correction factors (``H_l``, inpainting, etc.).
 
         These are dimensionless multiplicative factors applied to the
         covariance afterwards, not power spectra, so ``units=None``
@@ -1107,29 +1069,13 @@ class SpectraLoader:
                 if self.post_process_corrections is None:
                     self.post_process_corrections = ppc_loaded
                 else:
-                    # missing="identity": two correction files may
-                    # legitimately cover different spectra/frequencies.
+                    # missing="identity": correction files may cover different
+                    # spectra/frequencies.
                     self.post_process_corrections = mult_nested_dicts(
                         self.post_process_corrections, ppc_loaded, missing="identity"
                     )
         else:
             raise TypeError("post_process_correction parameter type not supported")
-
-        # if isinstance(inpainting_param, dict):
-        #     for key, val in inpainting_param.items():
-        #         try:
-        #             interp_data = hp.read_cl(val)
-        #             self.inpainting_rescaling[key] = 1 + (1 - interp_data[0, :self.lmax])
-        #         except Exception as e:
-        #             self.logger.warning(f"Error loading inpainting correction for {key}: {e}")
-        #             self.inpainting_rescaling[key] = np.ones(self.lmax)
-
-        # elif isinstance(inpainting_param, float):
-        #     for cf in self.combined_frequencies:
-        #         self.inpainting_rescaling[cf] = inpainting_param * np.ones(self.lmax)
-
-        # else:
-        #     raise TypeError("inpainting_rescaling parameter not correctly defined")
 
     # ----------------------------------------------------------------------------------
     # Main workflow methods
@@ -1159,27 +1105,17 @@ class SpectraLoader:
                     * self.fl_dict[key_freq][key_pol]
                 )
 
-        # missing="error": cl_dict/nl_dict and data_model are both built over
-        # exactly combined_frequencies x combined_stokes (see
-        # _compute_signal, _load_multiple and load_pre_process), so a key
-        # missing from data_model here means beams/pixwin/fl were silently
-        # not applied to it -- a bug, not a legitimate configuration.
+        # missing="error": cl_dict and data_model are both built over exactly
+        # combined_frequencies x combined_stokes, so a key missing from either
+        # is a bug.
         self.cl_dict_biased = mult_nested_dicts(
             self.cl_dict, self.data_model, missing="error"
         )
-        # `nl` is the noise power spectrum of the map as delivered to the
-        # estimator: it carries no beam, no pixel window and no transfer
-        # function, and so it is NEVER multiplied by the data model. This is
-        # the MASTER convention (Hivon et al. 2002, astro-ph/0105302),
-        # their Eqs. (15)-(16):
-        #
-        #   <Ctilde_l> = M_ll' F_l' B^2_l' <C_l'> + <Ntilde_l>
-        #   Delta C_l ~ (C_l + N_l / B^2_l) sqrt(2 / nu_l)
-        #
-        # The debiasing below divides each leg by data_model = B1 B2 pix fl,
-        # so the noise enters the reported error bars as N_l / B^2_l with no
-        # further bookkeeping. The copy keeps the loaded `nl_dict` intact for
-        # callers that want the map-level spectrum.
+        # `nl` is the noise spectrum of the map as delivered to the estimator
+        # (no beam, pixel window or transfer function), so it is NOT multiplied
+        # by the data model; see `_load_noise_spectra`. The debiasing below
+        # divides each leg by B1 B2 pix fl, so the noise enters the error bars
+        # as N_l / B_l^2. The copy keeps `nl_dict` intact.
         self.nl_dict_biased = deepcopy(self.nl_dict)
 
         # The per-leg factor applied to the covariance of each spectrum
@@ -1189,10 +1125,9 @@ class SpectraLoader:
         #   d[f][s] = post_process_correction[f][s] / data_model[f][s]
         #             * tf_uncertainty[f][s]
         #
-        # Block (C^s1_f1, C^s2_f2) is multiplied by outer(d[f1][s1], d[f2][s2]),
-        # so each factor enters exactly once per leg. Only the
-        # reported multipoles are kept: the spectra may be longer (ACC reads
-        # them to lmax_int), the corrections are loaded to lmax.
+        # Block (C^s1_f1, C^s2_f2) is multiplied by outer(d[f1][s1], d[f2][s2]).
+        # Only the reported multipoles are kept: the spectra may be longer
+        # (ACC reads them to lmax_int), the corrections are loaded to lmax.
         lmax = self.lmax
         self.debiasing_dict = {}
         for key_freq in self.combined_frequencies:
@@ -1203,14 +1138,10 @@ class SpectraLoader:
                     1.0, self.data_model[key_freq][key_pol][:lmax], default=1.0
                 )
 
-                # Transfer-function uncertainty (if requested). fl is the
-                # fraction of the signal the pipeline keeps, in [0, 1]
-                # (_check_transfer_function_range refuses a file outside it),
-                # so 1 + sqrt((1 - fl) / 3999) >= 1: it MULTIPLIES the leg
-                # factor, and the block, which is the point -- not knowing the
-                # transfer function exactly can only add variance, and the
-                # more signal the filtering removed (small fl) the larger the
-                # inflation.
+                # Transfer-function uncertainty (if requested). With fl in
+                # [0, 1], 1 + sqrt((1 - fl) / 3999) >= 1, so it can only
+                # inflate the variance, more where the filtering removed more
+                # signal (small fl).
                 if self.config.add_tf_uncertainty:
                     self.logger.info("Adding transfer function uncertainty...")
                     tf_uncertainty = 1 + np.sqrt(

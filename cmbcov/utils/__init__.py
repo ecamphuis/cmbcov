@@ -16,8 +16,10 @@ from .array_utils import (
     read_spectrum_file,
     safe_divide,
 )
+from .logging_utils import configure_logging
 
 __all__ = [
+    "configure_logging",
     "SPECTRUM_UNITS",
     "safe_divide",
     "read_spectrum_file",

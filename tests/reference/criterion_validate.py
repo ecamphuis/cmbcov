@@ -1,6 +1,6 @@
-"""Validate the term-selection thresholds, as ``cmbcov.term_selection`` cites.
+"""Validate the term-selection thresholds, as ``cmbcov.approximations.acc.term_selection`` cites.
 
-The module docstring of ``cmbcov/term_selection.py`` used to cite a
+The module docstring of ``cmbcov/approximations/acc/term_selection.py`` used to cite a
 ``criterion_validate.py`` that was never in the repository -- it was a scratch
 file from the original research -- so the numbers it quoted could not be
 re-checked.  This is a replacement, written to reproduce them.
@@ -32,12 +32,12 @@ import numpy as np
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, REPO)
 
-from cmbcov.grid import spin_weighted_integrals_gl  # noqa: E402
-from cmbcov.term_selection import (  # noqa: E402
+from cmbcov.approximations.acc.term_selection import (  # noqa: E402
     pole_rotation,
     rotate_alm,
     select_terms,
 )
+from cmbcov.harmonics.grid import spin_weighted_integrals_gl  # noqa: E402
 
 TOL = 1e-3
 OFFSETS = (0, 5, 10, 19)

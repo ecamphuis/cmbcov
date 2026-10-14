@@ -8,9 +8,9 @@ The ACC precompute needs
 
     I_{\ell m, LM} = \int W\, Y_{\ell m}\, Y^*_{LM}\, d\Omega ,
 
-which :func:`cmbcov.grid.spin_weighted_integrals_gl`
+which :func:`cmbcov.harmonics.grid.spin_weighted_integrals_gl`
 evaluates by quadrature (synthesise, multiply, analyse) and
-:func:`cmbcov.grid.banded_integrals_gl` by Legendre
+:func:`cmbcov.harmonics.grid.banded_integrals_gl` by Legendre
 transforms over a band of ``M``.  Expanding the mask,
 :math:`W = \sum_{\ell_3 m_3} w_{\ell_3 m_3} Y_{\ell_3 m_3}`, and using
 :math:`Y^*_{LM} = (-1)^M Y_{L,-M}` gives the closed form
@@ -27,7 +27,7 @@ is why only the mask orders in the band ``|M - m| <= m_band`` enter.  The
 negative-order mask coefficients that healpy does not store follow from the
 mask being real, :math:`w_{\ell,-m} = (-1)^m \bar w_{\ell m}`.  Both phase
 conventions are verified numerically against ``banded_integrals_gl`` in
-``tests/test_gaunt.py`` rather than trusted from the algebra.
+``tests/harmonics/test_gaunt.py`` rather than trusted from the algebra.
 
 This is :math:`O(\ell_w)` per ``(L, M)`` (one 3j symbol per :math:`\ell_3`,
 each :math:`O(\min \ell)` through the Racah sum), i.e. far slower than the
@@ -168,7 +168,7 @@ def gaunt_sum_integrals(
     m_band: int,
 ) -> np.ndarray:
     r"""
-    :func:`cmbcov.grid.banded_integrals_gl` (spin 0) by
+    :func:`cmbcov.harmonics.grid.banded_integrals_gl` (spin 0) by
     the literal Gaunt sum,
 
     .. math::
@@ -186,7 +186,7 @@ def gaunt_sum_integrals(
     mask_alm : ndarray
         healpy-ordered alm of the (real) mask, truncated at ``lw``.
     lw, ell, m, lmax_out, m_band
-        As in :func:`~cmbcov.grid.banded_integrals_gl`.
+        As in :func:`~cmbcov.harmonics.grid.banded_integrals_gl`.
     """
     import healpy as hp  # lazy, see utils/healpy_utils.py
 

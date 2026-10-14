@@ -170,6 +170,9 @@ exclude = [
 # Collect only the suite: a checkout also holds untracked working trees
 # (survey runs, research scripts) whose *_test.py files are not tests.
 testpaths = ["tests"]
+# A plain `pytest` runs the fast suite; `pytest -m slow` runs only the slow
+# tests and `pytest -m "slow or not slow"` all of them.
+addopts = "-m 'not slow'"
 markers = [
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "slow: a test of more than about 5 s (not run by default: `pytest -m slow` runs these, `pytest -m \"slow or not slow\"` everything)",
 ]

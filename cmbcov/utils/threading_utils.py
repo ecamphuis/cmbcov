@@ -8,21 +8,21 @@ performance tuning commonly used in numerical computations.
 import multiprocessing
 import os
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
-#: Whether an invalid ``OMP_NUM_THREADS`` has already been warned about in
-#: this process (warn once, since threading helpers run on every SHT/grid
-#: call).
+#: Non-empty once an invalid ``OMP_NUM_THREADS`` has been warned about (the
+#: warning is issued once per process; the helpers run on every SHT/grid call).
 _WARNED_INVALID_OMP_NUM_THREADS: list = []
 
 
 def _env_nthreads() -> int | None:
     """
-    Parse ``OMP_NUM_THREADS`` from the environment, shared by every
-    thread-count policy in this package (:func:`get_optimal_nthreads` and
-    :func:`~.grid._nthreads`'s grid-size-aware branch), so both honour it the
-    same way instead of re-parsing it independently.
+    Parse ``OMP_NUM_THREADS`` from the environment.
+
+    Shared by the thread-count policies of :func:`get_optimal_nthreads` and
+    ``cmbcov.harmonics.grid._nthreads``, so both honour it the same way.
 
     Returns
     -------
@@ -48,6 +48,46 @@ def _env_nthreads() -> int | None:
                 stacklevel=2,
             )
         return None
+
+
+#: Environment variables that set the size of the BLAS, OpenMP and numexpr
+#: thread pools of a process (:func:`child_thread_env`).
+_THREAD_ENV_VARS = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
+
+
+@contextmanager
+def child_thread_env(nthreads: int) -> Iterator[None]:
+    """
+    Set every thread-pool variable of :data:`_THREAD_ENV_VARS` to
+    ``max(1, nthreads)`` for the duration of the context, and restore the
+    previous values (or remove the variables that were unset) on exit.
+
+    Processes started while the context is active (``spawn``) inherit the
+    limits, so their BLAS and OpenMP pools get that many threads.  The
+    calling process's already-initialised BLAS is not affected, but anything
+    in the caller that reads ``OMP_NUM_THREADS`` while the context is active
+    (:func:`get_optimal_nthreads`) sees the child value: resolve the caller's
+    own thread count before entering.
+    """
+    value = str(max(1, int(nthreads)))
+    saved = {name: os.environ.get(name) for name in _THREAD_ENV_VARS}
+    try:
+        for name in _THREAD_ENV_VARS:
+            os.environ[name] = value
+        yield
+    finally:
+        for name, old in saved.items():
+            if old is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = old
 
 
 def get_optimal_nthreads(nside: int | None = None) -> int:
@@ -96,11 +136,9 @@ def get_optimal_nthreads(nside: int | None = None) -> int:
 
 #: Complex128 entries per worker below which :func:`run_row_blocks` callers
 #: do not split an elementwise array operation further
-#: (:func:`row_block_workers`).  The operations are memory-bound products and
-#: copies; measured inside the survey ACC precompute (``nside`` 256, 14-core
-#: laptop with a 4-core job alongside), one worker per 128 Ki entries (2 MiB)
-#: ran them 3-4x faster than one thread, while blocks of a few rows (many
-#: small numpy calls contending for the GIL) were slower than serial.
+#: (:func:`row_block_workers`). The operations are memory-bound products and
+#: copies; blocks of only a few rows (many small numpy calls contending for
+#: the GIL) are slower than serial, hence one worker per 128 Ki entries (2 MiB).
 ROW_BLOCK_ENTRIES_PER_THREAD = 131072
 
 #: The shared worker pool of :func:`run_row_blocks`, created on first use and

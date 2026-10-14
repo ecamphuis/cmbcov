@@ -1,6 +1,6 @@
 # Example parameter file for covariance matrix computation
 # Copy this file and edit it for your own analysis.
-# Authoritative list: cmbcov/generator/parameter_validation.py
+# Authoritative list: cmbcov/config/validation.py
 
 # ============================================================
 # REQUIRED PARAMETERS -- all ten below are mandatory; validation
@@ -196,6 +196,18 @@ fl: null
 #   nprobe: 32
 #   lw: null            # mask band-limit of the probes; set it to
 #                       # acc_precompute.lw on a high-resolution mask
+#   near_cut_step: null # extra nodes every lx/15 between 0.95 lx and 2 lx;
+#                       # 0: none (the geometric nodes alone)
+#   nprobe_near_cut: 128   # probes of those nodes; null: the complete basis
+#                          # (exact ratio, (2 l' + 1) probes per node, slow)
+#   # Optional scan-direction low-pass multiplying the high-pass (h = h_high *
+#   # h_low), for a time stream that is low-passed as well (SPT-3G: cut 300,
+#   # low-pass 6144). Same cut convention, m_c = lx sin(theta); lx must exceed
+#   # the high-pass lx. Absent (the default): no low-pass.
+#   lowpass:
+#     lx: 6144
+#     shape: exp          # or 'sharp': 1 where |M| <= lx sin(theta)
+#     power: 6            # 'exp' only: exp(-(|M| / (lx sin(theta)))^power)
 # Transfer function 'hl'. Accepted and stored on the parsed config but not
 # currently read or applied anywhere in the pipeline.
 hl: null

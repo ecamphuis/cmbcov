@@ -14,8 +14,13 @@ tooling used below (`black`, `ruff`, `isort`, `pre-commit`, `sphinx`).
 ## Running the tests
 
 ```bash
-python -m pytest -q
+python -m pytest -q                       # the fast suite (default)
+python -m pytest -q -m slow               # only the slow tests (more than about 5 s each)
+python -m pytest -q -m "slow or not slow" # everything
 ```
+
+CI runs the fast suite on every push and pull request, and the slow tests in a
+separate job after a merge to main.
 
 See [docs/installation.md](docs/installation.md) for the full requirement
 list and notes on optional dependencies (`sympy` for the Wigner-3j
@@ -36,7 +41,7 @@ two checks (`black --check`, `ruff check`) so a PR that hasn't run
 (vendored cross-check code, not reviewed against this project's style).
 
 Please run `black` and `ruff check --fix` on changed files before opening a
-PR, and keep the test suite green (`python -m pytest -q`).
+PR, and keep the test suite green (`python -m pytest -q`; run the slow tests too when you touch what they cover).
 
 ## Opening a pull request
 

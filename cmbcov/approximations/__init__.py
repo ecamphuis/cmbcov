@@ -6,24 +6,20 @@ Theta-bar of Camphuis et al. (2022) Eq. (25):
 
     nka   delta functions (Eq. 27)          -- exact on the full sky
     inka  renormalised MASTER kernel (Eq. 30)
-    acc   translation-invariant exact kernel (Eq. 33) -- this work, 1% accurate
+    acc   translation-invariant exact kernel (Eq. 33)
 
 `StrategyFactory` selects one from a `CovarianceConfig`.
 """
 
-import os
-import warnings
-from abc import ABC, abstractmethod
+from importlib import import_module
+from typing import TYPE_CHECKING
 
-import numpy as np
-
-from ..covariance import Cov, CovarianceConfig, CovarianceMethod
-from ..keys import CovKey
-from ..utils.healpy_utils import get_nside_from_ell
-from .acc import ACCStrategy
-from .base import CovarianceStrategy
-from .inka import INKAStrategy
-from .nka import NKAStrategy
+if TYPE_CHECKING:  # annotations only: assembly imports this package (see __getattr__)
+    from ..assembly.covariance import Cov
+    from .acc.strategy import ACCStrategy
+    from .base import CovarianceStrategy
+    from .inka import INKAStrategy
+    from .nka import NKAStrategy
 
 __all__ = [
     "StrategyFactory",
@@ -33,32 +29,53 @@ __all__ = [
     "INKAStrategy",
 ]
 
+# The strategies import `cmbcov.assembly` (their `Cov`, keys and method enum),
+# and `cmbcov.assembly` imports `cmbcov.exact`, which imports
+# `cmbcov.approximations.acc.term_selection` and so this package. They are
+# therefore imported on first use, so that importing this package (or
+# `approximations.acc.term_selection`) does not import `cmbcov.assembly`.
+_LAZY = {
+    "ACCStrategy": ".acc.strategy",
+    "CovarianceStrategy": ".base",
+    "NKAStrategy": ".nka",
+    "INKAStrategy": ".inka",
+}
+
+
+def __getattr__(name):
+    if name in _LAZY:
+        return getattr(import_module(_LAZY[name], __name__), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 class StrategyFactory:
     """Factory class for creating covariance computation strategies."""
 
     @staticmethod
-    def create_strategy(covariance_instance: Cov) -> "CovarianceStrategy":
+    def create_strategy(covariance_instance: "Cov") -> "CovarianceStrategy":
         """
-        Create a covariance computation strategy.
+        Create the strategy selected by ``covariance_instance.config.method``.
 
         Parameters
         ----------
-        method : CovarianceMethod
-            The covariance computation method to use
         covariance_instance : Cov
-            The main covariance computation instance
+            The covariance instance (mask, kernels, configuration).
 
         Returns
         -------
         CovarianceStrategy
-            Strategy instance for the requested method
+            An ``ACCStrategy``, ``NKAStrategy`` or ``INKAStrategy``.
 
         Raises
         ------
         ValueError
-            If method is not supported
+            If the method is not supported.
         """
+        from ..assembly.covariance import CovarianceMethod
+        from .acc.strategy import ACCStrategy
+        from .inka import INKAStrategy
+        from .nka import NKAStrategy
+
         strategy_map = {
             CovarianceMethod.ACC: ACCStrategy,
             CovarianceMethod.NKA: NKAStrategy,
@@ -70,4 +87,5 @@ class StrategyFactory:
                 f"Unknown covariance method: {covariance_instance.config.method}"
             )
 
-        return strategy_map[covariance_instance.config.method](covariance_instance)
+        base = strategy_map[covariance_instance.config.method](covariance_instance)
+        return base

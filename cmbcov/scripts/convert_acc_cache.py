@@ -1,17 +1,12 @@
 """
-Command-line converter for legacy text-format ACC coupling-kernel caches.
+Command-line converter for text-format (``.txt``) ACC coupling-kernel caches.
 
-Exposed as the ``convert-acc-cache`` console script. The on-disk coupling
-cache used to be written with ``np.savetxt`` (``.txt``); it is now
-``np.save`` (``.npy``) -- ``np.load`` is ~400x faster than ``np.loadtxt`` on
-a realistic kernel, and at ``dmax=20`` with 25 polarised pairs that
-difference is worth tens of seconds on every run that re-reads a cache from
-a previous session.
-:func:`~cmbcov.approximations.acc_cache.load_coupling_kernels`
-refuses to read a ``.txt``-only cache (naming this command in the error) so
-that a stale format is never silently reinterpreted; this script does the
-one-time conversion, verifying every kernel round-trips bit-exactly before
-touching anything.
+Exposed as the ``convert-acc-cache`` console script. The coupling cache is
+stored as ``.npy`` (``np.save``), which loads much faster than ``np.loadtxt``
+text. :func:`~cmbcov.approximations.acc.cache.load_coupling_kernels` refuses
+to read a ``.txt``-only cache (naming this command in the error); this script
+does the one-time conversion, verifying that every kernel round-trips
+bit-exactly before touching anything.
 """
 
 from __future__ import annotations
@@ -20,11 +15,11 @@ import argparse
 import sys
 from collections.abc import Sequence
 
-from ..approximations.acc_cache import convert_text_cache
+from ..approximations.acc.cache import convert_text_cache
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Convert a ``save_dir``'s legacy ``.txt`` coupling cache to ``.npy``."""
+    """Convert a ``save_dir``'s ``.txt`` coupling cache to ``.npy``. Returns 0."""
     parser = argparse.ArgumentParser(
         description=(
             "Convert a legacy .txt ACC coupling-kernel cache under "

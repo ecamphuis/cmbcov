@@ -6,7 +6,7 @@ support changes the assembly.
 (``precompute_acc_kernels``, ``Cov``, ``CovarianceConfig``, ``CovKeys``,
 ``StrategyFactory``), so the same function produces the stored reference
 ``acc_level1_reference.npz`` and is re-run by
-``tests/test_acc_bmode_assembly.py`` against the current one. To
+``tests/approximations/acc/test_acc_bmode_assembly.py`` against the current one. To
 regenerate (deliberately, and say why in the commit message), run
 from a checkout of the code that should define the reference::
 
@@ -79,13 +79,13 @@ def build_level1_reference(workdir: str) -> dict:
     import healpy as hp
 
     from cmbcov.approximations import StrategyFactory
-    from cmbcov.approximations.acc import precompute_acc_kernels
-    from cmbcov.covariance import (
+    from cmbcov.approximations.acc.precompute import precompute_acc_kernels
+    from cmbcov.assembly.covariance import (
         Cov,
         CovarianceConfig,
         CovarianceMethod,
     )
-    from cmbcov.keys import CovKeys
+    from cmbcov.assembly.keys import CovKeys
 
     hp.write_map(
         os.path.join(workdir, "mask.fits"),

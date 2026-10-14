@@ -53,8 +53,8 @@ unchanged.
 ## Kernels per spectrum
 
 Each two-letter spectrum takes one of a small set of kernels, built from the
-underlying MASTER/PolSpice quadrature (`kernels/coupling.py`,
-`kernels/polspice.py`):
+underlying MASTER/PolSpice quadrature (`mask/coupling.py`,
+`mask/polspice.py`):
 
 | Spectrum | Kernel |
 | --- | --- |

@@ -52,7 +52,7 @@ NKA and INKA need no precompute step.
 ## Running from a parameter file
 
 ```bash
-validate-parameters -p parameters.yml   # cheap: checks the file, touches nothing else
+validate-parameters parameters.yml      # cheap: checks the file, touches nothing else
 cmbcov-precompute parameters.yml           # ACC only
 cmbcov-cov parameters.yml
 ```
@@ -96,8 +96,8 @@ The same two steps, in Python, on the small mask above:
 ```python
 import numpy as np
 from cmbcov.approximations.acc import precompute_acc_kernels
-from cmbcov.covariance import Cov, CovarianceConfig, CovarianceMethod
-from cmbcov.keys import CovKeys
+from cmbcov.assembly.covariance import Cov, CovarianceConfig, CovarianceMethod
+from cmbcov.assembly.keys import CovKeys
 
 # Step 1: precompute -- once per mask. No Cov needed.
 precompute_acc_kernels(

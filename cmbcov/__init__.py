@@ -2,21 +2,25 @@
 Analytical covariance matrices for CMB power spectra.
 
 Implements the pseudo-Cl covariance of Camphuis et al. (2022),
-arXiv:2204.13721. Each module owns one part of the calculation:
+arXiv:2204.13721. Each subpackage owns one part of the calculation:
 
-    kernels/        Wigner-d recursions and the coupling operators Xi, M, K, G
-    mask            the survey footprint: W_l, W^2_l, degraded copies, kernel cache
-    sht             HEALPix spherical-harmonic primitives (ducc0; healpy is I/O only)
-    grid            Gauss-Legendre grids: exact synthesis/analysis and integrals
-    term_selection  which (m, m', M) terms carry the ACC kernel, from the mask alone
-    exact           the exact covariance of Sect. 3, row by row (HEALPix or GL)
-    keys            which spectra exist, and the Wick contractions between them
-    approximations  the choice of reduced coupling kernel: NKA, INKA, ACC
-    covariance      Cov: ties it together and assembles the block matrix
-    binning         bandpower binning
-    postprocess     PolSpice convolution, D_ell scaling, debiasing
+    harmonics/      HEALPix spherical-harmonic primitives (sht; ducc0, healpy is I/O
+                    only) and Gauss-Legendre grids (grid: exact synthesis/analysis
+                    and integrals)
+    mask/           the survey footprint (footprint: W_l, W^2_l, degraded copies,
+                    kernel cache) and the coupling operators Xi, M, K, G from
+                    Wigner-d recursions (coupling, polspice)
+    exact/          the exact covariance of Sect. 3, row by row (HEALPix or GL)
+    approximations/ the choice of reduced coupling kernel: NKA, INKA, and ACC
+                    (approximations/acc/: kernels, cache, error budget, term
+                    selection of the (m, m', M) terms from the mask alone, B-mode
+                    Wick contractions)
+    assembly/       Cov ties it together and assembles the block matrix; keys (which
+                    spectra exist, and the Wick contractions between them), binning,
+                    postprocess (PolSpice convolution, D_ell scaling, debiasing),
+                    windows, conditioning, filtering (filter-and-bin)
     spectra         loading and combining the input spectra, beams and noise
-    generator/      parameter files, data model, the end-to-end workflow
+    config/         parameter files, data model, the end-to-end workflow
 
 Example
 -------
@@ -33,11 +37,11 @@ To keep the matrix in memory instead, run the setup chain yourself and call
 
 from importlib.metadata import PackageNotFoundError, version
 
-from .covariance import Cov
+from .assembly.covariance import Cov
 
 # Main classes - import from appropriate modules
-from .generator.generator import CovarianceMatrixGenerator
-from .generator.parameter_validation import (
+from .config.generator import CovarianceMatrixGenerator
+from .config.validation import (
     ParameterManager,
     ParameterValidator,
     PipelineConfig,

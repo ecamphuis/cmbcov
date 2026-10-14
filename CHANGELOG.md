@@ -1,5 +1,153 @@
 # Changelog
 
+## 0.7.0 — 2026-10-14
+
+### Breaking changes
+
+- **Package layout reorganised (breaking).** The flat `cmbcov/` modules now
+  live in subpackages. The top-level `cmbcov` API (`Cov`,
+  `CovarianceMatrixGenerator`, `ParameterValidator`, `ParameterManager`,
+  `PipelineConfig`) is unchanged; the old module paths are removed, with no
+  compatibility shims. Each new subpackage re-exports its public names
+  (`cmbcov.mask.MaskWlm`, `cmbcov.exact.exact_covariance`,
+  `cmbcov.approximations.acc.precompute_acc_kernels`, ...), and the defining
+  submodule path works too. `cmbcov.approximations.ACCStrategy` and
+  `cmbcov.approximations.acc.ACCStrategy` are resolved on first use, so that
+  importing `cmbcov.exact` or `cmbcov.approximations.acc.term_selection` does
+  not import `cmbcov.assembly`.
+
+  | Old module | New module |
+  | --- | --- |
+  | `cmbcov.sht`, `cmbcov.grid` | `cmbcov.harmonics.sht`, `cmbcov.harmonics.grid` |
+  | `cmbcov.mask` | `cmbcov.mask.footprint` (`cmbcov.mask` re-exports `MaskWlm`) |
+  | `cmbcov.kernels.coupling`, `cmbcov.kernels.polspice` | `cmbcov.mask.coupling`, `cmbcov.mask.polspice` |
+  | `cmbcov.exact` | `cmbcov.exact`, now a subpackage split by path: `common`, `healpix`, `gl`, `pol`, `plan`, `parallel`, `covariance` (the public entry points; `cmbcov.exact` re-exports them) |
+  | `cmbcov.approximations.acc` | `cmbcov.approximations.acc`, now split into `channels`, `producers`, `contraction`, `store`, `precompute` (the kernel precompute) and `strategy`, `bands` (`ACCStrategy` and its helpers); `cmbcov.approximations.acc` re-exports its public names |
+  | `cmbcov.approximations.acc_cache`, `cmbcov.approximations.acc_budget` | `cmbcov.approximations.acc.cache`, `cmbcov.approximations.acc.budget` |
+  | `cmbcov.term_selection`, `cmbcov.bmode_wick` | `cmbcov.approximations.acc.term_selection`, `cmbcov.approximations.acc.bmode_wick` |
+  | `cmbcov.covariance`, `cmbcov.keys`, `cmbcov.binning`, `cmbcov.postprocess`, `cmbcov.windows`, `cmbcov.conditioning`, `cmbcov.filtering` | the same names under `cmbcov.assembly` |
+  | `cmbcov.generator.generator`, `cmbcov.generator.parameter_validation` | `cmbcov.config.generator`, `cmbcov.config.validation` |
+
+- **`ParameterManager` and `ParameterValidator` no longer take
+  `parent_logger`, and the library no longer configures logging**: a Python
+  user who wants the progress lines calls `cmbcov.utils.configure_logging(verbose=True)`
+  or `logging.basicConfig(level=logging.INFO)` (see Changed).
+
+### Added
+
+- **`map_filter.lowpass`: a scan-direction low-pass multiplying the
+  high-pass.** A time stream that is also low-passed along the scan
+  (SPT-3G: cut 300, low-pass 6144) is the same ring filter with
+  $h = h_{\mathrm{high}}\thinspace h_{\mathrm{low}}$. The optional sub-block
+  `lowpass: {lx, shape, power}` (`shape` `exp`, the default, or `sharp`;
+  `power` 6) takes the same cut convention $m_c = l_x \sin\theta$ as the
+  high-pass, with `lx` above the high-pass one. `filtering.lowpass_profile`
+  and `filtering.combined_profile` build the profiles; `default_nodes` and
+  `node_plan` take `lx_lowpass` and `lowpass_shape` and add nodes through the
+  rolloff (every $l_x^{\mathrm{low}}/15$ from $0.6$ to
+  $2\thinspace l_x^{\mathrm{low}}$, every $l_x^{\mathrm{low}}/50$ at the onset of a sharp
+  one) with the near-cut probe count; a low-pass above $\ell_{\max}/0.6$ adds
+  none. Without the key nothing changes, bit for bit, and the saved ratio
+  caches stay valid. At toy scale (low-pass at 200, inside the band) the
+  corrected T/E blocks are within 1.2% of the exact filtered covariance down to
+  $F \approx 0.4$, where leaving the low-pass out of $\rho$ gives +50% to
+  +450%; at the survey scale the SPT-3G low-pass lowers $\rho$ by 0.2%, 1.4%
+  and 5.1% at $\ell$ = 2000, 2800 and 3499 (probe noise 0.1%). See
+  `docs/theory/filter_and_bin.md`, "The low-pass".
+
+- **`nprocs` for `exact_covariance_pol`.** The polarised exact covariance
+  can now spread its rows over worker processes, as `exact_covariance`
+  already could (Gauss-Legendre grid only, default 1). The results are
+  bit-identical to the serial loop; processes mostly pay off on many-core
+  nodes rather than on one laptop.
+
+- **`map_filter.spectrum_aware`: spectrum-aware correction of the TT x TT
+  blocks.** With `spectrum_aware: true` every TT x TT block is probed with
+  the run's fiducial spectra instead of a white one
+  (`filtering.spectrum_aware_ratio`): the factor is the ratio of the exact
+  filtered covariance (spectra before the filter) to the exact unfiltered
+  one (the spectra the block is computed with). It multiplies the block
+  with no `fl` division and includes the power a sharp latitude-dependent
+  cut scatters across multipoles, which the white-spectrum ratio misses: on
+  a survey mask with the sharp cut at $l_x = 300$, the TT variance at
+  multipoles 2000 to 3500 goes from 5.5% low to within the Monte Carlo noise
+  (0.996 $\pm$ 0.006). The other T/E blocks keep the white channels, and
+  `00` is then not probed. The probes use a Gauss-Legendre grid oversampled
+  by 2. The ratio is cached under a digest of the spectra, so changing them
+  probes again. `CovarianceConfig` gains `filter_rho_blocks`
+  (`{block_id: (nodes, g)}`, `filtering.block_id`); `filtering` also
+  provides `pre_filter_noise`. Default `false`: nothing changes.
+
+- **`map_filter.near_cut_step` and `map_filter.nprobe_near_cut`; the probing
+  functions take per-node settings.** `near_cut_step` is the spacing of the
+  extra nodes between $0.95\thinspace l_x$ and $2\thinspace l_x$ (`null`:
+  $l_x / 15$; `0`: none), `nprobe_near_cut` the probes of the nodes from
+  $0.95\thinspace l_x$ to below $2\thinspace l_x$ (default 128; `null`:
+  the complete basis, exact ratio). `filtering.filtered_sum_rule_ratio` and
+  `filtering.spectrum_aware_ratio` accept `nprobe` as one count per node and
+  a new `lmax_int_floor` (lower bound of the internal band-limit, one for
+  all nodes or one per node); an integer `nprobe` and no floor give exactly
+  the previous results. `filtering.default_nodes` takes `lx` and
+  `near_cut_step` (without `lx` the list is unchanged), and
+  `filtering.node_plan` builds the nodes with their per-node probes and
+  floors. With `map_filter` the run logs a warning naming the bins whose
+  lowest `fl` is below 0.3 (accuracy degraded) and one naming those below
+  0.1 (cut them); `filtering.bin_transfer_minimum` gives the values.
+
+
+### Changed
+
+- **`map_filter` near the cut: denser nodes, more probes and a higher
+  band-limit by default.** The nodes now include one every $l_x / 15$
+  multipoles from $0.95\thinspace l_x$ to $2\thinspace l_x$; those use 128
+  random probes instead of 32 (`nprobe_near_cut: null` for the complete
+  basis of their degree, an exact ratio); and those
+  below $1.3\thinspace l_x$ carry the probes to at least
+  $3.5\thinspace l_x$ (the sharp cut scatters power into them from far
+  multipoles). This changes the results and the cache keys of every
+  `map_filter` run relative to 0.6.0 (`near_cut_step: 0` with
+  `nprobe_near_cut: 32` restores the 0.6.0 nodes and probes, but not the
+  band-limit of the nodes at the cut). Measured with the complete basis in
+  a survey-like test (nside-512 version of a 4% survey mask, sharp cut at
+  $l_x = 300$, 13200 paired simulations, bins of 50, Monte Carlo error 1.1
+  to 1.4%), the
+  paired variance ratio of the bin 350 to 399 went from 0.939 to 0.997 (TT,
+  white), 0.967 to 1.011 (TT, `spectrum_aware`), 0.957 to 1.003 (EE) and
+  0.924 to 0.975 (TE), that of 400 to 449 from 0.974, 1.007, 0.981, 0.975
+  to 0.978, 0.986, 0.986, 0.980; above 450 the bins moved by 0.7% or less.
+  With a smooth cut every T/E block is now within 2.1% from 350 up (it was
+  4.5% off in 400 to 449). The bin containing the cut is not usable either
+  way. The probing costs more: at survey scale (mask band-limit 875,
+  `dmax` 99, 8 threads) the near-cut nodes add about 24 minutes for the
+  three white channels and 13 minutes for the spectrum-aware TT to the 33
+  and 12 to 17 minutes the whole probing took before, and the binned
+  variances of that test differ from the complete-basis ones by at most
+  0.4%; the complete basis (`nprobe_near_cut: null`) adds about 2.6 and
+  1.3 hours.
+
+- **The library no longer configures logging.** `CovarianceMatrixGenerator`
+  used to call `logging.basicConfig` and set levels on import-time loggers;
+  now every module logs through `logging.getLogger(__name__)` and only the
+  command-line scripts configure levels. A Python user who wants the run's
+  progress calls `logging.basicConfig(level=logging.INFO)` or
+  `cmbcov.utils.configure_logging(verbose=True)` (the function the scripts
+  use: it sets the root level and format).
+  `ParameterManager` and `ParameterValidator` no longer take `parent_logger`.
+
+- **`CovariancePostProcessor` accepts an optional `mixing` kernel in its dict
+  form.** The dict layout now takes a `"mixing"` entry with the EE <-> BB
+  kernel, so `pseudo_to_spice_bmode` works with it as with the array layout.
+  Without it, the B-mode methods raise a `ValueError` naming the missing
+  kernel (they raised `AttributeError`).
+
+
+- **The default test run deselects the tests marked `slow`** (more than about
+  5 s each; `addopts = "-m 'not slow'"`). `pytest -m slow` runs only them and
+  `pytest -m "slow or not slow"` everything. CI runs the fast suite on every
+  push and pull request, and the slow tests in a separate job on Python 3.12
+  after a merge to main (or on request).
+
+
 ## 0.6.0 — 2026-10-01
 
 ### Added
@@ -120,6 +268,7 @@
   machine, against about 2.5 hours before. Kernels are identical up to
   floating-point rounding (2e-14 of the largest element); existing kernel
   caches remain valid.
+
 
 ## 0.4.1 — 2026-09-29
 

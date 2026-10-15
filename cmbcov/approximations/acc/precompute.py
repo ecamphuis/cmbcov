@@ -16,6 +16,7 @@ from ...harmonics.grid import full_from_pair
 from ...harmonics.sht import DEFAULT_MAP2ALM_ITER, ducc0_map2alm
 from ...mask.footprint import MaskWlm
 from ...utils.healpy_utils import get_nside_from_ell
+from ...utils.progress import Progress
 from . import cache as acc_cache
 from .channels import (
     _CENTRAL_FIELD,
@@ -300,51 +301,66 @@ class _CouplingPrecompute:
         all_results = {} if dryrun else None
         integral_mask_cache = {}
 
-        for indellp, ellp in enumerate(ellprange):
-            if verbose:
-                print(f"Processing ellp={ellp} ({indellp+1}/{len(ellprange)})")
+        # One progress step per ellp, weighted by ellp + 1. Measured on
+        # tests/data/baseline_mask.fits (nside 64, GL grid), ellp 100-123 one
+        # after the other: 0.58 s at 101 to 0.71 s at 123, proportional to
+        # ellp; the first ellp also pays about 0.3 s of one-off setup, not
+        # modelled. Over the narrow range dmax covers the cost per ellp is
+        # nearly even, so the weights matter little.
+        weights = [float(ellp) + 1.0 for ellp in ellprange]
+        with Progress(
+            "ACC precompute",
+            len(ellprange),
+            "l'",
+            plural="l' values",
+            weights=weights,
+        ) as progress:
+            for indellp, ellp in enumerate(ellprange):
+                if verbose:
+                    print(f"Processing ellp={ellp} ({indellp+1}/{len(ellprange)})")
 
-            # Compute coupling kernels for this ellp
-            coupling_kernels = self._compute_ellp_coupling(
-                ell,
-                ellp,
-                integral_mask,
-                integral_mask_cache,
-                ellprange[indellp + 1 :],
-                wn_for_ell,
-                nside,
-                lmax,
-                verbose,
-                grid=grid,
-                mask_alm=mask_alm,
-                lw=lw,
-                max_memory_bytes=max_memory_bytes,
-                spec_indices=spec_indices,
-                t_only=t_only,
-                selection=selection,
-                pairs=pairs_tuple,
-            )
-
-            # Save or store results
-            if not dryrun:
-                self._save_coupling_kernels(
-                    save_dir,
-                    coupling_kernels,
+                # Compute coupling kernels for this ellp
+                coupling_kernels = self._compute_ellp_coupling(
                     ell,
                     ellp,
-                    centralell,
+                    integral_mask,
+                    integral_mask_cache,
+                    ellprange[indellp + 1 :],
+                    wn_for_ell,
+                    nside,
+                    lmax,
                     verbose,
-                    spectra=spectra_tuple,
                     grid=grid,
+                    mask_alm=mask_alm,
                     lw=lw,
-                    nside=nside,
-                    term_selection=term_selection,
-                    term_selection_stats=(
-                        None if selection is None else selection.stats(ell, ellp)
-                    ),
+                    max_memory_bytes=max_memory_bytes,
+                    spec_indices=spec_indices,
+                    t_only=t_only,
+                    selection=selection,
+                    pairs=pairs_tuple,
                 )
-            else:
-                all_results[ellp] = coupling_kernels.copy()
+
+                # Save or store results
+                if not dryrun:
+                    self._save_coupling_kernels(
+                        save_dir,
+                        coupling_kernels,
+                        ell,
+                        ellp,
+                        centralell,
+                        verbose,
+                        spectra=spectra_tuple,
+                        grid=grid,
+                        lw=lw,
+                        nside=nside,
+                        term_selection=term_selection,
+                        term_selection_stats=(
+                            None if selection is None else selection.stats(ell, ellp)
+                        ),
+                    )
+                else:
+                    all_results[ellp] = coupling_kernels.copy()
+                progress.update()
 
         # Clean up and return
         del integral_mask_cache

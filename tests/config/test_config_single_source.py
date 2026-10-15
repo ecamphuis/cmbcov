@@ -25,6 +25,7 @@ from cmbcov import (  # noqa: E402
     ParameterManager,
 )
 from cmbcov.assembly.covariance import CovarianceMethod  # noqa: E402
+from cmbcov.config.run_record import RECORD_NAMES  # noqa: E402
 from cmbcov.config.validation import (  # noqa: E402
     PipelineConfig,
     normalise_param_aliases,
@@ -455,7 +456,12 @@ def _renamed(tmp_path, base_params, name, replace=None):
 
 
 def _yaml_files(version_dir):
-    return sorted(n for n in os.listdir(version_dir) if n.endswith((".yml", ".yaml")))
+    """The parameter files of a version directory (the run record is no such file)."""
+    return sorted(
+        n
+        for n in os.listdir(version_dir)
+        if n.endswith((".yml", ".yaml")) and n not in RECORD_NAMES
+    )
 
 
 def test_overwrite_checks_a_renamed_parameter_file(tmp_path):
@@ -478,6 +484,8 @@ def test_overwrite_with_a_renamed_parameter_file_leaves_one_parameter_file(tmp_p
     renamed = _renamed(tmp_path, params_file, "renamed.yaml")
     CovarianceMatrixGenerator(renamed).run_full_analysis(overwrite=0)
     assert _yaml_files(os.path.join(str(tmp_path), "v0")) == ["renamed.yaml"]
+    # the run record stays beside it, and is the one of the second run
+    assert os.path.exists(os.path.join(str(tmp_path), "v0", "params_resolved.yml"))
 
 
 def test_overwrite_refuses_a_version_dir_with_several_parameter_files(tmp_path):

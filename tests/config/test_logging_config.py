@@ -19,6 +19,7 @@ from cmbcov.utils import configure_logging
 def restore_root_logger():
     root = logging.getLogger()
     handlers, level = list(root.handlers), root.level
+    progress_level = logging.getLogger("cmbcov.progress").level
     yield root
     for handler in list(root.handlers):
         if handler not in handlers:
@@ -27,6 +28,7 @@ def restore_root_logger():
         if handler not in root.handlers:
             root.addHandler(handler)
     root.setLevel(level)
+    logging.getLogger("cmbcov.progress").setLevel(progress_level)
 
 
 def test_importing_and_validating_leaves_logging_alone(restore_root_logger):
@@ -51,3 +53,9 @@ def test_configure_logging_sets_the_root_level(restore_root_logger, verbose, exp
         root.removeHandler(handler)
     configure_logging(verbose)
     assert root.level == expected
+    # the progress lines are shown with and without --verbose ...
+    assert logging.getLogger("cmbcov.progress").level == logging.INFO
+    # ... and hidden by --quiet, which leaves the root level alone
+    configure_logging(verbose, quiet=True)
+    assert root.level == expected
+    assert logging.getLogger("cmbcov.progress").level == logging.WARNING

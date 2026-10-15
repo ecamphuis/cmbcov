@@ -7,9 +7,11 @@ by module path under the ``spawn`` start method.
 from __future__ import annotations
 
 import os
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from ..harmonics.grid import gl_minimal_lmax, gl_synthesis
+from ..utils.progress import Progress
+from .common import row_weights
 from .gl import _BatchedGL, _exact_row_gl
 from .pol import _exact_row_pol_gl, _polarised_batch
 
@@ -114,6 +116,7 @@ def _rows_gl_parallel(
     term_selection=None,
     max_memory_gb=None,
     pol=None,
+    stage="exact covariance",
 ):
     """
     ``[(ellp, row), ...]`` for every requested row, computed in ``nprocs``
@@ -123,6 +126,10 @@ def _rows_gl_parallel(
     deterministically over rings, and every row is computed by a single call
     chain; ``max_memory_gb`` is per process, so every worker plans the same
     chunks as the serial loop).
+
+    The parent counts the finished rows for the progress lines (``stage``
+    names them); the order and the values of the result are those of
+    ``pool.map`` over the rows, most expensive first.
     """
     rows = list(rows)
     nprocs = min(nprocs, len(rows)) or 1
@@ -147,4 +154,16 @@ def _rows_gl_parallel(
             pol,
         ),
     ) as pool:
-        return list(pool.map(_row_worker, order))
+        futures = [pool.submit(_row_worker, ellp) for ellp in order]
+        position = {future: i for i, future in enumerate(futures)}
+        weights = row_weights(order, use_symmetry)
+        try:
+            with Progress(stage, len(order), "row", weights=weights) as progress:
+                for future in as_completed(futures):
+                    future.result()  # a failed row raises here
+                    progress.update(item=position[future])
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
+        return [future.result() for future in futures]

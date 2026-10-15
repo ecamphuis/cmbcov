@@ -18,6 +18,7 @@ import numpy as np
 
 from ..harmonics.sht import DEFAULT_MAP2ALM_ITER
 from ..mask.footprint import KERNEL_CACHE_VERSION, MaskWlm
+from ..utils.progress import Progress
 from .binning import BinningManager
 from .keys import CovKey, CovKeys, SpecKey
 from .postprocess import CovariancePostProcessor
@@ -1519,6 +1520,13 @@ class Cov:
                 )
         filter_factors: dict[tuple[str, str, str, str], np.ndarray] = {}
 
+        # One progress step per block, counted when the block is consumed
+        # (computed or read back). The blocks differ in cost (a cross-frequency
+        # block is as dear as an auto one, a B run's blocks far dearer than a
+        # T/E run's), so the linear estimate of the time left is rough.
+        n_blocks = len(covariance_keys.keys())
+        progress = Progress("covariance assembly", n_blocks, "block")
+
         def consume(cov_key: CovKey, covariance_term: np.ndarray) -> None:
             channel = filter_channel.get(cov_key.stokekey())
             block_factor = (
@@ -1551,6 +1559,7 @@ class Cov:
                     post_processor,
                     projections,
                 )
+            progress.update()
 
         # Blocks read back from the save_raw_blocks cache are used as they
         # come; the others are computed by the strategy's
@@ -1560,42 +1569,50 @@ class Cov:
         # irrelevant.
         manifests: dict[CovKey, dict] = {}
         to_compute: list[CovKey] = []
-        for cov_key in covariance_keys.keys():
-            covariance_term = None
-            if self.config.save_raw_blocks:
-                manifest = self._raw_block_manifest(computation_strategy, cov_key, cl)
-                manifests[cov_key] = manifest
-                covariance_term = self._load_raw_block(cov_key, manifest)
-            if covariance_term is None:
-                to_compute.append(cov_key)
-            else:
-                consume(cov_key, covariance_term)
+        with progress:
+            for cov_key in covariance_keys.keys():
+                covariance_term = None
+                if self.config.save_raw_blocks:
+                    manifest = self._raw_block_manifest(
+                        computation_strategy, cov_key, cl
+                    )
+                    manifests[cov_key] = manifest
+                    covariance_term = self._load_raw_block(cov_key, manifest)
+                if covariance_term is None:
+                    to_compute.append(cov_key)
+                else:
+                    consume(cov_key, covariance_term)
 
-        for cov_key, covariance_term in computation_strategy.compute_covariance_terms(
-            to_compute, cl
-        ):
-            if self.config.verbose:
-                print(f"Computed {cov_key}")
-            if cov_key in manifests:
-                self._save_raw_block(cov_key, covariance_term, manifests[cov_key])
-            consume(cov_key, covariance_term)
+            for (
+                cov_key,
+                covariance_term,
+            ) in computation_strategy.compute_covariance_terms(to_compute, cl):
+                if self.config.verbose:
+                    print(f"Computed {cov_key}")
+                if cov_key in manifests:
+                    self._save_raw_block(cov_key, covariance_term, manifests[cov_key])
+                consume(cov_key, covariance_term)
 
         if needs_bmode_mixing:
             spec_index = {spec: i for i, spec in enumerate(covariance_keys.spec_keys)}
-            for cov_key in covariance_keys.keys():
-                block_provider = self._pseudo_block_provider(
-                    cov_key, raw_blocks, spec_index, covariance_keys.spec_keys
-                )
-                self._add_to_output_matrix_bmode(
-                    output_matrix,
-                    cov_key,
-                    covariance_keys,
-                    bin_matrix,
-                    num_bins,
-                    post_processor,
-                    block_provider,
-                    projections,
-                )
+            # The second pass of a B run: PolSpice transform, scaling,
+            # debiasing and binning of every block, one progress step each.
+            with Progress("covariance post-processing", n_blocks, "block") as post:
+                for cov_key in covariance_keys.keys():
+                    block_provider = self._pseudo_block_provider(
+                        cov_key, raw_blocks, spec_index, covariance_keys.spec_keys
+                    )
+                    self._add_to_output_matrix_bmode(
+                        output_matrix,
+                        cov_key,
+                        covariance_keys,
+                        bin_matrix,
+                        num_bins,
+                        post_processor,
+                        block_provider,
+                        projections,
+                    )
+                    post.update()
 
         # Handle asymmetric Stokes if requested
         if self.config.sum_asymmetric_stokes:

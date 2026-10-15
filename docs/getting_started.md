@@ -89,6 +89,48 @@ the example runs in seconds; `dmax` here is below the bin width (6), which
 `centralell` on a real footprint. See [`parameters.md`](parameters.md) for
 every key.
 
+### Progress lines
+
+The long computations report their progress, one plain log line per 10 % step
+(and at least every 30 s), with the elapsed time and an estimate of the time
+left, then a final line with the total time:
+
+```
+ACC precompute: 12/36 l' values (33%), 4m12s elapsed, ~8m24s left
+map_filter probing (white channels): 5/9 nodes (55%), 1m02s elapsed, ~50s left
+covariance assembly: 6/6 blocks (100%), done in 3m41s
+```
+
+The stages are the ACC kernel precompute (one step per $\ell'$), the
+`map_filter` probing (one per node, white channels and spectrum-aware TT), the
+covariance assembly (one per block, then one per block for the post-processing
+of a run with a B observable) and the rows of the exact covariance (also with
+`nprocs > 1`). The count (`5/9 nodes`) is the plain number of steps done; the
+percentage and the time left follow the *expected work*, because the steps are
+far from equal: a probing node costs its number of probes times the cost of a
+probe, which grows steeply with the node's grid, and an exact row costs in
+proportion to its multipole. Each stage weights its steps by a cost model of
+what a step does (the probing weights time a few filter rings and one
+transform per node, 0.4 % of the stage), and the time left is the time elapsed
+scaled by the work left over the work done, so the speed of your machine is
+measured, not assumed. It is still an estimate: it can be off by tens of per
+cent early in a stage, and a stage whose steps cannot be predicted keeps equal
+weights (the covariance assembly, whose blocks are computed in batches, so its
+steps arrive in bursts). The command-line scripts show these lines by
+default, without `--verbose`; `--quiet` (`-q`) hides them. In Python nothing
+is shown until you ask, either with `cmbcov.utils.configure_logging(verbose=False)`
+(what the scripts call; `quiet=True` hides the lines again) or by enabling just
+the progress logger:
+
+```python
+import logging
+
+logging.basicConfig(format="%(asctime)s %(message)s")
+logging.getLogger("cmbcov.progress").setLevel(logging.INFO)
+```
+
+The lines go to the `cmbcov.progress` logger only; they change no result.
+
 ## Running from the Python API
 
 The same two steps, in Python, on the small mask above:
@@ -170,7 +212,24 @@ Each `cmbcov-cov` run creates a fresh versioned directory under
   whether it is positive definite. A likelihood needs an invertible,
   positive-definite matrix, and multi-frequency covariances are genuinely
   near-singular, so this is worth checking rather than assuming.
-- a copy of the parameter file that produced the run.
+- `params.yml` — a copy of the parameter file that produced the run (named
+  like the file you passed). A later run into the same directory
+  (`--overwrite N`) compares its own parameters with it.
+- `params_resolved.yml` — what the run actually used: every parameter with its
+  effective value (the defaults the file did not set included, and the
+  `map_filter` / `acc_precompute` blocks with all their keys), under the same
+  keys as `params.yml` so the two can be compared with `diff`; then a
+  `derived` section with the values the run computed (mask `nside`, the
+  multipole bins, the ACC `lmax_int` and kernel directory, the `map_filter`
+  nodes with their probe counts and band-limit floors, the thread default),
+  and a `provenance` section (cmbcov version and git revision, Python, numpy,
+  scipy, ducc0 and healpy versions, the thread environment variables that are
+  set, start and end time in ISO 8601, wall time in seconds, and the status:
+  `running`, `completed`, `dry run` or `failed`). It is written as soon as the
+  parameters are resolved, so a run that crashes still has it, and completed
+  at the end. Nothing reads it back and it is not a parameter file:
+  `params.yml` is unchanged by it. It holds no spectra or matrices, and
+  neither a host name nor a user name beyond the paths in your parameters.
 - `error_budget.txt` — for every ACC run: the E→B
   leakage bound and the (unbounded) Eq. 33 translation-error range (reported
   as not applicable for a TT-only run or a run with a B observable) and the
@@ -185,6 +244,11 @@ Each `cmbcov-cov` run creates a fresh versioned directory under
 The ACC coupling kernels themselves live one level up, in
 `<cov_path>/covariance_coupling/` (`.npy` files plus a JSON manifest per
 multipole pair), so they are shared by every version directory of the file.
+`cmbcov-precompute` writes the same kind of record beside them, as
+`<cov_path>/precompute_params_resolved.yml` (the parameters with the
+`acc_precompute` defaults, the multipoles computed, the grid, `nside` and `lw`
+the precompute resolved, and the provenance); a later precompute into the same
+`cov_path` replaces it.
 
 ## Bandpower window functions
 

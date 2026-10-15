@@ -20,6 +20,29 @@ SPECTRA = ("TT", "EE", "BB", "TE", "TB", "EB")
 
 
 # --------------------------------------------------------------------------- #
+# Expected relative cost of a row (the weights of the progress lines)
+# --------------------------------------------------------------------------- #
+def row_weights(rows: Sequence[int], use_symmetry: bool = True) -> list[float]:
+    """
+    Expected relative cost of each row ``l'`` of ``rows`` (arbitrary units):
+    the number of orders ``m'`` it sums over, ``l' + 1`` with the symmetry
+    and ``2 l' + 1`` without. A row computes one set of correlation columns
+    per order (module docstring of :mod:`cmbcov.exact.gl`), each at a cost
+    that does not depend on ``l'``, so the cost is linear in ``l'`` (not the
+    ``O(l'^4)`` of the per-column reference path); the polarised rows have
+    the same structure. Nothing is fitted. A row also has a fixed cost
+    independent of ``l'``, not modelled: the estimate runs high early in a
+    stage (by about 15% at the 20% line of a one-minute run, 30% in a
+    three-second one: the fixed cost is then a larger share) and settles.
+    With ``term_selection`` a row drops some of its orders, not known in
+    advance; the estimate likewise runs high at first.
+    """
+    return [
+        float(ellp + 1 if use_symmetry else 2 * ellp + 1) for ellp in map(int, rows)
+    ]
+
+
+# --------------------------------------------------------------------------- #
 # How much C_L headroom a mask needs: the coupling width
 # --------------------------------------------------------------------------- #
 #: Fraction of a mask's coupling weight that the margin ``lmax_int - lmax``

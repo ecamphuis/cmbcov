@@ -8,7 +8,8 @@ import numpy as np
 
 from ..harmonics.grid import gl_minimal_lmax, gl_synthesis
 from ..harmonics.sht import alm2cl
-from .common import _cl_matrix, _spectra_fields, _warn_short_margin
+from ..utils.progress import Progress
+from .common import _cl_matrix, _spectra_fields, _warn_short_margin, row_weights
 from .gl import _BatchedGL, _exact_row_gl, _mask_alm_for_gl, _pole_frame_alm
 from .healpix import _correlation_column, _mask_wl_healpix
 from .parallel import _rows_gl_parallel
@@ -20,6 +21,13 @@ __all__ = [
     "exact_covariance_row_pol",
     "exact_covariance_pol",
 ]
+
+
+#: Names of the progress lines of the row loops (:class:`~cmbcov.utils.progress.Progress`).
+#: The cost of a row grows with ``l'`` (:func:`~.common.row_weights`); the
+#: progress lines weight the rows by it.
+_STAGE = "exact covariance"
+_STAGE_POL = "exact covariance (polarised)"
 
 
 # --------------------------------------------------------------------------- #
@@ -315,6 +323,7 @@ def exact_covariance(
                 lmax_int=lmax_int,
                 term_selection=term_selection,
                 max_memory_gb=max_memory_gb,
+                stage=_STAGE,
             ):
                 sigma[:, ellp] = row
             return sigma
@@ -323,29 +332,36 @@ def exact_covariance(
             batch = _BatchedGL(mask_alm, lw, lmax_i, lmax_grid, nthreads, max_memory_gb)
         else:
             mask_map = gl_synthesis(mask_alm, lw, lmax_grid, nthreads=nthreads)
-        for ellp in rows:
-            sigma[:, ellp] = _exact_row_gl(
-                mask_alm,
-                lw,
-                cl,
-                ellp,
-                lmax,
-                lmax_grid=lmax_grid,
-                use_symmetry=use_symmetry,
-                nthreads=nthreads,
-                mask_map=mask_map,
-                lmax_int=lmax_int,
-                term_selection=term_selection,
-                batch=batch,
-            )
+        weights = row_weights(rows, use_symmetry)
+        with Progress(_STAGE, len(rows), "row", weights=weights) as progress:
+            for ellp in rows:
+                sigma[:, ellp] = _exact_row_gl(
+                    mask_alm,
+                    lw,
+                    cl,
+                    ellp,
+                    lmax,
+                    lmax_grid=lmax_grid,
+                    use_symmetry=use_symmetry,
+                    nthreads=nthreads,
+                    mask_map=mask_map,
+                    lmax_int=lmax_int,
+                    term_selection=term_selection,
+                    batch=batch,
+                )
+                progress.update()
         return sigma
     if nprocs > 1:
         raise ValueError("nprocs > 1 is implemented for grid='gl' only")
 
-    for ellp in rows:
-        sigma[:, ellp] = exact_covariance_row(
-            mask, cl, ellp, lmax, nside, grid=grid, lmax_int=lmax_int, **kw
-        )
+    rows = list(rows)
+    weights = row_weights(rows, kw.get("use_symmetry", True))
+    with Progress(_STAGE, len(rows), "row", weights=weights) as progress:
+        for ellp in rows:
+            sigma[:, ellp] = exact_covariance_row(
+                mask, cl, ellp, lmax, nside, grid=grid, lmax_int=lmax_int, **kw
+            )
+            progress.update()
     return sigma
 
 
@@ -632,6 +648,7 @@ def exact_covariance_pol(
             term_selection=term_selection,
             max_memory_gb=max_memory_gb,
             pol=(specs, fields),
+            stage=_STAGE_POL,
         ):
             for pair in pairs:
                 sigma[pair][:, ellp] = row[pair]
@@ -643,22 +660,25 @@ def exact_covariance_pol(
         )
     else:
         mask_map = gl_synthesis(mask_alm, lw, lmax_grid, nthreads=nthreads)
-    for ellp in rows:
-        row = _exact_row_pol_gl(
-            mask_alm,
-            lw,
-            cmat,
-            ellp,
-            lmax,
-            specs,
-            lmax_grid=lmax_grid,
-            use_symmetry=use_symmetry,
-            nthreads=nthreads,
-            mask_map=mask_map,
-            lmax_int=lmax_int,
-            term_selection=term_selection,
-            batch=batch,
-        )
-        for pair in pairs:
-            sigma[pair][:, ellp] = row[pair]
+    weights = row_weights(rows, use_symmetry)
+    with Progress(_STAGE_POL, len(rows), "row", weights=weights) as progress:
+        for ellp in rows:
+            row = _exact_row_pol_gl(
+                mask_alm,
+                lw,
+                cmat,
+                ellp,
+                lmax,
+                specs,
+                lmax_grid=lmax_grid,
+                use_symmetry=use_symmetry,
+                nthreads=nthreads,
+                mask_map=mask_map,
+                lmax_int=lmax_int,
+                term_selection=term_selection,
+                batch=batch,
+            )
+            for pair in pairs:
+                sigma[pair][:, ellp] = row[pair]
+            progress.update()
     return sigma

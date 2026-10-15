@@ -191,6 +191,7 @@ from ..harmonics.grid import (
     gl_thetas,
 )
 from ..harmonics.sht import alm2cl
+from ..utils.progress import Progress
 
 __all__ = [
     "CHANNELS",
@@ -1246,6 +1247,7 @@ def filtered_sum_rule_ratio(
         verbose,
         channels,
         node,
+        lambda ellp: _white_probe_work(channels, ellp),
     )
 
 
@@ -1313,6 +1315,170 @@ def _check_probe_arguments(
     return mask_alm, lw, nodes, dmax, nprobe, margin, floors
 
 
+#: Progress-line names of the two probing loops, keyed by the ``name`` they
+#: pass to :func:`_over_nodes`.
+_PROBING_STAGE = {
+    "filtered_sum_rule_ratio": "map_filter probing (white channels)",
+    "spectrum_aware_ratio": "map_filter probing (spectrum-aware TT)",
+}
+
+
+#: A spin-2 GL transform in spin-0 transforms ("Cost per probe" of
+#: :func:`filtered_sum_rule_ratio`: two to three).
+_SPIN2_COST = 2.5
+
+#: Rings timed to measure the cost of the ring filter (scaled to the grid).
+_FILTER_TIMING_RINGS = 8
+
+
+def _best_time(call: Callable[[], object], repeat: int) -> float:
+    """Shortest of ``repeat`` runs of ``call`` (seconds), after one warm-up."""
+    call()
+    best = np.inf
+    for _ in range(repeat):
+        t0 = time.perf_counter()
+        call()
+        best = min(best, time.perf_counter() - t0)
+    return best
+
+
+def _filter_seconds(lg: int) -> float:
+    """
+    Seconds of one ring-filter application (``rfft``, a product, ``irfft``)
+    to one map of the GL grid ``lg``, from timing a few of its rings:
+    ``(lg + 1)`` rings of ``2 lg + 2`` points.  Measured, not modelled: the
+    cost of an FFT depends on its length through the prime factors (a prime
+    ``lg + 1`` makes a node 3-7 times dearer than its neighbour) and on the
+    numpy version.
+    """
+    ntheta, nphi = gl_shape(lg)
+    rows = min(ntheta, _FILTER_TIMING_RINGS)
+    block = np.random.default_rng(0).standard_normal((rows, nphi))
+    h = np.ones((rows, nphi // 2 + 1))
+
+    def call():
+        return np.fft.irfft(np.fft.rfft(block, axis=-1) * h, n=nphi, axis=-1)
+
+    return _best_time(call, 3) * ntheta / rows
+
+
+def _transform_seconds(lmax_int: int, lg: int, nthreads: int | None) -> float:
+    """Seconds of one spin-0 GL transform at band-limit ``lmax_int`` on the
+    grid ``lg`` (half a synthesis plus analysis pair, timed)."""
+    import healpy as hp  # lazy, see utils/healpy_utils.py
+
+    alm = np.random.default_rng(0).standard_normal(hp.Alm.getsize(lmax_int)) + 0j
+
+    def call():
+        gl_analysis(
+            gl_synthesis(alm, lmax_int, lg, nthreads=nthreads),
+            lmax_int,
+            lg,
+            nthreads=nthreads,
+        )
+
+    return _best_time(call, 2) / 2
+
+
+def _white_probe_work(channels: Sequence[str], ellp: int) -> tuple[float, float]:
+    """``(filters, transforms)`` per probe of :func:`_node_sums` at node
+    ``ellp`` for ``channels``, counted in the code: ``"00"`` 2 filters and 7
+    transforms; the spin-2 channels (``ellp >= 2``) share a spin-2 synthesis
+    and a spin-2 analysis per operator, ``"20"`` adds a spin-0 synthesis and
+    analysis per operator and a filter, ``"EE"`` a spin-2 synthesis and
+    analysis per operator and a two-map filter."""
+    filters = transforms = 0.0
+    if "00" in channels:
+        filters += 2
+        transforms += 7
+    if ("20" in channels or "EE" in channels) and ellp >= 2:
+        filters += 2  # filt(W S_2 (z, 0)): Q and U
+        transforms += _SPIN2_COST * 3  # one synthesis, two analyses
+        if "20" in channels:
+            filters += 1
+            transforms += 4
+        if "EE" in channels:
+            filters += 2
+            transforms += _SPIN2_COST * 4
+    return filters, transforms
+
+
+def _spectra_probe_work(npairs: int) -> tuple[float, float]:
+    """``(filters, transforms)`` per probe of :func:`_node_sums_spectra` for
+    ``npairs`` distinct frequency pairs: one filter on ``W S z`` and one per
+    pair; a synthesis and two analyses, then two transforms per operator and
+    pair."""
+    return 1.0 + npairs, 3.0 + 4.0 * npairs
+
+
+def _node_geometry(
+    ellp: int,
+    floor: int,
+    dmax: int,
+    margin: int,
+    lw: int,
+    lmax_cap: int | None,
+    oversample: float | None,
+) -> tuple[int, int, int]:
+    """``(lmax_int, lw_node, lg)`` of node ``ellp`` (see :func:`_over_nodes`)."""
+    lmax_int = max(ellp + dmax + margin, floor)
+    if lmax_cap is not None:
+        lmax_int = min(lmax_int, lmax_cap)
+    lw_node = min(lw, 2 * lmax_int)
+    lg = gl_minimal_lmax(lmax_int, lw_node)
+    if oversample is not None:
+        lg = max(lg, int(np.ceil(oversample * lmax_int)))
+    return lmax_int, lw_node, lg
+
+
+def _node_weights(
+    nodes: Sequence[int],
+    nprobe: Sequence[int],
+    geometry: Sequence[tuple[int, int, int]],
+    probe_work: Callable[[int], tuple[float, float]],
+    nthreads: int | None = None,
+) -> list[float]:
+    """
+    Expected cost of each node, for the progress lines: its number of probes
+    (the complete basis ``2 l' + 1`` when that is at most ``nprobe``, see
+    :func:`_probe_alms`) times the cost of one probe, ``filters`` ring-filter
+    applications plus ``transforms`` spin-0 GL transforms (:func:`_node_sums`,
+    :func:`_node_sums_spectra`) of the node's grid::
+
+        count * (filters * filter_seconds(lg) + transforms * transform_seconds(lmax_int, lg))
+
+    The structure -- what a node does, how often, on which grid -- is
+    counted in the code; the two unit costs are *measured* on the machine by
+    timing a few rings of the filter and one transform of the node's own
+    size (:func:`_filter_seconds`, :func:`_transform_seconds`; 0.4% of the
+    stage). Nothing is fitted: the FFT time is irregular in the grid size and
+    the transform time depends on the machine's threads, so neither is a
+    formula worth tuning. The progress line scales these by the rate
+    observed so far, so only their ratios between nodes matter.
+
+    Validated, with no parameter fitted to them, on five probing runs (8-core
+    Apple M-series, 2026-10; ``examples/quick_progress``, lmax 500; lmax 300
+    with another cut and low-pass; lmax 500 without low-pass and with 12/24
+    probes; lmax 400 with the spectrum-aware TT stage too): the predicted
+    total time is within 4-19% of the actual one from the 20% line on (the
+    plain count gave 50-70% there).
+    """
+    filter_s: dict[int, float] = {}
+    transform_s: dict[tuple[int, int], float] = {}
+    weights = []
+    for ellp, n, (lmax_int, _, lg) in zip(nodes, nprobe, geometry):
+        count = 2 * ellp + 1 if 2 * ellp + 1 <= n else n
+        filters, transforms = probe_work(ellp)
+        if lg not in filter_s:
+            filter_s[lg] = _filter_seconds(lg)
+        if (lmax_int, lg) not in transform_s:
+            transform_s[(lmax_int, lg)] = _transform_seconds(lmax_int, lg, nthreads)
+        weights.append(
+            count * (filters * filter_s[lg] + transforms * transform_s[(lmax_int, lg)])
+        )
+    return weights
+
+
 def _over_nodes(
     name: str,
     mask_alm: np.ndarray,
@@ -1329,6 +1495,7 @@ def _over_nodes(
     verbose: bool,
     labels: Sequence[str],
     node_sums: Callable,
+    probe_work: Callable[[int], tuple[float, float]],
 ) -> dict[str, np.ndarray]:
     """
     The node loop shared by :func:`filtered_sum_rule_ratio` and
@@ -1342,37 +1509,45 @@ def _over_nodes(
     grid; then ``node_sums(w_map, filt, l', lmax_int, lg, nprobe[i]) ->
     (exact, count, {label: (S^F, S)})`` and row ``i`` of ``g[label]`` is
     :func:`_ratio_by_distance` of those sums.
+
+    ``probe_work(l') -> (filters, transforms)`` counts the work of one probe
+    of node ``l'`` for the progress weights (:func:`_node_weights`).
     """
     g = {label: np.empty((len(nodes), dmax + 1)) for label in labels}
-    for i, ellp in enumerate(nodes):
-        t0 = time.perf_counter()
-        lmax_int = max(ellp + dmax + margin, floors[i])
-        if lmax_cap is not None:
-            lmax_int = min(lmax_int, lmax_cap)
-        lw_node = min(lw, 2 * lmax_int)
-        lg = gl_minimal_lmax(lmax_int, lw_node)
-        if oversample is not None:
-            lg = max(lg, int(np.ceil(oversample * lmax_int)))
-        w_map = gl_synthesis(
-            _truncate_alm(mask_alm, lw, lw_node), lw_node, lg, nthreads=nthreads
-        )
-        filt = FourierRingFilter(profile(lg))
-        if filt.h.shape != (gl_shape(lg)[0], gl_shape(lg)[1] // 2 + 1):
-            raise ValueError(
-                f"profile({lg}) returned shape {filt.h.shape}; expected "
-                f"{(gl_shape(lg)[0], gl_shape(lg)[1] // 2 + 1)}"
+    geometry = [
+        _node_geometry(ellp, floors[i], dmax, margin, lw, lmax_cap, oversample)
+        for i, ellp in enumerate(nodes)
+    ]
+    # One progress step per node, weighted by the expected cost of the node
+    # (probes x cost per probe, which grows steeply with the grid).
+    weights = _node_weights(nodes, nprobe, geometry, probe_work, nthreads)
+    with Progress(
+        _PROBING_STAGE.get(name, name), len(nodes), "node", weights=weights
+    ) as progress:
+        for i, ellp in enumerate(nodes):
+            t0 = time.perf_counter()
+            lmax_int, lw_node, lg = geometry[i]
+            w_map = gl_synthesis(
+                _truncate_alm(mask_alm, lw, lw_node), lw_node, lg, nthreads=nthreads
             )
-        exact, count, sums = node_sums(w_map, filt, ellp, lmax_int, lg, nprobe[i])
-        for label in labels:
-            g[label][i] = _ratio_by_distance(*sums[label], ellp, dmax)
-        if verbose:
-            rho0 = " ".join(f"rho{lab}(d=0)={g[lab][i, 0]:.4f}" for lab in labels)
-            print(
-                f"{name}: node {ellp} lmax_int {lmax_int} "
-                f"grid {lg} lw {lw_node} {'exact basis' if exact else 'random'} "
-                f"{count} probes {time.perf_counter() - t0:.2f} s {rho0}",
-                flush=True,
-            )
+            filt = FourierRingFilter(profile(lg))
+            if filt.h.shape != (gl_shape(lg)[0], gl_shape(lg)[1] // 2 + 1):
+                raise ValueError(
+                    f"profile({lg}) returned shape {filt.h.shape}; expected "
+                    f"{(gl_shape(lg)[0], gl_shape(lg)[1] // 2 + 1)}"
+                )
+            exact, count, sums = node_sums(w_map, filt, ellp, lmax_int, lg, nprobe[i])
+            for label in labels:
+                g[label][i] = _ratio_by_distance(*sums[label], ellp, dmax)
+            if verbose:
+                rho0 = " ".join(f"rho{lab}(d=0)={g[lab][i, 0]:.4f}" for lab in labels)
+                print(
+                    f"{name}: node {ellp} lmax_int {lmax_int} "
+                    f"grid {lg} lw {lw_node} {'exact basis' if exact else 'random'} "
+                    f"{count} probes {time.perf_counter() - t0:.2f} s {rho0}",
+                    flush=True,
+                )
+            progress.update()
     return g
 
 
@@ -1701,6 +1876,7 @@ def spectrum_aware_ratio(
         verbose,
         list(terms),
         node,
+        lambda ellp: _spectra_probe_work(len(pairs)),
     )
 
 

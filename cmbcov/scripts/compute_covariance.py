@@ -61,6 +61,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     parser.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="Hide the progress lines of the long computations",
+    )
+    parser.add_argument(
         "--overwrite",
         type=int,
         default=None,
@@ -98,7 +104,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
-    configure_logging(args.verbose)
+    configure_logging(args.verbose, quiet=args.quiet)
 
     if (
         args.parameter_file_positional is not None

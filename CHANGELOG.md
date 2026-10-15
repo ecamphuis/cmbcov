@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.8.0 — 2026-10-15
+
+### Added
+
+- **`params_resolved.yml`: every parameter a run actually used.** Each run
+  writes it next to `params.yml` in its output directory. It has three parts:
+  - all parameters with the values the run used, including the defaults
+    your file did not set (for example the full `map_filter` and
+    `acc_precompute` blocks). The keys are the same as in `params.yml`, so
+    `diff params.yml params_resolved.yml` shows what the defaults filled in;
+  - `derived`: values the run computed rather than read, such as the mask
+    `nside`, the bins, the ACC internal band-limit and kernel directory, and
+    the `map_filter` nodes with their probe counts;
+  - `provenance`: the cmbcov version and git revision, the Python, numpy,
+    scipy, ducc0 and healpy versions, the thread settings, the start and end
+    times, the wall time and whether the run completed.
+
+  The file is written as soon as the parameters are resolved, so a run that
+  crashes still leaves one, and it is completed when the run ends.
+  `params.yml` is unchanged, and so is the check a later run makes against it
+  before reusing the directory (`--overwrite N`). `cmbcov-precompute` writes
+  the same kind of record, `precompute_params_resolved.yml`, next to the ACC
+  kernels.
+
+- **Progress lines during the long computations.** The ACC kernel
+  precompute, the `map_filter` probing, the covariance assembly and the rows
+  of the exact covariance now report how far they are, for example
+
+  ```
+  map_filter probing (white channels): 28/34 nodes (51%), 42s elapsed, ~40s left
+  ```
+
+  with a line at each 10% step (or every 30 s at most) and a last line with
+  the total time. The percentage and the time left follow the expected work,
+  not the number of items: a probing node is weighted by its probes and the
+  size of its transforms (timed once per node at its real size), an exact row
+  and an ACC precompute step by their multipole. The machine's speed comes
+  from the rate observed so far. It is still an estimate: from the 20% line
+  on, the predicted total was within 3-19% of the actual time on the cases
+  tested, except very short runs (a few seconds), where it runs high.
+  The command-line scripts show these lines by default; `--quiet` (`-q`)
+  hides them. In Python they go to the `cmbcov.progress` logger: call
+  `cmbcov.utils.configure_logging(verbose=False)` (which now also takes
+  `quiet`) or enable that logger to see them. Results are unchanged.
+
 ## 0.7.0 — 2026-10-14
 
 ### Breaking changes
@@ -78,21 +123,27 @@
   (`{block_id: (nodes, g)}`, `filtering.block_id`); `filtering` also
   provides `pre_filter_noise`. Default `false`: nothing changes.
 
-- **`map_filter.near_cut_step` and `map_filter.nprobe_near_cut`; the probing
-  functions take per-node settings.** `near_cut_step` is the spacing of the
-  extra nodes between $0.95\thinspace l_x$ and $2\thinspace l_x$ (`null`:
-  $l_x / 15$; `0`: none), `nprobe_near_cut` the probes of the nodes from
-  $0.95\thinspace l_x$ to below $2\thinspace l_x$ (default 128; `null`:
-  the complete basis, exact ratio). `filtering.filtered_sum_rule_ratio` and
-  `filtering.spectrum_aware_ratio` accept `nprobe` as one count per node and
-  a new `lmax_int_floor` (lower bound of the internal band-limit, one for
-  all nodes or one per node); an integer `nprobe` and no floor give exactly
-  the previous results. `filtering.default_nodes` takes `lx` and
-  `near_cut_step` (without `lx` the list is unchanged), and
-  `filtering.node_plan` builds the nodes with their per-node probes and
-  floors. With `map_filter` the run logs a warning naming the bins whose
-  lowest `fl` is below 0.3 (accuracy degraded) and one naming those below
-  0.1 (cut them); `filtering.bin_transfer_minimum` gives the values.
+- **Two `map_filter` settings for the nodes near the cut:
+  `near_cut_step` and `nprobe_near_cut`.** The sum-rule ratio changes
+  fastest between $0.95\thinspace l_x$ and $2\thinspace l_x$, so the run adds
+  extra interpolation nodes there.
+  - `near_cut_step` is the spacing of those extra nodes. The default
+    (`null`) puts one every $l_x / 15$ multipoles; `0` adds none.
+  - `nprobe_near_cut` is the number of random probes at each of those
+    nodes: 128 by default. `null` uses the complete basis instead, which
+    gives the exact ratio at a higher cost.
+
+  The probing functions take these settings node by node.
+  `filtering.filtered_sum_rule_ratio` and `filtering.spectrum_aware_ratio`
+  accept `nprobe` as one count per node, and a new `lmax_int_floor` (the
+  lowest internal band-limit of the probes, one value for all nodes or one
+  per node); an integer `nprobe` and no floor give exactly the previous
+  results. `filtering.default_nodes` takes `lx` and `near_cut_step` (without
+  `lx` the list is unchanged), and `filtering.node_plan` builds the nodes
+  with their probe counts and floors. With `map_filter` the run also logs a
+  warning naming the bins whose lowest `fl` is below 0.3 (accuracy
+  degraded) and one naming those below 0.1 (cut them);
+  `filtering.bin_transfer_minimum` gives the values.
 
 
 ### Changed

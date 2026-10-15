@@ -21,6 +21,7 @@ Everything runs at ``nside = 16``, ``centralell = 16`` on the test mask
 
 import glob
 import json
+import logging
 import os
 import textwrap
 import warnings
@@ -482,6 +483,28 @@ def test_pipeline_config_exposes_the_block(tmp_path):
         setup_output=False
     )
     assert plain.acc_precompute is None
+
+
+def test_precompute_acc_script_reports_progress_unless_quiet(tmp_path, caplog):
+    """``precompute-acc`` logs one progress step per ellp, and ``--quiet``
+    hides the lines (it does not change what is written)."""
+    caplog.set_level(logging.INFO)
+    for name, flags in (("shown", []), ("hidden", ["--quiet"])):
+        workdir = tmp_path / name
+        workdir.mkdir()
+        caplog.clear()
+        assert precompute_acc.main([_params_file(workdir), *flags]) == 0
+        lines = [r.getMessage() for r in caplog.records if r.name == "cmbcov.progress"]
+        if flags:
+            assert lines == []
+        else:
+            assert lines[-1].startswith(
+                "ACC precompute: 3/3 l' values (100%), done in "
+            )
+        kernel_dir = workdir / "out" / "covariance_coupling"
+        assert len([f for f in os.listdir(kernel_dir) if f.endswith(".json")]) == 3
+    # the script set the level; leave the logger as the library has it
+    logging.getLogger("cmbcov.progress").setLevel(logging.NOTSET)
 
 
 def test_precompute_acc_script_then_every_run_reuses_the_kernels(tmp_path, capsys):

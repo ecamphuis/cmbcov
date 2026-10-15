@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 
 from ..approximations.acc.bmode_wick import required_kernel_pairs
+from ..approximations.acc.cache import read_coupling_manifest
 from ..approximations.acc.precompute import coupling_ellprange, precompute_acc_kernels
 from ..assembly.conditioning import conditioning_report, format_conditioning_report
 from ..assembly.covariance import Cov, CovarianceMethod
@@ -24,8 +25,14 @@ from ..utils import (
     add_nested_dicts,
     safe_divide,
 )
+from .run_record import (
+    PRECOMPUTE_RESOLVED_NAME,
+    RESOLVED_NAME,
+    RunRecord,
+)
 from .validation import (
     EMPTY_PARAMS,
+    SPECTRUM_UNITS_INPUTS,
     AccPrecomputeConfig,
     ParameterManager,
     PipelineConfig,
@@ -103,6 +110,10 @@ class CovarianceMatrixGenerator:
         # the covariance by _save_map_filter; None otherwise.
         self._map_filter_ratio: dict[str, np.ndarray] | None = None
 
+        # The record of what the run actually used (params_resolved.yml, see
+        # cmbcov.config.run_record), started once the parameters are resolved.
+        self._run_record: RunRecord | None = None
+
     @property
     def params(self) -> Mapping[str, Any]:
         """
@@ -150,8 +161,72 @@ class CovarianceMatrixGenerator:
         )
         self.config = self.param_manager.load_and_validate()
         self.param_manager.save_parameters()
+        self._start_run_record()
 
         self.logger.info("Parameters loaded, validated, and saved successfully")
+
+    # ----------------------------------------------------------------------------------
+    # The record of what the run used (params_resolved.yml)
+    # ----------------------------------------------------------------------------------
+
+    def _start_run_record(self) -> None:
+        """
+        Write ``params_resolved.yml`` beside the saved parameter file: every
+        parameter with its effective value, defaults included, and the
+        provenance of the run. Called as soon as the parameters are resolved,
+        so that a run that crashes still has it; :meth:`_record_derived` and
+        :meth:`_finish_run_record` complete it.
+        """
+        self._run_record = RunRecord.for_config(
+            os.path.join(self.config.save_dir, RESOLVED_NAME),
+            self.config,
+            params_name=os.path.basename(self.parameter_file),
+        )
+        self._run_record.write()
+
+    def _record_derived(self, **values: Any) -> None:
+        """Add values the run computed to ``params_resolved.yml`` (no record: no-op)."""
+        if self._run_record is not None:
+            self._run_record.add_derived(**values)
+
+    def _finish_run_record(self, status: str, error: str | None = None) -> None:
+        """Close ``params_resolved.yml`` with the status and the end time."""
+        if self._run_record is not None:
+            self._run_record.finish(status, error=error)
+
+    def _record_run_setup(self) -> None:
+        """
+        Record what the run computes from its inputs once the analysis object
+        is set up: the mask resolution, the spectra layout, the internal band
+        limit and kernel directory of ACC, and the thread policy.
+        """
+        from ..utils.threading_utils import get_optimal_nthreads
+
+        config = self.config
+        nside = self.covariance_instance.wlm.nside
+        derived: dict[str, Any] = {
+            "mask_nside": int(nside),
+            "frequency_pairs": list(self.combined_frequencies),
+            "spectra": list(self.combined_stokes),
+            "n_blocks": len(self.cov_keys.keys()),
+            "spectrum_units": {
+                name: config.spectrum_units_of(name) for name in SPECTRUM_UNITS_INPUTS
+            },
+            # the length the spectra are built to: lmax, or lmax_int for ACC
+            "spectra_lmax": int(self.spectra.spectra_lmax),
+            # the default of the SHT transforms; OMP_NUM_THREADS overrides it
+            "nthreads": {"sht": int(get_optimal_nthreads(nside))},
+        }
+        if config.method == CovarianceMethod.ACC:
+            derived["acc"] = {
+                "dmax": config.dmax,
+                "centralell": config.centralell,
+                "kernel_dir": os.path.join(
+                    config.acc_kernel_dir, "covariance_coupling"
+                ),
+                "lmax_int": int(self.spectra.spectra_lmax),
+            }
+        self._record_derived(**derived)
 
     def setup_frequency_stokes_mapping(self) -> None:
         """Setup frequency and Stokes parameter mappings."""
@@ -360,21 +435,58 @@ class CovarianceMatrixGenerator:
         if dryrun:
             return plan
 
-        precompute_acc_kernels(
-            config.mask_name,
-            config.acc_kernel_dir,
-            centralell=config.centralell,
-            dmax=config.dmax,
-            mask_path=config.mask_path,
-            nside=settings.nside,
-            grid=settings.grid,
-            lw=settings.lw,
-            spectra=settings.spectra,
-            pairs=pairs,
-            max_memory_gb=settings.max_memory_gb,
-            scratch_dir=settings.scratch_dir,
-            verbose=self.verbose_mode,
+        # The record of this precompute, beside the kernels it writes; the
+        # kernel directory is made here rather than by the precompute.
+        os.makedirs(config.acc_kernel_dir, exist_ok=True)
+        record = RunRecord.for_config(
+            os.path.join(config.acc_kernel_dir, PRECOMPUTE_RESOLVED_NAME),
+            config,
+            params_name=os.path.basename(self.parameter_file),
+            acc_precompute_defaults=True,
         )
+        record.add_derived(
+            acc={
+                "kernel_dir": os.path.join(
+                    config.acc_kernel_dir, "covariance_coupling"
+                ),
+                "centralell": config.centralell,
+                "dmax": config.dmax,
+                "ellprange": plan["ellprange"],
+                "pairs": pairs,
+            }
+        )
+        try:
+            precompute_acc_kernels(
+                config.mask_name,
+                config.acc_kernel_dir,
+                centralell=config.centralell,
+                dmax=config.dmax,
+                mask_path=config.mask_path,
+                nside=settings.nside,
+                grid=settings.grid,
+                lw=settings.lw,
+                spectra=settings.spectra,
+                pairs=pairs,
+                max_memory_gb=settings.max_memory_gb,
+                scratch_dir=settings.scratch_dir,
+                verbose=self.verbose_mode,
+            )
+        except Exception as e:
+            record.finish("failed", error=type(e).__name__)
+            raise
+        # What the precompute resolved from "auto": the manifest it wrote.
+        manifest = read_coupling_manifest(
+            config.acc_kernel_dir, config.centralell, config.centralell
+        )
+        if manifest is not None:
+            record.add_derived(
+                kernels={
+                    key: manifest[key]
+                    for key in ("grid", "nside", "lw")
+                    if key in manifest
+                }
+            )
+        record.finish("completed")
         return plan
 
     def _prepare_spectra(self) -> tuple[list[int], dict[str, dict[str, np.ndarray]]]:
@@ -426,6 +538,9 @@ class CovarianceMatrixGenerator:
         self.logger.info("Computing covariance matrix...")
 
         lbins, cl_used = self._prepare_spectra()
+        self._record_derived(
+            bins={"lbins": [int(b) for b in lbins], "n_bins": len(lbins) - 1}
+        )
         self._warn_low_transfer(lbins)
         # The spectrum-aware map_filter probes need the spectra the
         # covariance is computed with.
@@ -603,6 +718,17 @@ class CovarianceMatrixGenerator:
             "lmax_int_floor": np.asarray(floors),
             "channels": np.array(list(channels), dtype=str),
         }
+        self._record_derived(
+            map_filter={
+                "dmax": dmax,
+                "lw": lw,
+                "channels": list(channels),
+                "spectrum_aware": spectrum_aware,
+                "nodes": nodes,
+                "nprobe": nprobe,
+                "lmax_int_floor": floors,
+            }
+        )
         cov.config.filter_rho = None
         if channels:
             computed = []
@@ -1255,6 +1381,10 @@ class CovarianceMatrixGenerator:
 
             # Prepare for computation
             self.setup_analysis_object()
+            try:
+                self._record_run_setup()
+            except Exception as exc:  # the record never stops a run
+                self.logger.warning("could not record the derived values: %s", exc)
 
             # Compute covariance matrix
             final_cov = self.compute_covariance_matrix(dryrun=dryrun)
@@ -1273,8 +1403,10 @@ class CovarianceMatrixGenerator:
                         save_windows=save_windows,
                     )
 
+            self._finish_run_record("dry run" if dryrun else "completed")
             self.logger.info("Analysis completed successfully")
 
         except Exception as e:
             self.logger.error(f"Analysis failed: {e}")
+            self._finish_run_record("failed", error=type(e).__name__)
             raise

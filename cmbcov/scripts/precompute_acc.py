@@ -61,12 +61,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--verbose", "-v", action="store_true", help="Enable verbose output"
     )
     parser.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="Hide the progress lines of the long computations",
+    )
+    parser.add_argument(
         "--dryrun",
         action="store_true",
         help="Validate the file and print the plan without computing",
     )
     args = parser.parse_args(argv)
-    configure_logging(args.verbose)
+    configure_logging(args.verbose, quiet=args.quiet)
 
     if (
         args.parameter_file is not None

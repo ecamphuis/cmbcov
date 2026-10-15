@@ -26,6 +26,7 @@ from ..assembly.covariance import CovarianceConfig, CovarianceMethod
 from ..assembly.keys import CovKeys
 from ..utils.array_utils import SPECTRUM_UNITS
 from ..utils.file_utils import get_git_revision_short_hash, get_versioned_path
+from .run_record import RECORD_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -2028,7 +2029,10 @@ class ParameterManager:
         The parameter file a previous run saved in the version directory.
 
         That is the ``.yml``/``.yaml`` file there, or a file named like this
-        run's parameter file. None for a new (empty) directory.
+        run's parameter file. None for a new (empty) directory. The run
+        records ``params_resolved.yml`` and ``precompute_params_resolved.yml``
+        (:data:`~cmbcov.config.run_record.RECORD_NAMES`) are not parameter
+        files and are not counted.
 
         Raises
         ------
@@ -2040,7 +2044,7 @@ class ParameterManager:
         found = {
             os.path.join(save_dir, name)
             for name in os.listdir(save_dir)
-            if name.endswith((".yml", ".yaml"))
+            if name.endswith((".yml", ".yaml")) and name not in RECORD_NAMES
         }
         if os.path.exists(self.save_path):
             found.add(self.save_path)
